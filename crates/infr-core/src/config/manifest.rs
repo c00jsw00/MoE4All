@@ -328,6 +328,7 @@ knobs! {
     "INFR_DEBUG_COOPMAT"       => "debug.coopmat",         Presence, Ignored, "1", migrated;
     "INFR_DEBUG_WIDE_DISPATCH" => "debug.wide_dispatch",   Presence, Ignored, "1", migrated;
     "INFR_DEBUG_CHAT"          => "debug.chat",            Presence, Ignored, "1", migrated;
+    "INFR_STATE_TRACE"         => "debug.state_trace",     Presence, Ignored, "1", migrated;
     "INFR_MOE_COUNTS_DEBUG"    => "debug.moe_counts",      Presence, Ignored, "1", migrated;
     "INFR_MOE_COUNTS_DUMP"     => "debug.moe_counts_dump", Presence, Ignored, "1", migrated;
     "INFR_POISON_UNINIT"       => "debug.poison_uninit",   Presence, Ignored, "1", migrated;

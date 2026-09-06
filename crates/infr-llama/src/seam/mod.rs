@@ -692,6 +692,14 @@ pub(crate) fn generate_dense_vulkan_session(
         req,
     );
     if out.is_err() {
+        // A failed forward may already have committed several prefill chunks to KV/QSA and
+        // advanced recurrent/PLE state, while `cached` is published only at normal function exit.
+        // Never return that half-advanced slot to a persistent session pool as reusable. Keeping
+        // the allocations and weights is safe; an empty token ledger makes the next request take
+        // the existing full-reset + full-prefill path from position zero.
+        if let Some(kv) = state.as_mut() {
+            kv.reset();
+        }
         vk.release_moe_load_reservation();
     }
     let out = out?;

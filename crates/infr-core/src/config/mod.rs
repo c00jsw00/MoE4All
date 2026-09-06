@@ -774,6 +774,9 @@ cfg_struct! {
         wide_dispatch: bool = false,
         /// `INFR_DEBUG_CHAT`.
         chat: bool = false,
+        /// `INFR_STATE_TRACE`: one compact state-selection line per model request. Intended for
+        /// diagnosing recurrent/QSA continuation corruption without logging per token.
+        state_trace: bool = false,
         /// `INFR_MOE_COUNTS_DEBUG`.
         moe_counts: bool = false,
         /// `INFR_MOE_COUNTS_DUMP`.

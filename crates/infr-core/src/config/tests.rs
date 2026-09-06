@@ -1382,6 +1382,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_API_KEY",
         "INFR_CTX",
         "INFR_DEBUG_CHAT",
+        "INFR_STATE_TRACE",
         "INFR_MAX_TOKENS_CAP",
         "INFR_NO_THINK",
         "INFR_PROF_OUT",

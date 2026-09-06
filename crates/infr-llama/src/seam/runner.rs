@@ -471,6 +471,8 @@ pub(crate) fn generate_dense_backend(
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
+    let state_trace = ec.debug.state_trace;
+    let state_was_cold = state.is_none();
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
     let caps = be.capabilities();
@@ -1563,12 +1565,23 @@ pub(crate) fn generate_dense_backend(
     // A live append-only recurrent state wins when the new prompt extends it exactly. Otherwise
     // try the last stable conversation checkpoint before taking the unchanged zero-reset path.
     // Restoration is device-side work, so concurrent serve takes the same GPU baton as a forward.
-    let restored_turn_start = if denoise_req.is_none()
-        && (c.qwen35 || c.qwen4exp || c.bailingmoe3)
-        && state
+    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3;
+    let cached_before_restore = state.as_ref().map_or(0, |kv| kv.cached.len());
+    let common_before_restore = state_trace.then(|| {
+        state
             .as_ref()
-            .is_some_and(|kv| recurrent_extension_start(&kv.cached, prompt).is_none())
-    {
+            .map_or(0, |kv| common_prefix_len(&kv.cached, prompt))
+    });
+    let live_turn_start = recurrent_model
+        .then(|| {
+            state
+                .as_ref()
+                .and_then(|kv| recurrent_extension_start(&kv.cached, prompt))
+        })
+        .flatten();
+    let checkpoint_attempted =
+        denoise_req.is_none() && recurrent_model && live_turn_start.is_none();
+    let restored_turn_start = if checkpoint_attempted {
         let _gp = req.and_then(|r| r.gate_pass());
         state
             .as_mut()
@@ -1670,15 +1683,15 @@ pub(crate) fn generate_dense_backend(
     // else (divergent prompt, identical resend, first-ever call) zero-resets every DeltaNet layer's
     // conv/S state and re-prefills from scratch. Dense/attention models keep the generic
     // longest-common-prefix diff.
-    let start = if denoise_req.is_some() {
+    let (start, state_path) = if denoise_req.is_some() {
         // No-op: a denoise call never touches `cached` (it isn't part of the prompt/generation
         // token stream) — `cached.truncate(start)` below is then a truncate-to-current-length.
-        cached.len()
-    } else if c.qwen35 || c.qwen4exp || c.bailingmoe3 {
-        if let Some(pfx) = recurrent_extension_start(cached, prompt) {
-            pfx
+        (cached.len(), "denoise")
+    } else if recurrent_model {
+        if let Some(pfx) = live_turn_start {
+            (pfx, "live")
         } else if let Some(pfx) = restored_turn_start {
-            pfx
+            (pfx, "checkpoint")
         } else {
             // Non-extending prompt (divergent / identical resend / first-ever call): the append-only
             // recurrent state can't rewind to an arbitrary prefix, so zero every DeltaNet layer's
@@ -1707,15 +1720,25 @@ pub(crate) fn generate_dense_backend(
                 be.upload(state.as_ref(), &zeros)
                     .map_err(|e| anyhow!("{e}"))?;
             }
+            // This cache is now being rebuilt for a different token stream. A checkpoint from
+            // the old stream contains only recurrent/PLE state; restoring it later beside the
+            // attention/QSA rows overwritten below would create a mixed, invalid model state.
+            if let Some(ck) = turn_recurrent_ckpt.as_mut() {
+                ck.invalidate();
+            }
             cached.clear();
-            0
+            (0, "reset")
         }
     } else {
         // `saturating_sub(1)` guards the empty-prompt underflow defensively; the early guard
         // above already rejects an empty non-denoise prompt, so for any real call this is the
         // plain `prompt.len() - 1` (leave ≥1 prompt token to sample the first logits from).
-        common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1))
+        (
+            common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1)),
+            "prefix",
+        )
     };
+    let start_before_ring = start;
     // Only a strict, newly processed prefix can become a checkpoint. If the hint is malformed,
     // tokenization did not preserve the rendered string prefix, or the state already lies past it,
     // leave the previous checkpoint intact and use the ordinary generation path.
@@ -1765,6 +1788,34 @@ pub(crate) fn generate_dense_backend(
     } else {
         start
     };
+    if state_trace {
+        let qsa_ratio = c
+            .qwen4exp
+            .then(|| c.compress_ratios.iter().copied().max().unwrap_or(4).max(1))
+            .unwrap_or(1);
+        tracing::warn!(
+            "[state trace] cold_slot={} recurrent={} prompt={} cached_before={} common={} live_start={:?} checkpoint_attempted={} checkpoint_start={:?} path={} start_before_ring={} start={} checkpoint_boundary={:?} kv_ring={} segmented_kv={} qsa_ratio={} start_mod_qsa={} prompt_mod_qsa={} start_mod_32k={} prompt_mod_32k={}",
+            state_was_cold,
+            recurrent_model,
+            prompt.len(),
+            cached_before_restore,
+            common_before_restore.unwrap_or(0),
+            live_turn_start,
+            checkpoint_attempted,
+            restored_turn_start,
+            state_path,
+            start_before_ring,
+            start,
+            turn_checkpoint_boundary,
+            kv_ring,
+            segmented_kv_enabled,
+            qsa_ratio,
+            start % qsa_ratio,
+            prompt.len() % qsa_ratio,
+            start % 32_768,
+            prompt.len() % 32_768,
+        );
+    }
     cached.truncate(start);
 
     // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.

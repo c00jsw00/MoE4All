@@ -12661,6 +12661,585 @@ mod tests {
         bytemuck::cast_slice(&bytes).to_vec()
     }
 
+    /// Qwen3.8 uses 32K physical KV segments and rewrites a non-block-aligned suffix when a chat
+    /// turn restores its recurrent checkpoint. Keep the real geometry here: a reduced segment
+    /// size would miss address-shift and boundary bugs that only appear at the production cut.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn qsa_segmented_32k_boundary_and_suffix_rewrite_match_flat() {
+        use infr_core::backend::SegmentedKvSpec;
+
+        const MIB: usize = 1024 * 1024;
+        const SEGMENT_ROWS: usize = 32 * 1024;
+        const HD: usize = 128;
+        const RATIO: usize = 4;
+        const HEADS: usize = 4;
+        const TOP: usize = 512;
+
+        let be = VulkanBackend::new().unwrap();
+        let _pool = be.init_unified_vram(224 * MIB).unwrap();
+        let kv_len = SEGMENT_ROWS + 6;
+        let blocks = kv_len / RATIO;
+        let raw_segment_elements = SEGMENT_ROWS * HD;
+        let block_segment_elements = (SEGMENT_ROWS / RATIO) * HD;
+        let raw_segment_bytes = raw_segment_elements * 2;
+        let block_segment_bytes = block_segment_elements * 4;
+
+        let raw_segmented = be
+            .alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 2 * raw_segment_bytes,
+                segment_bytes: raw_segment_bytes,
+                segment_elements: raw_segment_elements,
+                max_segments: 2,
+            })
+            .unwrap()
+            .unwrap();
+        let block_segmented = be
+            .alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 2 * block_segment_bytes,
+                segment_bytes: block_segment_bytes,
+                segment_elements: block_segment_elements,
+                max_segments: 2,
+            })
+            .unwrap()
+            .unwrap();
+        be.ensure_segmented_kv_batch(&[raw_segmented.as_ref(), block_segmented.as_ref()], 2)
+            .unwrap();
+        let raw_virtual = crate::as_segmented_kv(raw_segmented.as_ref()).unwrap();
+        let block_virtual = crate::as_segmented_kv(block_segmented.as_ref()).unwrap();
+        let segment_shifts = Some((
+            raw_segment_elements.trailing_zeros(),
+            block_segment_elements.trailing_zeros(),
+        ));
+
+        let mut raw_bits: Vec<u16> = (0..kv_len * HD)
+            .map(|i| half::f16::from_f32(((i * 53 + 7) % 127) as f32 / 96.0 - 0.65).to_bits())
+            .collect();
+        let raw_flat = be.alloc(raw_bits.len() * 2, BufferUsage::KvCache).unwrap();
+        let block_flat = be.alloc(blocks * HD * 4, BufferUsage::KvCache).unwrap();
+        let qv: Vec<f32> = (0..HEADS * HD)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 70.0 - 0.7)
+            .collect();
+        let norm: Vec<f32> = (0..HD).map(|i| 0.8 + (i % 13) as f32 * 0.01).collect();
+        let q = upf16(&be, &qv);
+        let nw = upf32(&be, &norm);
+        let scores_flat = be.alloc(blocks * 4, BufferUsage::Readback).unwrap();
+        let scores_segmented = be.alloc(blocks * 4, BufferUsage::Readback).unwrap();
+        let ids_flat = be.alloc(TOP * 4, BufferUsage::Readback).unwrap();
+        let ids_segmented = be.alloc(TOP * 4, BufferUsage::Readback).unwrap();
+        let work_flat = be
+            .alloc(QSA_TOPK_PARALLEL_WORK_BYTES, BufferUsage::Activations)
+            .unwrap();
+        let work_segmented = be
+            .alloc(QSA_TOPK_PARALLEL_WORK_BYTES, BufferUsage::Activations)
+            .unwrap();
+
+        let upload_raw = |bits: &[u16]| {
+            be.upload(raw_flat.as_ref(), bytemuck::cast_slice(bits))
+                .unwrap();
+            let segments = raw_virtual.segments.lock().unwrap();
+            for (index, src) in bytemuck::cast_slice(bits)
+                .chunks(raw_segment_bytes)
+                .enumerate()
+            {
+                be.upload(&segments[index], src).unwrap();
+            }
+        };
+
+        for phase in 0..2 {
+            let compress_from = if phase == 0 {
+                0
+            } else {
+                // Re-rendered chat history commonly resumes within a QSA block. Recompute that
+                // entire block, including its one retained prefix row and rewritten suffix rows.
+                let rewind = SEGMENT_ROWS - 3;
+                for (i, value) in raw_bits[rewind * HD..].iter_mut().enumerate() {
+                    *value =
+                        half::f16::from_f32(((i * 29 + 17) % 113) as f32 / 80.0 - 0.72).to_bits();
+                }
+                rewind / RATIO
+            };
+            upload_raw(&raw_bits);
+
+            let rec = be.recorder().unwrap();
+            rec.qsa_indexer(
+                q.as_ref(),
+                raw_flat.as_ref(),
+                block_flat.as_ref(),
+                nw.as_ref(),
+                scores_flat.as_ref(),
+                Some(work_flat.as_ref()),
+                ids_flat.as_ref(),
+                1,
+                kv_len as u32,
+                compress_from as u32,
+                HEADS as u32,
+                HD as u32,
+                TOP as u32,
+                RATIO as u32,
+                64,
+                10_000.0,
+                1e-6,
+                1.0 / (HD as f32).sqrt(),
+                None,
+            );
+            rec.qsa_indexer(
+                q.as_ref(),
+                raw_virtual.table_buffer(),
+                block_virtual.table_buffer(),
+                nw.as_ref(),
+                scores_segmented.as_ref(),
+                Some(work_segmented.as_ref()),
+                ids_segmented.as_ref(),
+                1,
+                kv_len as u32,
+                compress_from as u32,
+                HEADS as u32,
+                HD as u32,
+                TOP as u32,
+                RATIO as u32,
+                64,
+                10_000.0,
+                1e-6,
+                1.0 / (HD as f32).sqrt(),
+                segment_shifts,
+            );
+            rec.finish().unwrap();
+
+            let flat_scores = download_f32(&be, scores_flat.as_ref(), blocks);
+            let segmented_scores = download_f32(&be, scores_segmented.as_ref(), blocks);
+            let score_err = flat_scores
+                .iter()
+                .zip(&segmented_scores)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                score_err < 1e-5,
+                "phase {phase}: segmented QSA scores diverge at 32K: {score_err:e}"
+            );
+
+            let mut flat_id_bytes = vec![0u8; TOP * 4];
+            let mut segmented_id_bytes = vec![0u8; TOP * 4];
+            be.download(ids_flat.as_ref(), &mut flat_id_bytes).unwrap();
+            be.download(ids_segmented.as_ref(), &mut segmented_id_bytes)
+                .unwrap();
+            let flat_ids = bytemuck::cast_slice::<u8, u32>(&flat_id_bytes);
+            let segmented_ids = bytemuck::cast_slice::<u8, u32>(&segmented_id_bytes);
+            assert_eq!(
+                segmented_ids, flat_ids,
+                "phase {phase}: segmented QSA selected different blocks"
+            );
+            let mut expected: Vec<usize> = (0..blocks).collect();
+            expected.sort_unstable_by(|&a, &b| {
+                flat_scores[b]
+                    .total_cmp(&flat_scores[a])
+                    .then_with(|| a.cmp(&b))
+            });
+            expected.truncate(TOP);
+            expected.sort_unstable();
+            assert_eq!(
+                flat_ids,
+                expected.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                "phase {phase}: parallel QSA top-k differs from score ordering"
+            );
+
+            let flat_blocks = download_f32(&be, block_flat.as_ref(), blocks * HD);
+            let physical = block_virtual.segments.lock().unwrap();
+            let mut segmented_blocks = Vec::with_capacity(2 * block_segment_elements);
+            for segment in physical.iter() {
+                segmented_blocks.extend(download_f32(&be, segment, block_segment_elements));
+            }
+            let block_err = flat_blocks
+                .iter()
+                .zip(&segmented_blocks)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                block_err < 1e-5,
+                "phase {phase}: segmented QSA block cache diverges at 32K: {block_err:e}"
+            );
+        }
+
+        // The production default is planar Q8 K/V, whose scale plane is local to each physical
+        // segment. Exercise a single write that straddles the exact 32K cut, then read those rows
+        // through both QSA decode gather and batched-attention. Comparing with the flat-Q8 twin
+        // isolates segmented code/scale addressing from quantization error.
+        const ATTN_HD: usize = 256;
+        const N_HEAD: usize = 24;
+        const N_KV: usize = 2;
+        const ROW_ELEMS: usize = N_KV * ATTN_HD;
+        const CROSS_ROWS: usize = 8;
+        const SELECTED: usize = 2;
+        let kv_segment_elements = SEGMENT_ROWS * ROW_ELEMS;
+        let kv_segment_bytes = (kv_segment_elements / 32 * 34).next_multiple_of(4);
+        let kv_cap = 2 * kv_segment_elements;
+        let flat_q8_bytes = (kv_cap / 32 * 34).next_multiple_of(4);
+        let kv_shift = kv_segment_elements.trailing_zeros();
+        let cross_start_row = SEGMENT_ROWS - RATIO;
+        let cross_start = cross_start_row * ROW_ELEMS;
+
+        let alloc_segmented_q8 = || {
+            be.alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 2 * kv_segment_bytes,
+                segment_bytes: kv_segment_bytes,
+                segment_elements: kv_segment_elements,
+                max_segments: 2,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let k_segmented = alloc_segmented_q8();
+        let v_segmented = alloc_segmented_q8();
+        be.ensure_segmented_kv_batch(&[k_segmented.as_ref(), v_segmented.as_ref()], 2)
+            .unwrap();
+        let k_virtual = crate::as_segmented_kv(k_segmented.as_ref()).unwrap();
+        let v_virtual = crate::as_segmented_kv(v_segmented.as_ref()).unwrap();
+        let k_flat = be.alloc(flat_q8_bytes, BufferUsage::KvCache).unwrap();
+        let v_flat = be.alloc(flat_q8_bytes, BufferUsage::KvCache).unwrap();
+
+        let k_values: Vec<f32> = (0..CROSS_ROWS * ROW_ELEMS)
+            .map(|i| ((i * 43 + 5) % 109) as f32 / 85.0 - 0.65)
+            .collect();
+        let v_values: Vec<f32> = (0..CROSS_ROWS * ROW_ELEMS)
+            .map(|i| ((i * 31 + 23) % 103) as f32 / 80.0 - 0.6)
+            .collect();
+        let k_src = upf16(&be, &k_values);
+        let v_src = upf16(&be, &v_values);
+        let selected_ids = [
+            (SEGMENT_ROWS / RATIO - 1) as u32,
+            (SEGMENT_ROWS / RATIO) as u32,
+        ];
+        let ids = be.alloc(SELECTED * 4, BufferUsage::Activations).unwrap();
+        be.upload(ids.as_ref(), bytemuck::cast_slice(&selected_ids))
+            .unwrap();
+
+        let gathered_rows = SELECTED * RATIO;
+        let kd_flat = be
+            .alloc(gathered_rows * ROW_ELEMS * 2, BufferUsage::Readback)
+            .unwrap();
+        let vd_flat = be
+            .alloc(gathered_rows * ROW_ELEMS * 2, BufferUsage::Readback)
+            .unwrap();
+        let kd_segmented = be
+            .alloc(gathered_rows * ROW_ELEMS * 2, BufferUsage::Readback)
+            .unwrap();
+        let vd_segmented = be
+            .alloc(gathered_rows * ROW_ELEMS * 2, BufferUsage::Readback)
+            .unwrap();
+        let attn_qv: Vec<f32> = (0..N_HEAD * ATTN_HD)
+            .map(|i| ((i * 29 + 19) % 113) as f32 / 90.0 - 0.6)
+            .collect();
+        let attn_q = upf16(&be, &attn_qv);
+        let attn_flat = be
+            .alloc(N_HEAD * ATTN_HD * 4, BufferUsage::Readback)
+            .unwrap();
+        let attn_segmented = be
+            .alloc(N_HEAD * ATTN_HD * 4, BufferUsage::Readback)
+            .unwrap();
+
+        let rec = be.recorder().unwrap();
+        for (src, flat, segmented) in [
+            (k_src.as_ref(), k_flat.as_ref(), k_virtual.table_buffer()),
+            (v_src.as_ref(), v_flat.as_ref(), v_virtual.table_buffer()),
+        ] {
+            rec.store_q8(
+                src,
+                flat,
+                CROSS_ROWS * ROW_ELEMS,
+                cross_start,
+                kv_cap,
+                true,
+                0,
+            );
+            rec.store_q8_segmented(
+                src,
+                segmented,
+                CROSS_ROWS * ROW_ELEMS,
+                cross_start,
+                true,
+                0,
+                kv_shift,
+            );
+        }
+        rec.qsa_gather(
+            k_flat.as_ref(),
+            v_flat.as_ref(),
+            ids.as_ref(),
+            kd_flat.as_ref(),
+            vd_flat.as_ref(),
+            SELECTED as u32,
+            (SEGMENT_ROWS / RATIO + 1) as u32,
+            0,
+            RATIO as u32,
+            ROW_ELEMS as u32,
+            true,
+            true,
+            kv_cap as u32,
+            kv_cap as u32,
+            None,
+        );
+        rec.qsa_gather(
+            k_virtual.table_buffer(),
+            v_virtual.table_buffer(),
+            ids.as_ref(),
+            kd_segmented.as_ref(),
+            vd_segmented.as_ref(),
+            SELECTED as u32,
+            (SEGMENT_ROWS / RATIO + 1) as u32,
+            0,
+            RATIO as u32,
+            ROW_ELEMS as u32,
+            true,
+            true,
+            0,
+            0,
+            Some(kv_shift),
+        );
+        let qsa_kv_len = (SEGMENT_ROWS + RATIO) as u32;
+        rec.qsa_attention_batch(
+            attn_q.as_ref(),
+            k_flat.as_ref(),
+            v_flat.as_ref(),
+            ids.as_ref(),
+            attn_flat.as_ref(),
+            1,
+            qsa_kv_len,
+            N_HEAD as u32,
+            N_KV as u32,
+            ATTN_HD as u32,
+            SELECTED as u32,
+            RATIO as u32,
+            1.0 / (ATTN_HD as f32).sqrt(),
+            true,
+            true,
+            kv_cap as u32,
+            kv_cap as u32,
+            None,
+        );
+        rec.qsa_attention_batch(
+            attn_q.as_ref(),
+            k_virtual.table_buffer(),
+            v_virtual.table_buffer(),
+            ids.as_ref(),
+            attn_segmented.as_ref(),
+            1,
+            qsa_kv_len,
+            N_HEAD as u32,
+            N_KV as u32,
+            ATTN_HD as u32,
+            SELECTED as u32,
+            RATIO as u32,
+            1.0 / (ATTN_HD as f32).sqrt(),
+            true,
+            true,
+            0,
+            0,
+            Some(kv_shift),
+        );
+        rec.finish().unwrap();
+
+        for (name, flat, segmented, bytes) in [
+            (
+                "K",
+                kd_flat.as_ref(),
+                kd_segmented.as_ref(),
+                gathered_rows * ROW_ELEMS * 2,
+            ),
+            (
+                "V",
+                vd_flat.as_ref(),
+                vd_segmented.as_ref(),
+                gathered_rows * ROW_ELEMS * 2,
+            ),
+        ] {
+            let mut flat_bytes = vec![0u8; bytes];
+            let mut segmented_bytes = vec![0u8; bytes];
+            be.download(flat, &mut flat_bytes).unwrap();
+            be.download(segmented, &mut segmented_bytes).unwrap();
+            assert_eq!(
+                segmented_bytes, flat_bytes,
+                "segmented Q8 QSA {name} gather differs across 32K"
+            );
+        }
+        let flat_attention = download_f32(&be, attn_flat.as_ref(), N_HEAD * ATTN_HD);
+        let segmented_attention = download_f32(&be, attn_segmented.as_ref(), N_HEAD * ATTN_HD);
+        assert_eq!(
+            segmented_attention, flat_attention,
+            "segmented Q8 QSA attention differs across 32K"
+        );
+    }
+
+    /// A cached multi-token continuation must be causal: every row must match a scalar forward at
+    /// that exact visible length. This is the QSA counterpart of the GDN cached-chunk regression
+    /// test upstream added after multi-token continuation had silently discarded recurrent state.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn qsa_cached_suffix_matches_scalar_continuation() {
+        const PREFIX: usize = 4097;
+        const ROWS: usize = 9;
+        const HD: usize = 128;
+        const HEADS: usize = 4;
+        const RATIO: usize = 4;
+        const TOP: usize = 512;
+
+        let be = VulkanBackend::new().unwrap();
+        let kv_len = PREFIX + ROWS;
+        let blocks = kv_len / RATIO;
+
+        let raw_values: Vec<f32> = (0..kv_len * HD)
+            .map(|i| ((i * 53 + 7) % 127) as f32 / 96.0 - 0.65)
+            .collect();
+        let kv_values: Vec<f32> = (0..kv_len * HD)
+            .map(|i| ((i * 31 + 23) % 103) as f32 / 80.0 - 0.6)
+            .collect();
+        let query_values: Vec<f32> = (0..ROWS * HEADS * HD)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 70.0 - 0.7)
+            .collect();
+        let norm: Vec<f32> = (0..HD).map(|i| 0.8 + (i % 13) as f32 * 0.01).collect();
+
+        let raw = upf16(&be, &raw_values);
+        let kv = upf16(&be, &kv_values);
+        let queries = upf16(&be, &query_values);
+        let scalar_query = upf16(&be, &query_values[..HEADS * HD]);
+        let nw = upf32(&be, &norm);
+
+        let batch_blocks = be.alloc(blocks * HD * 4, BufferUsage::Activations).unwrap();
+        let scalar_blocks = be.alloc(blocks * HD * 4, BufferUsage::Activations).unwrap();
+        let batch_scores = be
+            .alloc(ROWS * blocks * 4, BufferUsage::Activations)
+            .unwrap();
+        let scalar_scores = be.alloc(blocks * 4, BufferUsage::Activations).unwrap();
+        let batch_ids = be.alloc(ROWS * TOP * 4, BufferUsage::Readback).unwrap();
+        let scalar_ids = be.alloc(TOP * 4, BufferUsage::Readback).unwrap();
+        let batch_out = be
+            .alloc(ROWS * HEADS * HD * 4, BufferUsage::Readback)
+            .unwrap();
+        let scalar_out = be.alloc(HEADS * HD * 4, BufferUsage::Readback).unwrap();
+
+        let rec = be.recorder().unwrap();
+        rec.qsa_indexer(
+            queries.as_ref(),
+            raw.as_ref(),
+            batch_blocks.as_ref(),
+            nw.as_ref(),
+            batch_scores.as_ref(),
+            None,
+            batch_ids.as_ref(),
+            ROWS as u32,
+            kv_len as u32,
+            0,
+            HEADS as u32,
+            HD as u32,
+            TOP as u32,
+            RATIO as u32,
+            64,
+            10_000.0,
+            1e-6,
+            1.0 / (HD as f32).sqrt(),
+            None,
+        );
+        rec.qsa_attention_batch(
+            queries.as_ref(),
+            kv.as_ref(),
+            kv.as_ref(),
+            batch_ids.as_ref(),
+            batch_out.as_ref(),
+            ROWS as u32,
+            kv_len as u32,
+            HEADS as u32,
+            1,
+            HD as u32,
+            TOP as u32,
+            RATIO as u32,
+            1.0 / (HD as f32).sqrt(),
+            false,
+            false,
+            0,
+            0,
+            None,
+        );
+        rec.finish().unwrap();
+
+        let mut batch_id_bytes = vec![0u8; ROWS * TOP * 4];
+        be.download(batch_ids.as_ref(), &mut batch_id_bytes)
+            .unwrap();
+        let batch = download_f32(&be, batch_out.as_ref(), ROWS * HEADS * HD);
+
+        for row in 0..ROWS {
+            let visible = PREFIX + row + 1;
+            let q_begin = row * HEADS * HD;
+            let scalar_query_bits: Vec<u16> = query_values[q_begin..q_begin + HEADS * HD]
+                .iter()
+                .map(|&x| half::f16::from_f32(x).to_bits())
+                .collect();
+            be.upload(
+                scalar_query.as_ref(),
+                bytemuck::cast_slice(&scalar_query_bits),
+            )
+            .unwrap();
+
+            let rec = be.recorder().unwrap();
+            rec.qsa_indexer(
+                scalar_query.as_ref(),
+                raw.as_ref(),
+                scalar_blocks.as_ref(),
+                nw.as_ref(),
+                scalar_scores.as_ref(),
+                None,
+                scalar_ids.as_ref(),
+                1,
+                visible as u32,
+                0,
+                HEADS as u32,
+                HD as u32,
+                TOP as u32,
+                RATIO as u32,
+                64,
+                10_000.0,
+                1e-6,
+                1.0 / (HD as f32).sqrt(),
+                None,
+            );
+            rec.qsa_attention_batch(
+                scalar_query.as_ref(),
+                kv.as_ref(),
+                kv.as_ref(),
+                scalar_ids.as_ref(),
+                scalar_out.as_ref(),
+                1,
+                visible as u32,
+                HEADS as u32,
+                1,
+                HD as u32,
+                TOP as u32,
+                RATIO as u32,
+                1.0 / (HD as f32).sqrt(),
+                false,
+                false,
+                0,
+                0,
+                None,
+            );
+            rec.finish().unwrap();
+
+            let mut scalar_id_bytes = vec![0u8; TOP * 4];
+            be.download(scalar_ids.as_ref(), &mut scalar_id_bytes)
+                .unwrap();
+            assert_eq!(
+                &batch_id_bytes[row * TOP * 4..(row + 1) * TOP * 4],
+                &scalar_id_bytes,
+                "cached QSA chunk row {row} selected different blocks than scalar continuation"
+            );
+
+            let scalar = download_f32(&be, scalar_out.as_ref(), HEADS * HD);
+            assert_eq!(
+                &batch[row * HEADS * HD..(row + 1) * HEADS * HD],
+                &scalar,
+                "cached QSA chunk row {row} differs from scalar continuation"
+            );
+        }
+    }
+
     fn run_deltanet_strided_parity(rows: usize, nv: usize, nk: usize, kd: usize, vd: usize) {
         let be = VulkanBackend::new().unwrap();
         let stride = 2 * nk * kd + nv * vd + 7;

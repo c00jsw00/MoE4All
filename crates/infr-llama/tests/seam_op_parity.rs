@@ -54,6 +54,58 @@ fn run(
     o
 }
 
+/// As [`run`], but also download one input that the op mutates in place. Recurrent kernels can
+/// produce the right rows for the current batch while persisting the wrong state for the next
+/// execute, so output-only parity is not enough for them.
+fn run_with_mutated_state(
+    be: &dyn Backend,
+    g: &Graph,
+    inputs: &[(TensorId, &[f32])],
+    weights: &[(TensorId, &[f32])],
+    out: TensorId,
+    out_len: usize,
+    state: TensorId,
+    state_len: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let plan = be.compile(g).expect("compile");
+    let mut keep: Vec<(TensorId, Box<dyn infr_core::backend::Buffer>)> = Vec::new();
+    for (id, data) in inputs {
+        let buf = be
+            .alloc(data.len() * 4, BufferUsage::Activations)
+            .expect("alloc in");
+        be.upload(buf.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        keep.push((*id, buf));
+    }
+    for (id, data) in weights {
+        let buf = be
+            .alloc(data.len() * 4, BufferUsage::Weights)
+            .expect("alloc w");
+        be.upload(buf.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        keep.push((*id, buf));
+    }
+    let obuf = be
+        .alloc(out_len * 4, BufferUsage::Readback)
+        .expect("alloc out");
+    let mut b = Bindings::new();
+    for (id, buf) in &keep {
+        b.bind(*id, buf.as_ref());
+    }
+    b.bind(out, obuf.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+
+    let mut o = vec![0f32; out_len];
+    be.download(obuf.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    let state_buf = keep
+        .iter()
+        .find_map(|(id, buf)| (*id == state).then_some(buf.as_ref()))
+        .expect("mutated state input");
+    let mut s = vec![0f32; state_len];
+    be.download(state_buf, bytemuck::cast_slice_mut(&mut s))
+        .unwrap();
+    (o, s)
+}
+
 fn gpu() -> Option<infr_vulkan::VulkanBackend> {
     infr_vulkan::VulkanBackend::new().ok()
 }
@@ -791,11 +843,14 @@ fn conv1d_silu_parity() {
         return;
     };
     let cpu = infr_cpu::CpuBackend::new();
-    let (rows, cc, kernel) = (4usize, 32usize, 4usize);
+    // Qwen3.8 PLE expands its dilated 4-tap convolution into a 10-tap dense kernel. Use a
+    // realistic short conversation suffix and a nonzero incoming history: output-only parity can
+    // miss a wrong final history that poisons the following decode/turn.
+    let (rows, cc, kernel) = (155usize, 32usize, 10usize);
     let mut g = Graph::new();
     let x = g.input(f32d(rows * cc));
     let w = g.weight(f32d(cc * kernel));
-    let state = g.input(f32d((kernel - 1) * cc)); // zeroed history (calloc)
+    let state = g.input(f32d((kernel - 1) * cc));
     let dst = g.output(f32d(rows * cc));
     g.push(Op::Conv1dSilu {
         x,
@@ -808,25 +863,55 @@ fn conv1d_silu_parity() {
     });
     let xi = gen(rows * cc, 6);
     let wi = gen(cc * kernel, 7);
-    let st = vec![0f32; (kernel - 1) * cc];
-    let c = run(
+    let st = gen((kernel - 1) * cc, 8);
+
+    // Independent token-serial oracle for both the batch output and the persisted history.
+    let mut expected_state = st.clone();
+    let mut expected = vec![0.0f32; rows * cc];
+    for t in 0..rows {
+        for ch in 0..cc {
+            let mut acc = 0.0f32;
+            for k in 0..kernel - 1 {
+                acc += expected_state[k * cc + ch] * wi[ch * kernel + k];
+            }
+            acc += xi[t * cc + ch] * wi[ch * kernel + kernel - 1];
+            expected[t * cc + ch] = acc / (1.0 + (-acc).exp());
+        }
+        expected_state.copy_within(cc.., 0);
+        expected_state[(kernel - 2) * cc..].copy_from_slice(&xi[t * cc..(t + 1) * cc]);
+    }
+
+    let (c, c_state) = run_with_mutated_state(
         &cpu,
         &g,
         &[(x, &xi), (state, &st)],
         &[(w, &wi)],
         dst,
         rows * cc,
+        state,
+        (kernel - 1) * cc,
     );
-    let v = run(
+    let (v, v_state) = run_with_mutated_state(
         &vk,
         &g,
         &[(x, &xi), (state, &st)],
         &[(w, &wi)],
         dst,
         rows * cc,
+        state,
+        (kernel - 1) * cc,
     );
-    println!("Conv1dSilu max_err={:e}", maxerr(&c, &v));
-    assert!(maxerr(&c, &v) < 1e-3, "Conv1dSilu diverges");
+    println!(
+        "Conv1dSilu rows={rows} kernel={kernel} cpu_out={:e} vk_out={:e} cpu_state={:e} vk_state={:e}",
+        maxerr(&expected, &c),
+        maxerr(&expected, &v),
+        maxerr(&expected_state, &c_state),
+        maxerr(&expected_state, &v_state),
+    );
+    assert!(maxerr(&expected, &c) < 1e-5, "CPU Conv1dSilu diverges");
+    assert!(maxerr(&expected, &v) < 1e-3, "Vulkan Conv1dSilu diverges");
+    assert_eq!(c_state, expected_state, "CPU Conv1dSilu final state");
+    assert_eq!(v_state, expected_state, "Vulkan Conv1dSilu final state");
 }
 
 #[test]
@@ -839,7 +924,7 @@ fn deltanet_chunked_parity() {
         return;
     };
     let cpu = infr_cpu::CpuBackend::new();
-    let (rows, nv, nk, kd, vd) = (130usize, 8usize, 4usize, 128usize, 128usize);
+    let (rows, nv, nk, kd, vd) = (130usize, 6usize, 2usize, 128usize, 128usize);
     let mut g = Graph::new();
     let q = g.input(f32d(rows * nk * kd));
     let k = g.input(f32d(rows * nk * kd));
@@ -887,13 +972,86 @@ fn deltanet_chunked_parity() {
         (state, &st[..]),
     ];
     let ws = [(a_coef, &aci[..]), (dt_bias, &dti[..])];
-    let c = run(&cpu, &g, &ins, &ws, dst, rows * nv * vd);
-    let vv = run(&vk, &g, &ins, &ws, dst, rows * nv * vd);
+    let state_len = nv * kd * vd;
+    let (c, c_state) =
+        run_with_mutated_state(&cpu, &g, &ins, &ws, dst, rows * nv * vd, state, state_len);
+    let (vv, vv_state) =
+        run_with_mutated_state(&vk, &g, &ins, &ws, dst, rows * nv * vd, state, state_len);
     let e = maxerr(&c, &vv);
-    println!("DeltaNet-chunked rows={rows} max_err={e:e}");
+    let state_e = maxerr(&c_state, &vv_state);
+    println!("DeltaNet-chunked rows={rows} output_max_err={e:e} state_max_err={state_e:e}");
     assert!(
         e < 1e-3,
         "chunked DeltaNet diverges from the sequential oracle"
+    );
+    assert!(
+        state_e < 1e-3,
+        "chunked DeltaNet persists a state that diverges from the sequential oracle"
+    );
+
+    // Feed one decode token through a second execute, initialized from each backend's prefill
+    // state. This is the real transition that a long-context chat takes after every prompt turn.
+    let mut dg = Graph::new();
+    let dq = dg.input(f32d(nk * kd));
+    let dk = dg.input(f32d(nk * kd));
+    let dv = dg.input(f32d(nv * vd));
+    let db = dg.input(f32d(nv));
+    let da = dg.input(f32d(nv));
+    let dac = dg.weight(f32d(nv));
+    let ddt = dg.weight(f32d(nv));
+    let ds = dg.input(f32d(state_len));
+    let dout = dg.output(f32d(nv * vd));
+    dg.push(Op::DeltaNet {
+        q: dq,
+        k: dk,
+        v: dv,
+        b: db,
+        a: da,
+        a_coef: dac,
+        dt_bias: ddt,
+        state: ds,
+        dst: dout,
+        rows: 1,
+        n_vhead: nv as u32,
+        n_khead: nk as u32,
+        head_k: kd as u32,
+        head_v: vd as u32,
+        eps: 1e-6,
+        src_stride: 0,
+    });
+    let (dqi, dki, dvi) = (gen(nk * kd, 21), gen(nk * kd, 22), gen(nv * vd, 23));
+    let (dbi, dai) = (gen(nv, 24), gen(nv, 25));
+    let cpu_inputs = [
+        (dq, &dqi[..]),
+        (dk, &dki[..]),
+        (dv, &dvi[..]),
+        (db, &dbi[..]),
+        (da, &dai[..]),
+        (ds, &c_state[..]),
+    ];
+    let vk_inputs = [
+        (dq, &dqi[..]),
+        (dk, &dki[..]),
+        (dv, &dvi[..]),
+        (db, &dbi[..]),
+        (da, &dai[..]),
+        (ds, &vv_state[..]),
+    ];
+    let dws = [(dac, &aci[..]), (ddt, &dti[..])];
+    let (c_next, c_next_state) =
+        run_with_mutated_state(&cpu, &dg, &cpu_inputs, &dws, dout, nv * vd, ds, state_len);
+    let (v_next, v_next_state) =
+        run_with_mutated_state(&vk, &dg, &vk_inputs, &dws, dout, nv * vd, ds, state_len);
+    let next_e = maxerr(&c_next, &v_next);
+    let next_state_e = maxerr(&c_next_state, &v_next_state);
+    println!("DeltaNet prefill->decode output_max_err={next_e:e} state_max_err={next_state_e:e}");
+    assert!(
+        next_e < 1e-3,
+        "first decode token diverges after DeltaNet prefill"
+    );
+    assert!(
+        next_state_e < 1e-3,
+        "first decode token persists a divergent DeltaNet state"
     );
 }
 

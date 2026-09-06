@@ -405,6 +405,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.debug.coopmat = presence(get, "INFR_DEBUG_COOPMAT");
     p.debug.wide_dispatch = presence(get, "INFR_DEBUG_WIDE_DISPATCH");
     p.debug.chat = presence(get, "INFR_DEBUG_CHAT");
+    p.debug.state_trace = presence(get, "INFR_STATE_TRACE");
     p.debug.moe_counts = presence(get, "INFR_MOE_COUNTS_DEBUG");
     p.debug.moe_counts_dump = presence(get, "INFR_MOE_COUNTS_DUMP");
     p.debug.poison_uninit = presence(get, "INFR_POISON_UNINIT");

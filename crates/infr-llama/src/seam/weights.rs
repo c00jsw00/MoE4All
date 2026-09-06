@@ -604,6 +604,13 @@ fn checkpoint_extension_start(checkpoint: &[u32], prompt: &[u32]) -> Option<usiz
 }
 
 impl TurnRecurrentCkpt {
+    pub(super) fn invalidate(&mut self) {
+        self.valid = false;
+        self.tokens.clear();
+        self.copied.fill(false);
+        self.ple_copied = false;
+    }
+
     /// Start replacing the rolling checkpoint with `tokens`. The existing device buffers are
     /// retained; validity is published only after every recurrent layer has been copied.
     pub(super) fn begin(
@@ -914,10 +921,7 @@ impl SeamKv {
 
     fn invalidate_turn_checkpoint(&mut self) {
         if let Some(ck) = self.turn_recurrent_ckpt.as_mut() {
-            ck.valid = false;
-            ck.tokens.clear();
-            ck.copied.fill(false);
-            ck.ple_copied = false;
+            ck.invalidate();
         }
     }
 
@@ -1311,7 +1315,7 @@ impl SeamKv {
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoint_extension_start;
+    use super::{checkpoint_extension_start, TurnRecurrentCkpt};
 
     #[test]
     fn recurrent_checkpoint_requires_a_nonempty_strict_extension() {
@@ -1322,5 +1326,26 @@ mod tests {
         assert_eq!(checkpoint_extension_start(&[], &[10]), None);
         assert_eq!(checkpoint_extension_start(&[10, 20], &[10, 20]), None);
         assert_eq!(checkpoint_extension_start(&[10, 20], &[10, 99, 30]), None);
+    }
+
+    #[test]
+    fn invalidating_recurrent_checkpoint_clears_all_publish_metadata() {
+        let mut checkpoint = TurnRecurrentCkpt {
+            kbufs: Vec::new(),
+            vbufs: Vec::new(),
+            ple_state: None,
+            layers: Vec::new(),
+            tokens: vec![10, 20, 30],
+            copied: vec![true, true],
+            ple_copied: true,
+            valid: true,
+        };
+
+        checkpoint.invalidate();
+
+        assert!(!checkpoint.valid);
+        assert!(checkpoint.tokens.is_empty());
+        assert_eq!(checkpoint.copied, [false, false]);
+        assert!(!checkpoint.ple_copied);
     }
 }
