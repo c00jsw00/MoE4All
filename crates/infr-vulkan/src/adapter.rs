@@ -424,6 +424,37 @@ struct ScratchPool {
     in_use: HashSet<ScratchKey>,
 }
 
+struct PagedMmqScratch {
+    counts: ScratchKey,
+    offsets: ScratchKey,
+    fill: ScratchKey,
+    bucket_rows: ScratchKey,
+    bucket_wts: ScratchKey,
+    inv_pos: ScratchKey,
+    qa: ScratchKey,
+    qda: ScratchKey,
+    qsa: ScratchKey,
+    ge: ScratchKey,
+    ue: Option<ScratchKey>,
+    ae: ScratchKey,
+    dqa: ScratchKey,
+    dda: ScratchKey,
+    dsa: ScratchKey,
+    ye: ScratchKey,
+}
+
+struct PagedSmallScratch {
+    gbuf: ScratchKey,
+    ubuf: Option<ScratchKey>,
+    abuf: ScratchKey,
+    ybuf: ScratchKey,
+}
+
+enum PagedMoeScratch {
+    Mmq(PagedMmqScratch),
+    Small(PagedSmallScratch),
+}
+
 impl ScratchPool {
     /// Start a new recording after the previous execute has fully drained. Compact here as well as
     /// at the success tail so an execute that returned through an error path cannot leave several
@@ -916,6 +947,80 @@ fn pooled(
     pool.acquire(tag, bytes, |capacity| {
         be_.alloc_uninit(capacity, BufferUsage::Activations)
     })
+    .map_err(|error| {
+        be(format!(
+            "pooled activation scratch '{tag}' ({bytes} bytes) allocation failed: {error}"
+        ))
+    })
+}
+
+/// Reserve every DeltaNet prefill workspace before a paged graph freezes its first expert LUT.
+/// These buffers are reused across serialized layers; allocating them lazily inside `lower_op`
+/// would let unified VRAM retire an expert slot that an earlier recorded layer still addresses.
+fn preallocate_paged_deltanet_scratch(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    pool: &mut ScratchPool,
+) -> Result<()> {
+    let mut seq = [0usize; 4];
+    let mut split = [0usize; 6];
+    for op in &graph.ops {
+        let Op::DeltaNet {
+            rows,
+            n_vhead,
+            n_khead,
+            head_k,
+            head_v,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let (rows, nv, nk, kd, vd) = (
+            *rows as usize,
+            *n_vhead as usize,
+            *n_khead as usize,
+            *head_k as usize,
+            *head_v as usize,
+        );
+        let chunked = rows >= 2 && be_.cfg().kernels.vulkan.dn_chunk;
+        if chunked
+            && kd == 128
+            && vd.is_multiple_of(crate::recorder::DN_SEQ_NCOL)
+            && be_.cfg().kernels.vulkan.dn_chunk_scan
+            && be_.cfg().kernels.vulkan.dn_split
+        {
+            seq[0] = seq[0].max((rows * nk * kd * 4).max(4));
+            seq[1] = seq[1].max((rows * nk * kd * 4).max(4));
+            seq[2] = seq[2].max((rows * nv * 4).max(4));
+            seq[3] = seq[3].max((rows * nv * 4).max(4));
+        } else if chunked && be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.dn_split {
+            let nchunk = rows.div_ceil(32);
+            split[0] = split[0].max((rows * nk * kd * 4).max(4));
+            split[1] = split[1].max((rows * nk * kd * 4).max(4));
+            split[2] = split[2].max((nchunk * nk * 1024 * 4).max(4));
+            split[3] = split[3].max((nchunk * nk * 1024 * 4).max(4));
+            split[4] = split[4].max((nchunk * nv * 32 * 4).max(4));
+            split[5] = split[5].max((nchunk * nv * 32 * 4).max(4));
+        }
+    }
+    for (tag, bytes) in [
+        ("dn_seq_kn", seq[0]),
+        ("dn_seq_qn", seq[1]),
+        ("dn_seq_bet", seq[2]),
+        ("dn_seq_dec", seq[3]),
+        ("dn_split_kn", split[0]),
+        ("dn_split_qn", split[1]),
+        ("dn_split_dk", split[2]),
+        ("dn_split_dq", split[3]),
+        ("dn_split_bg", split[4]),
+        ("dn_split_gg", split[5]),
+    ] {
+        if bytes != 0 {
+            pooled(pool, be_, tag, bytes)?;
+        }
+    }
+    Ok(())
 }
 
 /// Small-m MoE scratch handle: a pooled `(tag, bytes)` key (the default — rides the per-execute
@@ -4467,12 +4572,10 @@ fn lower_op(
                 && be_.cfg().kernels.vulkan.dn_split
             {
                 // alloc_uninit: every slot the scan reads is written by norm/gates first.
-                let kn =
-                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
-                let qn =
-                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
-                let bet = be_.alloc_uninit((rows_ * nv_ * 4).max(4), BufferUsage::Activations)?;
-                let dec = be_.alloc_uninit((rows_ * nv_ * 4).max(4), BufferUsage::Activations)?;
+                let kn = pooled(pool, be_, "dn_seq_kn", rows_ * nk_ * kd_ * 4)?;
+                let qn = pooled(pool, be_, "dn_seq_qn", rows_ * nk_ * kd_ * 4)?;
+                let bet = pooled(pool, be_, "dn_seq_bet", rows_ * nv_ * 4)?;
+                let dec = pooled(pool, be_, "dn_seq_dec", rows_ * nv_ * 4)?;
                 rec.deltanet_seq_split(
                     r(*q)?,
                     r(*k)?,
@@ -4483,10 +4586,10 @@ fn lower_op(
                     r(*dt_bias)?,
                     r(*state)?,
                     r(*dst)?,
-                    kn.as_ref(),
-                    qn.as_ref(),
-                    bet.as_ref(),
-                    dec.as_ref(),
+                    pool[&kn].as_ref(),
+                    pool[&qn].as_ref(),
+                    pool[&bet].as_ref(),
+                    pool[&dec].as_ref(),
                     rows_,
                     nv_,
                     nk_,
@@ -4494,7 +4597,6 @@ fn lower_op(
                     vd_,
                     *eps,
                 );
-                transient.extend([kn, qn, bet, dec]);
                 return Ok(());
             }
             // deltanet_chunked_split's prep pass (deltanet_prep.comp) is the ONLY DeltaNet shader
@@ -4506,18 +4608,12 @@ fn lower_op(
             if chunked && be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.dn_split {
                 let nchunk = rows_.div_ceil(32);
                 // alloc_uninit: every slot the scan reads is written by prep/gates first.
-                let kn =
-                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
-                let qn =
-                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
-                let dk =
-                    be_.alloc_uninit((nchunk * nk_ * 1024 * 4).max(4), BufferUsage::Activations)?;
-                let dq =
-                    be_.alloc_uninit((nchunk * nk_ * 1024 * 4).max(4), BufferUsage::Activations)?;
-                let bg =
-                    be_.alloc_uninit((nchunk * nv_ * 32 * 4).max(4), BufferUsage::Activations)?;
-                let gg =
-                    be_.alloc_uninit((nchunk * nv_ * 32 * 4).max(4), BufferUsage::Activations)?;
+                let kn = pooled(pool, be_, "dn_split_kn", rows_ * nk_ * kd_ * 4)?;
+                let qn = pooled(pool, be_, "dn_split_qn", rows_ * nk_ * kd_ * 4)?;
+                let dk = pooled(pool, be_, "dn_split_dk", nchunk * nk_ * 1024 * 4)?;
+                let dq = pooled(pool, be_, "dn_split_dq", nchunk * nk_ * 1024 * 4)?;
+                let bg = pooled(pool, be_, "dn_split_bg", nchunk * nv_ * 32 * 4)?;
+                let gg = pooled(pool, be_, "dn_split_gg", nchunk * nv_ * 32 * 4)?;
                 rec.deltanet_chunked_split(
                     r(*q)?,
                     r(*k)?,
@@ -4528,12 +4624,12 @@ fn lower_op(
                     r(*dt_bias)?,
                     r(*state)?,
                     r(*dst)?,
-                    kn.as_ref(),
-                    qn.as_ref(),
-                    dk.as_ref(),
-                    dq.as_ref(),
-                    bg.as_ref(),
-                    gg.as_ref(),
+                    pool[&kn].as_ref(),
+                    pool[&qn].as_ref(),
+                    pool[&dk].as_ref(),
+                    pool[&dq].as_ref(),
+                    pool[&bg].as_ref(),
+                    pool[&gg].as_ref(),
                     rows_,
                     nv_,
                     nk_,
@@ -4541,7 +4637,6 @@ fn lower_op(
                     vd_,
                     *eps,
                 );
-                transient.extend([kn, qn, dk, dq, bg, gg]);
             } else {
                 // Strided DeltaNet: when q==k==v (all same source buffer), derive stride from
                 // dimensions: 2*nk*kd + nv*vd.  The runner only forms this graph for Vulkan
@@ -6096,6 +6191,9 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &mut local_pool,
         ),
     };
+    if be_.moe_paged() {
+        preallocate_paged_deltanet_scratch(be_, graph, pool)?;
+    }
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
     // carries a `positions` i32 tensor. Read `positions[0]` (decode rows=1, or the start of a
@@ -6425,6 +6523,11 @@ fn pooled_usage(
     usage: BufferUsage,
 ) -> Result<ScratchKey> {
     pool.acquire(tag, bytes, |capacity| be_.alloc_uninit(capacity, usage))
+        .map_err(|error| {
+            be(format!(
+                "pooled {usage:?} scratch '{tag}' ({bytes} bytes) allocation failed: {error}"
+            ))
+        })
 }
 
 /// Host side of paged execution, per `execute_static` call: Dense streaming owns the ring cursor,
@@ -7517,6 +7620,59 @@ fn execute_paged_moe<'a>(
     if !layer_stream && !stage_ids.is_empty() && !stream_synced_for_cpu_push {
         sync_stream(be_, rec, ps)?;
     }
+
+    // Unified VRAM may loan cold expert cells to runtime scratch. Acquire the complete workspace
+    // before freezing any LUT address for this op; otherwise a later lazy allocation can retire a
+    // slot that the just-recorded LUT still names, turning the expert pointer into scratch memory.
+    let paged_mmq_ok = infr_core::tensor::moe_paged_mmq_ok;
+    let paged_mmq_act_ok = if *fused_gate_up {
+        matches!(act, Activation::Silu | Activation::Gelu)
+    } else {
+        matches!(act, Activation::Silu)
+    };
+    let use_paged_mmq = rows > moe_small_m_threshold(be_)
+        && be_.caps().i8_dot
+        && paged_mmq_act_ok
+        && paged_mmq_ok(gdt)
+        && paged_mmq_ok(udt)
+        && paged_mmq_ok(ddt);
+    let moe_scratch = if use_paged_mmq {
+        let n_pairs = n_slots;
+        let npad = n_pairs.div_ceil(64) * 64 + 64;
+        PagedMoeScratch::Mmq(PagedMmqScratch {
+            counts: pooled(pool, be_, "moe_pgb_counts", n_expert * 4)?,
+            offsets: pooled(pool, be_, "moe_pgb_offsets", n_expert * 4)?,
+            fill: pooled(pool, be_, "moe_pgb_fill", n_expert * 4)?,
+            bucket_rows: pooled(pool, be_, "moe_pgb_brows", n_pairs * 4)?,
+            bucket_wts: pooled(pool, be_, "moe_pgb_bwts", n_pairs * 4)?,
+            inv_pos: pooled(pool, be_, "moe_pgb_ipos", n_pairs * 4)?,
+            qa: pooled(pool, be_, "moe_pgb_qa", npad * ne)?,
+            qda: pooled(pool, be_, "moe_pgb_qda", npad * (ne / 32) * 2)?,
+            qsa: pooled(pool, be_, "moe_pgb_qsa", npad * (ne / 32) * 2)?,
+            ge: pooled(pool, be_, "moe_pgb_ge", npad * gu_width * 4)?,
+            ue: if *fused_gate_up {
+                None
+            } else {
+                Some(pooled(pool, be_, "moe_pgb_ue", npad * nff * 4)?)
+            },
+            ae: pooled(pool, be_, "moe_pgb_ae", npad * nff * 4)?,
+            dqa: pooled(pool, be_, "moe_pgb_dqa", npad * nff)?,
+            dda: pooled(pool, be_, "moe_pgb_dda", npad * (nff / 32) * 2)?,
+            dsa: pooled(pool, be_, "moe_pgb_dsa", npad * (nff / 32) * 2)?,
+            ye: pooled(pool, be_, "moe_pgb_ye", npad * ne * 4)?,
+        })
+    } else {
+        PagedMoeScratch::Small(PagedSmallScratch {
+            gbuf: pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?,
+            ubuf: if *fused_gate_up {
+                None
+            } else {
+                Some(pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?)
+            },
+            abuf: pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?,
+            ybuf: pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?,
+        })
+    };
     let mut active_mask = all_active_mask;
     let mut shared_batch_preopened = false;
     let mut promotion_probe = None;
@@ -7579,10 +7735,17 @@ fn execute_paged_moe<'a>(
                 let up_hit_w = stage_and_window(be_, rec, ps, up_id, &[], n_expert, false, true)?;
                 let down_hit_w =
                     stage_and_window(be_, rec, ps, down_id, &[], n_expert, false, true)?;
-                let gbuf = pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?;
-                let ubuf = pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?;
-                let abuf = pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?;
-                let ybuf = pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?;
+                let PagedMoeScratch::Small(scratch) = &moe_scratch else {
+                    unreachable!("decode hit-first path always uses small-m scratch")
+                };
+                let (gbuf, ubuf, abuf, ybuf) = (
+                    scratch.gbuf,
+                    scratch
+                        .ubuf
+                        .expect("hit-first excludes fused gate/up scratch"),
+                    scratch.abuf,
+                    scratch.ybuf,
+                );
                 let rec2 = rec.as_ref().expect("segment always Some between ops");
                 rec2.zero(pool[&gbuf].as_ref(), physical_slots * gu_width);
                 rec2.zero(pool[&ubuf].as_ref(), physical_slots * nff);
@@ -7812,226 +7975,196 @@ fn execute_paged_moe<'a>(
     // `_xpg` kernel builds (`infr_core::tensor::MOE_MMQ_PAGED_DTYPES` — the FULL
     // `MOE_MMQ_DTYPES` set, mirror checked by `moe_mmq_drift_test`) + activation + dp4a
     // support; anything else stays on the id-GEMV arm below, which is shape-general.
-    {
-        let paged_mmq_ok = infr_core::tensor::moe_paged_mmq_ok;
-        let act_ok = if *fused_gate_up {
-            // Fused callers ship GeGLU (gemma-4 MoE / DiffusionGemma) or SwiGLU — same set the
-            // resident fused arm accepts.
-            matches!(act, Activation::Silu | Activation::Gelu)
-        } else {
-            matches!(act, Activation::Silu)
-        };
-        if rows > moe_small_m_threshold(be_)
-            && be_.caps().i8_dot
-            && act_ok
-            && paged_mmq_ok(gdt)
-            && paged_mmq_ok(udt)
-            && paged_mmq_ok(ddt)
-        {
-            let n_pairs = n_slots;
-            // The GEMM As stage reads up to 63 rows past a segment end — pad the packed row
-            // dimension so the LAST expert's overread stays in-bounds (the resident arm's npad).
-            let npad = n_pairs.div_ceil(64) * 64 + 64;
-            let counts = pooled(pool, be_, "moe_pgb_counts", n_expert * 4)?;
-            let offsets = pooled(pool, be_, "moe_pgb_offsets", n_expert * 4)?;
-            let fill = pooled(pool, be_, "moe_pgb_fill", n_expert * 4)?;
-            let bucket_rows = pooled(pool, be_, "moe_pgb_brows", n_pairs * 4)?;
-            let bucket_wts = pooled(pool, be_, "moe_pgb_bwts", n_pairs * 4)?;
-            let inv_pos = pooled(pool, be_, "moe_pgb_ipos", n_pairs * 4)?;
-            let qa = pooled(pool, be_, "moe_pgb_qa", npad * ne)?;
-            let qda = pooled(pool, be_, "moe_pgb_qda", npad * (ne / 32) * 2)?;
-            let qsa = pooled(pool, be_, "moe_pgb_qsa", npad * (ne / 32) * 2)?;
-            // Fused: `ge` holds the single wide [n_pairs, 2*nff] gate|up GEMM output (the
-            // resident batched fused arm's shape); `ue` is unused/unallocated.
-            let ge = pooled(pool, be_, "moe_pgb_ge", npad * gu_width * 4)?;
-            let ue = if *fused_gate_up {
-                None
-            } else {
-                Some(pooled(pool, be_, "moe_pgb_ue", npad * nff * 4)?)
-            };
-            let ae = pooled(pool, be_, "moe_pgb_ae", npad * nff * 4)?;
-            let dqa = pooled(pool, be_, "moe_pgb_dqa", npad * nff)?;
-            let dda = pooled(pool, be_, "moe_pgb_dda", npad * (nff / 32) * 2)?;
-            let dsa = pooled(pool, be_, "moe_pgb_dsa", npad * (nff / 32) * 2)?;
-            let ye = pooled(pool, be_, "moe_pgb_ye", npad * ne * 4)?;
+    if let PagedMoeScratch::Mmq(scratch) = &moe_scratch {
+        let n_pairs = n_slots;
+        let counts = scratch.counts;
+        let offsets = scratch.offsets;
+        let fill = scratch.fill;
+        let bucket_rows = scratch.bucket_rows;
+        let bucket_wts = scratch.bucket_wts;
+        let inv_pos = scratch.inv_pos;
+        let qa = scratch.qa;
+        let qda = scratch.qda;
+        let qsa = scratch.qsa;
+        let ge = scratch.ge;
+        let ue = scratch.ue;
+        let ae = scratch.ae;
+        let dqa = scratch.dqa;
+        let dda = scratch.dda;
+        let dsa = scratch.dsa;
+        let ye = scratch.ye;
 
-            let rec2 = rec.as_ref().expect("segment always Some between ops");
-            let xb = r(*x)?;
-            rec2.zero(pool[&counts].as_ref(), n_expert);
-            // Clear the scatter's `fill` counters here (independent of `counts`) so the parallel
-            // clear overlaps the count/scan rather than riding the 1-lane serial scan.
-            rec2.zero(pool[&fill].as_ref(), n_expert);
-            rec2.moe_bucket_count(pool[&ids_key].as_ref(), pool[&counts].as_ref(), n_pairs);
-            rec2.moe_bucket_scan(pool[&counts].as_ref(), pool[&offsets].as_ref(), n_expert);
-            let dsb: Option<&dyn Buffer> = match down_scale {
-                Some(ds) => Some(r(*ds)?),
-                None => None,
-            };
-            rec2.moe_bucket_scatter(
-                pool[&ids_key].as_ref(),
-                pool[&wts].as_ref(),
-                pool[&offsets].as_ref(),
-                pool[&fill].as_ref(),
-                pool[&bucket_rows].as_ref(),
-                pool[&bucket_wts].as_ref(),
-                pool[&inv_pos].as_ref(),
-                dsb,
-                n_pairs,
-                n_used,
-            );
-            rec2.quant_q8_gather(
-                xb,
-                pool[&bucket_rows].as_ref(),
+        let rec2 = rec.as_ref().expect("segment always Some between ops");
+        let xb = r(*x)?;
+        rec2.zero(pool[&counts].as_ref(), n_expert);
+        // Clear the scatter's `fill` counters here (independent of `counts`) so the parallel
+        // clear overlaps the count/scan rather than riding the 1-lane serial scan.
+        rec2.zero(pool[&fill].as_ref(), n_expert);
+        rec2.moe_bucket_count(pool[&ids_key].as_ref(), pool[&counts].as_ref(), n_pairs);
+        rec2.moe_bucket_scan(pool[&counts].as_ref(), pool[&offsets].as_ref(), n_expert);
+        let dsb: Option<&dyn Buffer> = match down_scale {
+            Some(ds) => Some(r(*ds)?),
+            None => None,
+        };
+        rec2.moe_bucket_scatter(
+            pool[&ids_key].as_ref(),
+            pool[&wts].as_ref(),
+            pool[&offsets].as_ref(),
+            pool[&fill].as_ref(),
+            pool[&bucket_rows].as_ref(),
+            pool[&bucket_wts].as_ref(),
+            pool[&inv_pos].as_ref(),
+            dsb,
+            n_pairs,
+            n_used,
+        );
+        rec2.quant_q8_gather(
+            xb,
+            pool[&bucket_rows].as_ref(),
+            pool[&qa].as_ref(),
+            pool[&qda].as_ref(),
+            pool[&qsa].as_ref(),
+            n_pairs,
+            ne,
+        );
+        {
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().expect("checked above");
+            // Same `MOE_MMQ_SACT_DTYPES` split as the resident arm (gate/up can each
+            // independently be any `paged_mmq_ok` member).
+            let gate_needs_sact = infr_core::tensor::moe_mmq_needs_sact(gdt);
+            rec2.matmul_mmq_experts_paged(
+                gdt,
+                "expert_gateup",
                 pool[&qa].as_ref(),
                 pool[&qda].as_ref(),
-                pool[&qsa].as_ref(),
-                n_pairs,
+                gate_needs_sact.then(|| pool[&qsa].as_ref()),
+                sess.arena_addr(gate_id)?,
+                sess.slot_bytes(gate_id)? as u32,
+                sess.tape(),
+                gate_w as usize,
+                pool[&counts].as_ref(),
+                pool[&offsets].as_ref(),
+                pool[&ge].as_ref(),
+                rows,
                 ne,
+                gu_width,
+                n_expert,
+                n_used,
             );
-            {
-                let guard = be_.moe_pager().lock().unwrap();
-                let sess = guard.as_ref().expect("checked above");
-                // Same `MOE_MMQ_SACT_DTYPES` split as the resident arm (gate/up can each
-                // independently be any `paged_mmq_ok` member).
-                let gate_needs_sact = infr_core::tensor::moe_mmq_needs_sact(gdt);
+            if let Some(ue) = &ue {
+                // The up GEMM reads the same quantized activations and writes its own buffer —
+                // disjoint from the gate GEMM, no barrier needed (resident arm's pattern).
+                rec2.suppress_sync(true);
+                let up_needs_sact = infr_core::tensor::moe_mmq_needs_sact(udt);
                 rec2.matmul_mmq_experts_paged(
-                    gdt,
+                    udt,
                     "expert_gateup",
                     pool[&qa].as_ref(),
                     pool[&qda].as_ref(),
-                    gate_needs_sact.then(|| pool[&qsa].as_ref()),
-                    sess.arena_addr(gate_id)?,
-                    sess.slot_bytes(gate_id)? as u32,
+                    up_needs_sact.then(|| pool[&qsa].as_ref()),
+                    sess.arena_addr(up_id)?,
+                    sess.slot_bytes(up_id)? as u32,
                     sess.tape(),
-                    gate_w as usize,
+                    up_w as usize,
                     pool[&counts].as_ref(),
                     pool[&offsets].as_ref(),
-                    pool[&ge].as_ref(),
+                    pool[ue].as_ref(),
                     rows,
                     ne,
-                    gu_width,
+                    nff,
                     n_expert,
                     n_used,
                 );
-                if let Some(ue) = &ue {
-                    // The up GEMM reads the same quantized activations and writes its own buffer —
-                    // disjoint from the gate GEMM, no barrier needed (resident arm's pattern).
-                    rec2.suppress_sync(true);
-                    let up_needs_sact = infr_core::tensor::moe_mmq_needs_sact(udt);
-                    rec2.matmul_mmq_experts_paged(
-                        udt,
-                        "expert_gateup",
-                        pool[&qa].as_ref(),
-                        pool[&qda].as_ref(),
-                        up_needs_sact.then(|| pool[&qsa].as_ref()),
-                        sess.arena_addr(up_id)?,
-                        sess.slot_bytes(up_id)? as u32,
-                        sess.tape(),
-                        up_w as usize,
-                        pool[&counts].as_ref(),
-                        pool[&offsets].as_ref(),
-                        pool[ue].as_ref(),
-                        rows,
-                        ne,
-                        nff,
-                        n_expert,
-                        n_used,
-                    );
-                    rec2.suppress_sync(false);
-                }
+                rec2.suppress_sync(false);
             }
-            if *weight_before {
-                rec2.moe_weight_scale(
-                    pool[&ge].as_ref(),
-                    pool[&bucket_wts].as_ref(),
-                    n_pairs,
-                    gu_width,
-                );
-                if let Some(ue) = &ue {
-                    rec2.moe_weight_scale(
-                        pool[ue].as_ref(),
-                        pool[&bucket_wts].as_ref(),
-                        n_pairs,
-                        nff,
-                    );
-                }
+        }
+        if *weight_before {
+            rec2.moe_weight_scale(
+                pool[&ge].as_ref(),
+                pool[&bucket_wts].as_ref(),
+                n_pairs,
+                gu_width,
+            );
+            if let Some(ue) = &ue {
+                rec2.moe_weight_scale(pool[ue].as_ref(), pool[&bucket_wts].as_ref(), n_pairs, nff);
             }
-            match &ue {
-                // Split: gate and up are separate [n_pairs, nff] buffers.
-                Some(ue) => rec2.silu_mul(
+        }
+        match &ue {
+            // Split: gate and up are separate [n_pairs, nff] buffers.
+            Some(ue) => rec2.silu_mul(
+                pool[&ge].as_ref(),
+                pool[ue].as_ref(),
+                pool[&ae].as_ref(),
+                n_pairs * nff,
+                *swiglu_clamp,
+            ),
+            // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second per
+            // row) from the single wide GEMM above — the resident batched fused arm's shape.
+            None => match act {
+                Activation::Silu => rec2.silu_mul_fused(
                     pool[&ge].as_ref(),
-                    pool[ue].as_ref(),
                     pool[&ae].as_ref(),
-                    n_pairs * nff,
+                    n_pairs,
+                    nff,
                     *swiglu_clamp,
                 ),
-                // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second per
-                // row) from the single wide GEMM above — the resident batched fused arm's shape.
-                None => match act {
-                    Activation::Silu => rec2.silu_mul_fused(
-                        pool[&ge].as_ref(),
-                        pool[&ae].as_ref(),
-                        n_pairs,
-                        nff,
-                        *swiglu_clamp,
-                    ),
-                    Activation::Gelu => rec2.gelu_mul_fused(
-                        pool[&ge].as_ref(),
-                        pool[&ae].as_ref(),
-                        n_pairs,
-                        nff,
-                        *swiglu_clamp,
-                    ),
-                    Activation::Sigmoid => unreachable!("act_ok gate above excludes Sigmoid"),
-                },
-            }
-            rec2.quant_q8(
-                pool[&ae].as_ref(),
+                Activation::Gelu => rec2.gelu_mul_fused(
+                    pool[&ge].as_ref(),
+                    pool[&ae].as_ref(),
+                    n_pairs,
+                    nff,
+                    *swiglu_clamp,
+                ),
+                Activation::Sigmoid => unreachable!("act_ok gate above excludes Sigmoid"),
+            },
+        }
+        rec2.quant_q8(
+            pool[&ae].as_ref(),
+            pool[&dqa].as_ref(),
+            pool[&dda].as_ref(),
+            pool[&dsa].as_ref(),
+            n_pairs,
+            nff,
+        );
+        {
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().expect("checked above");
+            let down_needs_sact = infr_core::tensor::moe_mmq_needs_sact(ddt);
+            rec2.matmul_mmq_experts_paged(
+                ddt,
+                "expert_down",
                 pool[&dqa].as_ref(),
                 pool[&dda].as_ref(),
-                pool[&dsa].as_ref(),
-                n_pairs,
-                nff,
-            );
-            {
-                let guard = be_.moe_pager().lock().unwrap();
-                let sess = guard.as_ref().expect("checked above");
-                let down_needs_sact = infr_core::tensor::moe_mmq_needs_sact(ddt);
-                rec2.matmul_mmq_experts_paged(
-                    ddt,
-                    "expert_down",
-                    pool[&dqa].as_ref(),
-                    pool[&dda].as_ref(),
-                    down_needs_sact.then(|| pool[&dsa].as_ref()),
-                    sess.arena_addr(down_id)?,
-                    sess.slot_bytes(down_id)? as u32,
-                    sess.tape(),
-                    down_w as usize,
-                    pool[&counts].as_ref(),
-                    pool[&offsets].as_ref(),
-                    pool[&ye].as_ref(),
-                    rows,
-                    nff,
-                    ne,
-                    n_expert,
-                    n_used,
-                );
-            }
-            rec2.moe_scatter_reduce(
+                down_needs_sact.then(|| pool[&dsa].as_ref()),
+                sess.arena_addr(down_id)?,
+                sess.slot_bytes(down_id)? as u32,
+                sess.tape(),
+                down_w as usize,
+                pool[&counts].as_ref(),
+                pool[&offsets].as_ref(),
                 pool[&ye].as_ref(),
-                pool[&bucket_wts].as_ref(),
-                pool[&inv_pos].as_ref(),
-                r(*dst)?,
                 rows,
+                nff,
                 ne,
+                n_expert,
                 n_used,
-                *weight_before,
             );
-            if layer_stream {
-                prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
-            }
-            return Ok(()); // recorded inline — the ambient segment stays open
         }
+        rec2.moe_scatter_reduce(
+            pool[&ye].as_ref(),
+            pool[&bucket_wts].as_ref(),
+            pool[&inv_pos].as_ref(),
+            r(*dst)?,
+            rows,
+            ne,
+            n_used,
+            *weight_before,
+        );
+        if layer_stream {
+            prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
+        }
+        return Ok(()); // recorded inline — the ambient segment stays open
     }
 
     // ── Small-m id-GEMV arm: the paged expert GEMVs (arena + frozen tape window, LOCAL ids)
@@ -8039,14 +8172,13 @@ fn execute_paged_moe<'a>(
     // exactly mirroring the non-paged small-m arm (including its fused-gate_up shape: one
     // double-width GEMV into a gate|up buffer, split by the fused activation kernel). Recorded
     // inline into the ambient segment like the batched arm above.
-    let gbuf = pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?;
-    let ubuf = if *fused_gate_up {
-        None
-    } else {
-        Some(pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?)
+    let PagedMoeScratch::Small(scratch) = &moe_scratch else {
+        unreachable!("non-MMQ paged MoE path requires small-m scratch")
     };
-    let abuf = pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?;
-    let ybuf = pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?;
+    let gbuf = scratch.gbuf;
+    let ubuf = scratch.ubuf;
+    let abuf = scratch.abuf;
+    let ybuf = scratch.ybuf;
     let n_act = physical_slots * nff;
     let rec2 = rec.as_ref().expect("segment always Some between ops");
     let xb = r(*x)?;
