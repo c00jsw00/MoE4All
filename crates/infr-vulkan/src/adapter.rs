@@ -6958,7 +6958,7 @@ fn prefetch_next_moe_layer<'a>(
     // that cannot run on the existing host producer also takes the synchronous correctness path.
     // This property is frozen during model setup, so previous uploads are drained before the next
     // layer reserves a lane exactly as they were before transport was abstracted.
-    let synchronous = ps.cursor > 0
+    let synchronous = !be_.cfg().paging.prefill_upload_async
         || !be_
             .moe_pager()
             .lock()

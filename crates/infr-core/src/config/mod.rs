@@ -207,6 +207,9 @@ cfg_struct! {
         /// Keep as many complete expert layers resident as fit and stream the remainder as whole
         /// layers during prefill. Decode reuses the same arena as the ordinary expert LRU.
         moe_layer_stream: bool = true,
+        /// Upload future streamed MoE layers on the host worker while the GPU computes the current
+        /// layer. `INFR_SYNC_PREFILL_UPLOAD` disables the overlap for diagnostics.
+        prefill_upload_async: bool = true,
         /// `INFR_MOE_SIZE_CACHE_BIAS`: optional Decode arena weighting between distinct per-expert
         /// tensor sizes. Positive values favor larger tensors and negative values favor smaller.
         /// `None` auto-enables the validated `+2` bias only for a balanced two-size layout where
