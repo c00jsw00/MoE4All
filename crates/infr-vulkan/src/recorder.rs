@@ -909,6 +909,9 @@ pub struct Recorder<'a> {
     /// temporary transfer sources survive until blocking finish, or move into `PendingSegment`
     /// when the command buffer is submitted without waiting.
     buffer_keepalive: std::cell::RefCell<Vec<std::sync::Arc<dyn Buffer>>>,
+    /// Highest dedicated-transfer timeline value whose writes this command buffer consumes.
+    /// Zero preserves the ordinary main-queue submit byte-for-byte.
+    dedicated_transfer_wait: std::cell::Cell<u64>,
     /// Buffers written since the last barrier (for read-after-write / write-after-write detection).
     dirty_writes: RefCell<HashSet<vk::Buffer>>,
     /// Buffers read since the last barrier (for write-after-read detection).
@@ -1137,6 +1140,7 @@ impl<'a> Recorder<'a> {
             owns_transient: std::cell::Cell::new(true),
             pools: std::cell::RefCell::new(vec![pool]),
             buffer_keepalive: std::cell::RefCell::new(Vec::new()),
+            dedicated_transfer_wait: std::cell::Cell::new(0),
             dirty_writes: RefCell::new(HashSet::new()),
             dirty_reads: RefCell::new(HashSet::new()),
             dirty_transfer: std::cell::Cell::new(false),
@@ -8288,6 +8292,20 @@ impl<'a> Recorder<'a> {
         self.buffer_keepalive.borrow_mut().push(buffer);
     }
 
+    /// Submit imported-host copies on the session's transfer-only queue. `false` asks the caller
+    /// to record the same batches on this recorder's main queue fallback.
+    pub(crate) fn submit_dedicated_transfer(
+        &self,
+        batches: &[crate::transfer::TransferCopyBatch],
+    ) -> Result<bool> {
+        let Some(value) = self.be.shared.submit_transfer_batches(batches)? else {
+            return Ok(false);
+        };
+        self.dedicated_transfer_wait
+            .set(self.dedicated_transfer_wait.get().max(value));
+        Ok(true)
+    }
+
     pub fn attention(
         &self,
         q: &dyn Buffer,
@@ -11415,12 +11433,12 @@ impl<'a> Recorder<'a> {
             return Err(be(format!("end cmd: {e}")));
         }
         let prof = pager_profile::active();
-        let submits = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))];
-        let submit = self.be.shared.queue_submit_recovering(
-            &submits,
+        let submit = self.be.shared.queue_submit_commands_recovering(
+            std::slice::from_ref(&self.cmd),
             vk::Fence::null(),
             Some(dispatches),
             "forward queue_submit",
+            self.dedicated_transfer_wait.get(),
         );
         if let Err(e) = submit {
             self.free_transient();
@@ -11525,12 +11543,12 @@ impl<'a> Recorder<'a> {
                 }
             },
         };
-        let submits = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))];
-        let submit = self.be.shared.queue_submit_recovering(
-            &submits,
+        let submit = self.be.shared.queue_submit_commands_recovering(
+            std::slice::from_ref(&self.cmd),
             fence,
             Some(dispatches),
             "pipelined queue_submit",
+            self.dedicated_transfer_wait.get(),
         );
         if let Err(e) = submit {
             self.be.shared.recorder_fences.lock().unwrap().push(fence);

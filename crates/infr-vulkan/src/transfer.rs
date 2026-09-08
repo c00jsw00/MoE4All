@@ -15,6 +15,201 @@ use infr_core::pager_profile;
 
 use crate::{as_vk_buf, be, copy_to_mapped, ImportedHostAllocation, VkBuffer, VulkanBackend};
 
+/// One source/destination group submitted to the optional dedicated transfer queue. Both owners
+/// are retained by the queue's command slot until its timeline value completes.
+pub(crate) struct TransferCopyBatch {
+    pub(crate) src: Arc<dyn Buffer>,
+    pub(crate) dst: Arc<dyn Buffer>,
+    pub(crate) regions: Vec<vk::BufferCopy>,
+}
+
+const DEDICATED_TRANSFER_COMMAND_SLOTS: usize = 3;
+
+struct DedicatedTransferCommandSlot {
+    cmd: vk::CommandBuffer,
+    pending_value: u64,
+    keepalive: Vec<Arc<dyn Buffer>>,
+}
+
+/// Transfer-family stream for imported host RAM to device-arena copies. The timeline value is
+/// consumed by the main queue submission that first reads the uploaded experts.
+pub(crate) struct DedicatedTransferQueue {
+    queue: vk::Queue,
+    family_index: u32,
+    pool: vk::CommandPool,
+    timeline: vk::Semaphore,
+    slots: Vec<DedicatedTransferCommandSlot>,
+    cursor: usize,
+    next_value: u64,
+}
+
+impl DedicatedTransferQueue {
+    pub(crate) fn new(device: &ash::Device, family_index: u32) -> Result<Self> {
+        let queue = unsafe { device.get_device_queue(family_index, 0) };
+        let pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(family_index)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+        }
+        .map_err(|error| be(format!("create dedicated transfer command pool: {error}")))?;
+        let commands = match unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(DEDICATED_TRANSFER_COMMAND_SLOTS as u32),
+            )
+        } {
+            Ok(commands) => commands,
+            Err(error) => {
+                unsafe { device.destroy_command_pool(pool, None) };
+                return Err(be(format!(
+                    "allocate dedicated transfer command buffers: {error}"
+                )));
+            }
+        };
+        let mut semaphore_type = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let timeline = match unsafe {
+            device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut semaphore_type),
+                None,
+            )
+        } {
+            Ok(semaphore) => semaphore,
+            Err(error) => {
+                unsafe { device.destroy_command_pool(pool, None) };
+                return Err(be(format!(
+                    "create dedicated transfer timeline semaphore: {error}"
+                )));
+            }
+        };
+        Ok(Self {
+            queue,
+            family_index,
+            pool,
+            timeline,
+            slots: commands
+                .into_iter()
+                .map(|cmd| DedicatedTransferCommandSlot {
+                    cmd,
+                    pending_value: 0,
+                    keepalive: Vec::new(),
+                })
+                .collect(),
+            cursor: 0,
+            next_value: 1,
+        })
+    }
+
+    pub(crate) fn family_index(&self) -> u32 {
+        self.family_index
+    }
+
+    pub(crate) fn timeline(&self) -> vk::Semaphore {
+        self.timeline
+    }
+
+    pub(crate) fn submit(
+        &mut self,
+        shared: &crate::VulkanShared,
+        batches: &[TransferCopyBatch],
+    ) -> Result<u64> {
+        debug_assert!(!batches.is_empty());
+        let slot = &mut self.slots[self.cursor];
+        if slot.pending_value != 0 {
+            let semaphores = [self.timeline];
+            let values = [slot.pending_value];
+            unsafe {
+                shared.device.wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .semaphores(&semaphores)
+                        .values(&values),
+                    u64::MAX,
+                )
+            }
+            .map_err(|error| be(format!("wait reusable transfer command slot: {error}")))?;
+            slot.keepalive.clear();
+        }
+        unsafe {
+            shared
+                .device
+                .reset_command_buffer(slot.cmd, vk::CommandBufferResetFlags::empty())
+        }
+        .map_err(|error| be(format!("reset dedicated transfer command buffer: {error}")))?;
+        unsafe {
+            shared.device.begin_command_buffer(
+                slot.cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }
+        .map_err(|error| be(format!("begin dedicated transfer command buffer: {error}")))?;
+
+        let host_barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::HOST_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        unsafe {
+            shared.device.cmd_pipeline_barrier(
+                slot.cmd,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[host_barrier],
+                &[],
+                &[],
+            );
+            for batch in batches {
+                let src = as_vk_buf(batch.src.as_ref())?.buffer;
+                let dst = as_vk_buf(batch.dst.as_ref())?.buffer;
+                shared
+                    .device
+                    .cmd_copy_buffer(slot.cmd, src, dst, &batch.regions);
+            }
+            shared
+                .device
+                .end_command_buffer(slot.cmd)
+                .map_err(|error| be(format!("end dedicated transfer command buffer: {error}")))?;
+        }
+
+        let value = self.next_value;
+        self.next_value = self
+            .next_value
+            .checked_add(1)
+            .ok_or_else(|| be("dedicated transfer timeline value overflow"))?;
+        let commands = [slot.cmd];
+        let signals = [self.timeline];
+        let signal_values = [value];
+        let mut timeline =
+            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&signal_values);
+        let submit = vk::SubmitInfo::default()
+            .command_buffers(&commands)
+            .signal_semaphores(&signals)
+            .push_next(&mut timeline);
+        shared.submit_dedicated_transfer(self.queue, &submit)?;
+
+        slot.pending_value = value;
+        slot.keepalive.reserve(batches.len() * 2);
+        for batch in batches {
+            slot.keepalive.push(Arc::clone(&batch.src));
+            slot.keepalive.push(Arc::clone(&batch.dst));
+        }
+        self.cursor = (self.cursor + 1) % self.slots.len();
+        Ok(value)
+    }
+
+    pub(crate) unsafe fn destroy(self, device: &ash::Device) {
+        unsafe {
+            device.destroy_semaphore(self.timeline, None);
+            device.destroy_command_pool(self.pool, None);
+        }
+    }
+}
+
 /// Backend contract consumed by residency logic. It exposes data movement, not Vulkan memory
 /// types or queue choices; a different executor can satisfy the same requests without changing
 /// pager policy.
@@ -95,6 +290,7 @@ impl SessionTransferPlan {
             source_ptr,
             target: target.clone(),
             len: src.len(),
+            dedicated: false,
         });
         Ok(())
     }
@@ -118,6 +314,7 @@ impl SessionTransferPlan {
                     .subtarget(advanced, range.len)
                     .expect("imported source range was validated against its device target"),
                 len: range.len,
+                dedicated: true,
             });
             advanced += range.len;
         }
@@ -232,6 +429,9 @@ struct PreparedCopy {
     source_ptr: usize,
     target: DeviceTransferTarget,
     len: usize,
+    /// Imported host memory and unified device arenas can use the session's transfer-family
+    /// queue. Temporary staging remains exclusive to the main queue.
+    dedicated: bool,
 }
 
 /// One backend-resolved transfer batch. The source route and staging ownership are frozen before
@@ -248,14 +448,14 @@ impl PreparedTransfer {
     }
 
     pub(crate) fn record(mut self, rec: &crate::Recorder<'_>) -> Result<()> {
-        struct Group {
-            src: Arc<dyn Buffer>,
-            dst: Arc<dyn Buffer>,
-            regions: Vec<vk::BufferCopy>,
-        }
-
-        let mut groups: Vec<Group> = Vec::new();
+        let mut dedicated_groups: Vec<TransferCopyBatch> = Vec::new();
+        let mut main_groups: Vec<TransferCopyBatch> = Vec::new();
         for copy in &self.copies {
+            let groups = if copy.dedicated {
+                &mut dedicated_groups
+            } else {
+                &mut main_groups
+            };
             let src_handle = as_vk_buf(copy.source.as_ref())?.buffer;
             let dst_handle = as_vk_buf(copy.target.buffer())?.buffer;
             let group = match groups.iter_mut().find(|group| {
@@ -264,7 +464,7 @@ impl PreparedTransfer {
             }) {
                 Some(group) => group,
                 None => {
-                    groups.push(Group {
+                    groups.push(TransferCopyBatch {
                         src: Arc::clone(&copy.source),
                         dst: copy.target.buffer_arc(),
                         regions: Vec::new(),
@@ -279,17 +479,20 @@ impl PreparedTransfer {
                     .size(copy.len as u64),
             );
         }
-        if !groups.is_empty() {
+        if !dedicated_groups.is_empty() && !rec.submit_dedicated_transfer(&dedicated_groups)? {
+            main_groups.append(&mut dedicated_groups);
+        }
+        if !main_groups.is_empty() {
             rec.host_transfer_barrier();
-            for group in &groups {
+            for group in &main_groups {
                 rec.retain_buffer(Arc::clone(&group.src));
                 rec.retain_buffer(Arc::clone(&group.dst));
                 rec.copy_regions(group.src.as_ref(), group.dst.as_ref(), &group.regions);
             }
-            if pager_profile::active() {
-                for copy in &self.copies {
-                    pager_profile::record_gpu_copy(copy.len);
-                }
+        }
+        if pager_profile::active() {
+            for copy in &self.copies {
+                pager_profile::record_gpu_copy(copy.len);
             }
         }
         self.copies.clear();

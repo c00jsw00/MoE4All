@@ -600,6 +600,10 @@ struct VulkanShared {
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
+    /// Optional transfer-only queue for imported host-RAM to unified-arena copies. Its absence
+    /// preserves the established main-queue path on devices without the required family or
+    /// timeline support.
+    dedicated_transfer: Option<Mutex<crate::transfer::DedicatedTransferQueue>>,
     /// Vulkan requires host access to one queue to be externally synchronized. It also turns the
     /// rare submit-OOM recovery into one atomic drain/retry boundary across the graph and Prefill
     /// upload threads without changing GPU submission order.
@@ -750,6 +754,113 @@ struct VulkanShared {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanShared {
+    fn dedicated_transfer_families(&self) -> Option<[u32; 2]> {
+        self.dedicated_transfer.as_ref().map(|queue| {
+            let family = queue.lock().unwrap().family_index();
+            [self.queue_family_index, family]
+        })
+    }
+
+    pub(crate) fn submit_dedicated_transfer(
+        &self,
+        queue: vk::Queue,
+        submit: &vk::SubmitInfo<'_>,
+    ) -> Result<()> {
+        if let Some(error) = self.queue_submit_failure() {
+            return Err(be(format!(
+                "dedicated transfer queue is unavailable after an earlier submit failure: {error}"
+            )));
+        }
+        let started = infr_core::pager_profile::active().then(std::time::Instant::now);
+        let mut attempts = 1usize;
+        let mut result = unsafe {
+            self.device
+                .queue_submit(queue, &[*submit], vk::Fence::null())
+        };
+        for delay_ms in MEMORY_OOM_RETRY_DELAYS_MS {
+            let Err(error) = result else {
+                break;
+            };
+            if !retryable_queue_submit_error(error) {
+                break;
+            }
+            tracing::warn!(
+                "[infr] dedicated transfer queue_submit hit {error}; draining that queue and retrying after {delay_ms} ms"
+            );
+            if let Err(wait_error) = unsafe { self.device.queue_wait_idle(queue) } {
+                let _ = self.make_queue_unusable(wait_error, "dedicated transfer queue drain");
+                return Err(be(format!(
+                    "dedicated transfer queue drain failed: {wait_error}"
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            result = unsafe {
+                self.device
+                    .queue_submit(queue, &[*submit], vk::Fence::null())
+            };
+        }
+        if let Some(t0) = started {
+            infr_core::pager_profile::record_queue_submit(0, t0.elapsed());
+        }
+        match result {
+            Ok(()) => {
+                if attempts > 1 {
+                    tracing::warn!(
+                        "[infr] dedicated transfer queue_submit recovered after {attempts} attempts"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.make_queue_unusable(error, "dedicated transfer queue_submit");
+                Err(be(format!("dedicated transfer queue_submit: {error}")))
+            }
+        }
+    }
+
+    fn submit_transfer_batches(
+        &self,
+        batches: &[crate::transfer::TransferCopyBatch],
+    ) -> Result<Option<u64>> {
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return Ok(None);
+        };
+        queue.lock().unwrap().submit(self, batches).map(Some)
+    }
+
+    fn queue_submit_commands_recovering(
+        &self,
+        commands: &[vk::CommandBuffer],
+        fence: vk::Fence,
+        profile_dispatches: Option<usize>,
+        context: &str,
+        transfer_wait: u64,
+    ) -> std::result::Result<(), vk::Result> {
+        if transfer_wait == 0 {
+            let submits = [vk::SubmitInfo::default().command_buffers(commands)];
+            return self.queue_submit_recovering(&submits, fence, profile_dispatches, context);
+        }
+        let timeline = self
+            .dedicated_transfer
+            .as_ref()
+            .expect("a transfer timeline wait requires the dedicated queue")
+            .lock()
+            .unwrap()
+            .timeline();
+        let waits = [timeline];
+        let values = [transfer_wait];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let mut timeline_info =
+            vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values);
+        let submits = [vk::SubmitInfo::default()
+            .command_buffers(commands)
+            .wait_semaphores(&waits)
+            .wait_dst_stage_mask(&stages)
+            .push_next(&mut timeline_info)];
+        self.queue_submit_recovering(&submits, fence, profile_dispatches, context)
+    }
+
     fn queue_submit_failure(&self) -> Option<vk::Result> {
         let raw = self.queue_submit_failure.load(Ordering::Acquire);
         (raw != vk::Result::SUCCESS.as_raw()).then(|| vk::Result::from_raw(raw))
@@ -1156,6 +1267,9 @@ impl Drop for VulkanShared {
             }
             for pool in self.recorder_submit_query_pools.lock().unwrap().drain(..) {
                 self.device.destroy_query_pool(pool, None);
+            }
+            if let Some(queue) = self.dedicated_transfer.take() {
+                queue.into_inner().unwrap().destroy(&self.device);
             }
             // Destroy command pool.
             let pool = *self.cmd_pool.lock().unwrap();
@@ -2584,6 +2698,16 @@ impl VulkanBackend {
             .position(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
             .map(|i| i as u32)
             .ok_or_else(|| be("no compute queue family found"))?;
+        let dedicated_transfer_family_index = qf_props
+            .iter()
+            .position(|p| {
+                p.queue_count > 0
+                    && p.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                    && !p
+                        .queue_flags
+                        .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+            })
+            .map(|i| i as u32);
         let submit_timestamp_valid_bits =
             qf_props[queue_family_index as usize].timestamp_valid_bits;
 
@@ -2724,6 +2848,13 @@ impl VulkanBackend {
         // The external-semaphore all-reduce needs BOTH the fd extension and the timeline feature
         // (read here, after `feat2`'s last use, for the same borrow reason as `has_bda`).
         let has_ext_sem = has_ext_sem_fd && timeline_feat.timeline_semaphore != 0;
+        // A transfer-only queue is useful only for the imported-host route: otherwise the source
+        // first has to be staged through the main queue and there is no independent DMA stream.
+        let dedicated_transfer_family_index =
+            (cfg.paging.host_dma && has_ext_mem_host && timeline_feat.timeline_semaphore != 0)
+                .then_some(dedicated_transfer_family_index)
+                .flatten();
+        let timeline_enabled = has_ext_sem || dedicated_transfer_family_index.is_some();
         // Hard requirement, not a fallback: the paged-MoE arena is addressed by a 64-bit device
         // pointer, so a device that cannot hand out one has no 64-bit address space for infr to
         // use. bufferDeviceAddress is core in Vulkan 1.2 and this backend targets 1.3, so on any
@@ -3096,6 +3227,14 @@ impl VulkanBackend {
         let queue_ci = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities);
+        let mut queue_cis = vec![queue_ci];
+        if let Some(family) = dedicated_transfer_family_index {
+            queue_cis.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family)
+                    .queue_priorities(&priorities),
+            );
+        }
 
         // Feature chain — needed for cooperative-matrix kernels:
         //   shaderFloat16 (f16 math), 16-bit storage (f16 SSBOs), Vulkan memory model
@@ -3139,7 +3278,7 @@ impl VulkanBackend {
             .shader_int16(has_int16)
             .shader_int64(has_int64);
         let mut device_ci = vk::DeviceCreateInfo::default()
-            .queue_create_infos(std::slice::from_ref(&queue_ci))
+            .queue_create_infos(&queue_cis)
             .enabled_extension_names(&ext_ptrs)
             .enabled_features(&core_features)
             .push_next(&mut shader_f16_ci)
@@ -3154,7 +3293,7 @@ impl VulkanBackend {
         if has_coop_matrix {
             device_ci = device_ci.push_next(&mut coopmat_ci);
         }
-        if has_ext_sem {
+        if timeline_enabled {
             device_ci = device_ci.push_next(&mut timeline_sem_ci);
         }
         // The two post-ash feature structs (see `vkext`): chained by hand, asking for exactly the
@@ -3536,6 +3675,22 @@ impl VulkanBackend {
         // host-visible type (system RAM over PCIe). KV overflow and portable transfer staging use
         // it explicitly; ordinary GpuOnly allocations never do.
         let host_overflow_type = probe_host_visible_non_device_local_type(&mem_props);
+        let dedicated_transfer = dedicated_transfer_family_index.and_then(|family| {
+            match crate::transfer::DedicatedTransferQueue::new(&device, family) {
+                Ok(queue) => {
+                    tracing::info!(
+                        "[infr] host DMA: dedicated transfer queue family {family} enabled"
+                    );
+                    Some(Mutex::new(queue))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[infr] host DMA: dedicated transfer queue unavailable ({error}); using the main queue"
+                    );
+                    None
+                }
+            }
+        });
 
         // Success: the instance/device/pool now move into `VulkanShared` (which owns their
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
@@ -3562,6 +3717,7 @@ impl VulkanBackend {
                 device,
                 queue,
                 queue_family_index,
+                dedicated_transfer,
                 queue_access: Mutex::new(()),
                 queue_submit_failure: AtomicI32::new(vk::Result::SUCCESS.as_raw()),
                 cmd_pool: Mutex::new(cmd_pool),
@@ -3813,11 +3969,18 @@ impl VulkanBackend {
         let device = &self.shared.device;
         let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
         let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
-        let info = vk::BufferCreateInfo::default()
+        let queue_families = self.shared.dedicated_transfer_families();
+        let mut info = vk::BufferCreateInfo::default()
             .push_next(&mut external)
             .size(len as u64)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST);
+        if let Some(families) = queue_families.as_ref() {
+            info = info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(families);
+        } else {
+            info = info.sharing_mode(vk::SharingMode::EXCLUSIVE);
+        }
         let buffer = unsafe { device.create_buffer(&info, None) }
             .map_err(|e| be(format!("create imported-host buffer: {e}")))?;
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
@@ -4491,10 +4654,17 @@ impl VulkanBackend {
         let usage = vk::BufferUsageFlags::from_raw(
             BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
         );
-        let info = vk::BufferCreateInfo::default()
+        let queue_families = self.shared.dedicated_transfer_families();
+        let mut info = vk::BufferCreateInfo::default()
             .size(fill_span(bytes))
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            .usage(usage);
+        if let Some(families) = queue_families.as_ref() {
+            info = info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(families);
+        } else {
+            info = info.sharing_mode(vk::SharingMode::EXCLUSIVE);
+        }
         let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
             .map_err(|error| be(format!("create_buffer(device-arena): {error}")))?;
         let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
@@ -4579,10 +4749,17 @@ impl VulkanBackend {
         let usage = vk::BufferUsageFlags::from_raw(
             BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
         );
-        let info = vk::BufferCreateInfo::default()
+        let queue_families = self.shared.dedicated_transfer_families();
+        let mut info = vk::BufferCreateInfo::default()
             .size(fill_span(bytes))
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            .usage(usage);
+        if let Some(families) = queue_families.as_ref() {
+            info = info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(families);
+        } else {
+            info = info.sharing_mode(vk::SharingMode::EXCLUSIVE);
+        }
         let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
             .map_err(|e| be(format!("create_buffer(moe-arena-rebar): {e}")))?;
         let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
