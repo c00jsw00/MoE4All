@@ -1214,14 +1214,22 @@ impl UnifiedRangePool {
 /// A Vulkan-backed range lease. Keeping the physical shard and logical lease in the same handle
 /// lets a `VkBuffer` view outlive the backend handle without forming a cycle through
 /// `VulkanShared`.
+struct UnifiedOwnerLease {
+    _allocations: Vec<Arc<UnifiedAllocation>>,
+}
+
 pub(crate) struct UnifiedAllocationHandle {
-    lease: Arc<UnifiedAllocation>,
+    range: UnifiedRange,
+    /// Every range committed by one owner transaction shares this lease. No subset can return to
+    /// Expert filler while sibling buffers from the same KV-growth, Prefill or runtime batch are
+    /// still live.
+    _owner: Arc<UnifiedOwnerLease>,
     shard: Arc<DeviceArenaShard>,
 }
 
 impl UnifiedAllocationHandle {
     pub(crate) fn range(&self) -> UnifiedRange {
-        self.lease.range()
+        self.range
     }
 
     pub(crate) fn buffer(&self) -> &dyn Buffer {
@@ -1333,7 +1341,15 @@ impl UnifiedVramPool {
             UnifiedVramClass::Expert,
         )?;
         let shard = self.arena.shard(placement.shard)?;
-        Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
+        let range = lease.range();
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: vec![lease],
+        });
+        Some(Arc::new(UnifiedAllocationHandle {
+            range,
+            _owner: owner,
+            shard,
+        }))
     }
 
     /// Plan one logical owner without exposing corridor or growth-direction policy to callers.
@@ -1430,15 +1446,22 @@ impl UnifiedVramPool {
             .ranges
             .try_claim_planned(class, &plan.ranges)
             .ok_or_else(|| be(format!("stale {class:?} unified VRAM claim plan")))?;
-        leases
+        let ranges = leases.iter().map(|lease| lease.range()).collect::<Vec<_>>();
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: leases,
+        });
+        ranges
             .into_iter()
-            .map(|lease| {
-                let range = lease.range();
+            .map(|range| {
                 let shard = self
                     .arena
                     .shard(range.shard)
                     .ok_or_else(|| be("planned unified VRAM range has no physical shard"))?;
-                Ok(Arc::new(UnifiedAllocationHandle { lease, shard }))
+                Ok(Arc::new(UnifiedAllocationHandle {
+                    range,
+                    _owner: Arc::clone(&owner),
+                    shard,
+                }))
             })
             .collect()
     }
@@ -1453,8 +1476,16 @@ impl UnifiedVramPool {
         } else {
             self.ranges.allocate_high(bytes, 256, class)?
         };
-        let shard = self.arena.shard(lease.range().shard)?;
-        Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
+        let range = lease.range();
+        let shard = self.arena.shard(range.shard)?;
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: vec![lease],
+        });
+        Some(Arc::new(UnifiedAllocationHandle {
+            range,
+            _owner: owner,
+            shard,
+        }))
     }
 
     pub(crate) fn try_claim_exact(
@@ -1466,8 +1497,13 @@ impl UnifiedVramPool {
     ) -> Option<Arc<UnifiedAllocationHandle>> {
         let lease = self.ranges.try_claim_exact(shard, offset, bytes, class)?;
         let physical = self.arena.shard(shard)?;
+        let range = lease.range();
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: vec![lease],
+        });
         Some(Arc::new(UnifiedAllocationHandle {
-            lease,
+            range,
+            _owner: owner,
             shard: physical,
         }))
     }
@@ -1917,6 +1953,27 @@ mod tests {
             .try_claim_planned(UnifiedVramClass::LlmRuntime, &plan)
             .unwrap();
         assert_eq!(claimed.len(), 2);
+    }
+
+    #[test]
+    fn owner_batch_keeps_every_range_until_the_final_reference_drops() {
+        let pool = UnifiedRangePool::new([1024]).unwrap();
+        let leases = vec![
+            pool.try_claim_exact(0, 0, 256, UnifiedVramClass::KvCache)
+                .unwrap(),
+            pool.try_claim_exact(0, 256, 256, UnifiedVramClass::KvCache)
+                .unwrap(),
+        ];
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: leases,
+        });
+        let sibling = Arc::clone(&owner);
+
+        drop(owner);
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::KvCache), 512);
+        drop(sibling);
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::KvCache), 0);
+        assert_eq!(pool.stats().free_bytes, 1024);
     }
 
     #[test]
