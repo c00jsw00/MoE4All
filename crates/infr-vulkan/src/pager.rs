@@ -2580,10 +2580,11 @@ impl MoePagerSession {
                     coordinates.push((lane, bank));
                 }
             }
-            let plan = match self
-                .unified_pool
-                .plan_prefill_claim(&requested, &protected_experts)
-            {
+            let plan = match self.unified_pool.plan_owner_claim(
+                &requested,
+                UnifiedVramClass::Prefill,
+                &protected_experts,
+            ) {
                 Ok(plan) => plan,
                 Err(error) => {
                     last_error = Some(error.to_string());

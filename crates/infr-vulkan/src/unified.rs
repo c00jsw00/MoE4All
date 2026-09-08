@@ -840,6 +840,26 @@ impl UnifiedVramClass {
             Self::DraftRuntime => 9,
         }
     }
+
+    fn placement(self, layout: &ExpertArenaLayout) -> Result<(Range<usize>, ClaimDirection)> {
+        match self {
+            Self::Expert => Err(be(
+                "Expert filler must be claimed from the frozen slot directory",
+            )),
+            Self::KvCache => Ok((layout.kv_corridor(), ClaimDirection::Low)),
+            Self::Prefill => Ok((layout.prefill_corridor(), ClaimDirection::Low)),
+            Self::LlmRuntime
+            | Self::EmbeddingWeights
+            | Self::EmbeddingRuntime
+            | Self::VisionWeights
+            | Self::VisionRuntime
+            | Self::DraftWeights
+            | Self::DraftRuntime => Ok((
+                layout.floor_corridor().end..layout.total_bytes(),
+                ClaimDirection::High,
+            )),
+        }
+    }
 }
 
 /// Immutable coordinates of one allocation. A range never crosses a physical Vulkan shard.
@@ -1316,21 +1336,27 @@ impl UnifiedVramPool {
         Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
     }
 
-    pub(crate) fn plan_kv_claim(
+    /// Plan one logical owner without exposing corridor or growth-direction policy to callers.
+    /// The class fixes those choices at session construction: KV grows from low addresses,
+    /// Prefill uses its phase-exclusive middle corridor, and variable phase owners grow down from
+    /// high addresses. Expert filler remains a separate fixed-slot operation.
+    pub(crate) fn plan_owner_claim(
         &self,
         requested: &[usize],
+        class: UnifiedVramClass,
         protected_experts: &[ExpertSlotId],
     ) -> Result<UnifiedClaimPlan> {
         let layout = self
             .expert_layout
             .as_ref()
-            .ok_or_else(|| be("KV corridor requires an expert-aware unified VRAM layout"))?;
+            .ok_or_else(|| be("owner claims require an expert-aware unified VRAM layout"))?;
+        let (corridor, direction) = class.placement(layout)?;
         layout.plan_claim(
             &self.ranges.allocations(),
             requested,
-            UnifiedVramClass::KvCache,
-            layout.kv_corridor(),
-            ClaimDirection::Low,
+            class,
+            corridor,
+            direction,
             protected_experts,
         )
     }
@@ -1370,69 +1396,25 @@ impl UnifiedVramPool {
         }))
     }
 
-    pub(crate) fn plan_exact_kv_claim(
+    /// Exact-coordinate twin of [`Self::plan_owner_claim`], used by owners that reserve a stable
+    /// future layout and commit it incrementally. The owner class still selects and validates the
+    /// corridor; callers cannot smuggle an exact range into another owner's address space.
+    pub(crate) fn plan_exact_owner_claim(
         &self,
         ranges: &[PlannedRange],
-        protected_experts: &[ExpertSlotId],
-    ) -> Result<UnifiedClaimPlan> {
-        let layout = self
-            .expert_layout
-            .as_ref()
-            .ok_or_else(|| be("exact KV claims require an expert-aware unified VRAM layout"))?;
-        layout.plan_exact_claim(
-            &self.ranges.allocations(),
-            ranges,
-            UnifiedVramClass::KvCache,
-            layout.kv_corridor(),
-            protected_experts,
-        )
-    }
-
-    pub(crate) fn plan_prefill_claim(
-        &self,
-        requested: &[usize],
-        protected_experts: &[ExpertSlotId],
-    ) -> Result<UnifiedClaimPlan> {
-        let layout = self
-            .expert_layout
-            .as_ref()
-            .ok_or_else(|| be("Prefill corridor requires an expert-aware unified VRAM layout"))?;
-        layout.plan_claim(
-            &self.ranges.allocations(),
-            requested,
-            UnifiedVramClass::Prefill,
-            layout.prefill_corridor(),
-            ClaimDirection::Low,
-            protected_experts,
-        )
-    }
-
-    /// Plan a non-KV, non-Prefill owner from high addresses. The physical expert-floor corridor
-    /// remains a hard lower boundary even before lazy KV segments are committed.
-    pub(crate) fn plan_high_claim(
-        &self,
-        requested: &[usize],
         class: UnifiedVramClass,
         protected_experts: &[ExpertSlotId],
     ) -> Result<UnifiedClaimPlan> {
-        if matches!(
-            class,
-            UnifiedVramClass::Expert | UnifiedVramClass::KvCache | UnifiedVramClass::Prefill
-        ) {
-            return Err(be(format!(
-                "{class:?} cannot use the high-address elastic claim path"
-            )));
-        }
         let layout = self
             .expert_layout
             .as_ref()
-            .ok_or_else(|| be("high-address claim requires an expert-aware unified VRAM layout"))?;
-        layout.plan_claim(
+            .ok_or_else(|| be("exact owner claims require an expert-aware unified VRAM layout"))?;
+        let (corridor, _) = class.placement(layout)?;
+        layout.plan_exact_claim(
             &self.ranges.allocations(),
-            requested,
+            ranges,
             class,
-            layout.floor_corridor().end..layout.total_bytes(),
-            ClaimDirection::High,
+            corridor,
             protected_experts,
         )
     }
@@ -1641,6 +1623,34 @@ mod tests {
         assert_eq!(layout.kv_corridor(), 0..512);
         assert_eq!(layout.runtime_corridor(), 4352..5120);
         assert_eq!(layout.prefill_corridor(), 512..4352);
+    }
+
+    #[test]
+    fn owner_classes_select_their_frozen_corridors() {
+        let layout = ExpertArenaLayout::build(&[(256, 20, 0)], 4096, 512, 0, 0, 512).unwrap();
+
+        let (kv, kv_direction) = UnifiedVramClass::KvCache.placement(&layout).unwrap();
+        assert_eq!(kv, layout.kv_corridor());
+        assert!(matches!(kv_direction, ClaimDirection::Low));
+
+        let (prefill, prefill_direction) = UnifiedVramClass::Prefill.placement(&layout).unwrap();
+        assert_eq!(prefill, layout.prefill_corridor());
+        assert!(matches!(prefill_direction, ClaimDirection::Low));
+
+        for class in [
+            UnifiedVramClass::LlmRuntime,
+            UnifiedVramClass::EmbeddingWeights,
+            UnifiedVramClass::EmbeddingRuntime,
+            UnifiedVramClass::VisionWeights,
+            UnifiedVramClass::VisionRuntime,
+            UnifiedVramClass::DraftWeights,
+            UnifiedVramClass::DraftRuntime,
+        ] {
+            let (corridor, direction) = class.placement(&layout).unwrap();
+            assert_eq!(corridor, layout.floor_corridor().end..layout.total_bytes());
+            assert!(matches!(direction, ClaimDirection::High));
+        }
+        assert!(UnifiedVramClass::Expert.placement(&layout).is_err());
     }
 
     #[test]

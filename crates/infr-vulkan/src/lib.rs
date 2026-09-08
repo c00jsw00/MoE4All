@@ -4743,15 +4743,7 @@ impl VulkanBackend {
                 ));
             }
             let protected = self.protected_unified_experts();
-            let plan = match class {
-                crate::unified::UnifiedVramClass::KvCache => {
-                    pool.plan_kv_claim(&[size], &protected)?
-                }
-                crate::unified::UnifiedVramClass::Prefill => {
-                    pool.plan_prefill_claim(&[size], &protected)?
-                }
-                _ => pool.plan_high_claim(&[size], class, &protected)?,
-            };
+            let plan = pool.plan_owner_claim(&[size], class, &protected)?;
             let mut handles = self.commit_unified_claim_locked(&pool, plan)?;
             let handle = handles
                 .pop()
@@ -4956,7 +4948,11 @@ impl VulkanBackend {
                         Ok(range)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let plan = pool.plan_exact_kv_claim(&exact_ranges, &protected)?;
+                let plan = pool.plan_exact_owner_claim(
+                    &exact_ranges,
+                    crate::unified::UnifiedVramClass::KvCache,
+                    &protected,
+                )?;
                 debug_assert_eq!(plan.len(), sizes.len());
                 self.commit_unified_claim_locked(&pool, plan)?
             } else {
@@ -5472,7 +5468,7 @@ impl VulkanBackend {
             if pool.expert_layout().is_some() {
                 self.with_unified_exclusive(|| {
                     let protected = self.protected_unified_experts();
-                    let plan = pool.plan_high_claim(sizes, class, &protected)?;
+                    let plan = pool.plan_owner_claim(sizes, class, &protected)?;
                     let handles = self.commit_unified_claim_locked(&pool, plan)?;
                     if handles.len() != sizes.len() {
                         return Err(be(
