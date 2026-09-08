@@ -2053,8 +2053,9 @@ impl Default for BdaWeightArena {
 
 /// Vulkan device + allocator + pipeline cache.
 pub struct VulkanBackend {
-    // NOTE: `moe_pager` is declared before `shared` so the session's buffers are freed first on
-    // drop (each holds its own `Arc<VulkanShared>` clone, so the device outlives them either way).
+    // NOTE: the prefetch worker is declared before `moe_pager` and `shared`, so it is stopped and
+    // joined before either dependency drops. The pager itself likewise drops before `shared`.
+    decode_prefetch: Mutex<Option<adapter::DecodePrefetchScheduler>>,
     /// Paged MoE expert cache (see `pager::MoePagerSession`) — `Some` only when the loaded model's
     /// expert banks don't fit VRAM and the seam's placement policy chose paging over the legacy
     /// host-visible split (see `infr-llama`'s `generate_dense_vulkan_session`). `None` is the
@@ -2310,11 +2311,13 @@ impl infr_core::backend::ProgressScope for WeightProgress {}
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
     pub(crate) fn background_expert_transfer_ready(&self) -> bool {
-        self.shared.dedicated_transfer.is_some()
+        self.background_expert_transfer_executor().is_some()
     }
 
-    pub(crate) fn wait_background_transfer(&self, value: u64) -> Result<()> {
-        self.shared.wait_dedicated_transfer(value)
+    pub(crate) fn background_expert_transfer_executor(
+        &self,
+    ) -> Option<crate::transfer::BackgroundTransferExecutor> {
+        crate::transfer::BackgroundTransferExecutor::from_backend(self)
     }
 
     /// `maxComputeSharedMemorySize` for the active device — the per-workgroup shared-memory budget
@@ -3732,6 +3735,7 @@ impl VulkanBackend {
         let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
         let unified_phases = UnifiedPhaseRegistry::new(&runtime_phase);
         let backend = Self {
+            decode_prefetch: Mutex::new(None),
             moe_pager: Arc::new(Mutex::new(None)),
             session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dense_pager: Mutex::new(None),
@@ -4258,9 +4262,29 @@ impl VulkanBackend {
     /// already read true by the time that closure's placeholder buffers are bound). Replaces any
     /// previous session (there is only ever one loaded model per process today).
     pub fn init_moe_pager(&self, layout: crate::pager::MoePagerLayout) -> Result<()> {
+        // Stop a prior model's producer before replacing the pager state it owns.
+        *self.decode_prefetch.lock().unwrap() = None;
         *self.shared.session_transfer_plan.write().unwrap() = None;
         let session = crate::pager::MoePagerSession::new(self, layout)?;
         *self.moe_pager.lock().unwrap() = Some(session);
+        if self.cfg.paging.expert_prefetch {
+            if let Some(executor) = self.background_expert_transfer_executor() {
+                match adapter::DecodePrefetchScheduler::spawn(
+                    Arc::clone(&self.moe_pager),
+                    executor,
+                ) {
+                    Ok(scheduler) => {
+                        *self.decode_prefetch.lock().unwrap() = Some(scheduler);
+                        tracing::info!(
+                            "[infr] next-layer expert prefetch enabled on the transfer queue"
+                        );
+                    }
+                    Err(error) => tracing::warn!(
+                        "[infr] could not start the expert prefetch worker ({error}); continuing without prefetch"
+                    ),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4334,6 +4358,20 @@ impl VulkanBackend {
     /// outside the `Graph`/`Bindings` seam instead of a per-op flag.
     pub(crate) fn moe_pager(&self) -> &crate::pager::MoePagerCell {
         &self.moe_pager
+    }
+
+    pub(crate) fn decode_prefetch_scheduler(
+        &self,
+    ) -> &Mutex<Option<adapter::DecodePrefetchScheduler>> {
+        &self.decode_prefetch
+    }
+
+    fn quiesce_decode_prefetch_for_vram_claim(&self) -> Result<bool> {
+        self.decode_prefetch
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map_or(Ok(false), adapter::DecodePrefetchScheduler::cancel_active)
     }
 
     /// Install this model's dense layer-streaming session (see `pager::DensePagerSession`) —
@@ -4946,6 +4984,7 @@ impl VulkanBackend {
         let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
         let unified_phase_id = self.unified_phases.register(&runtime_phase);
         Ok(Self {
+            decode_prefetch: Mutex::new(None),
             moe_pager: Arc::clone(&self.moe_pager),
             session_finalization_deferred: Arc::clone(&self.session_finalization_deferred),
             dense_pager: Mutex::new(None),
@@ -5020,7 +5059,14 @@ impl VulkanBackend {
                 ));
             }
             let protected = self.protected_unified_experts();
-            let plan = pool.plan_owner_claim(&[size], class, &protected)?;
+            let mut plan = pool.plan_owner_claim(&[size], class, &protected)?;
+            if !plan.victims().is_empty() && self.quiesce_decode_prefetch_for_vram_claim()? {
+                // The worker may have changed LRU residency before it was stopped. Physical arena
+                // ownership is unchanged, but recomputing keeps relocation/victim choice based on
+                // the final pager state that this transaction will commit.
+                let protected = self.protected_unified_experts();
+                plan = pool.plan_owner_claim(&[size], class, &protected)?;
+            }
             let mut handles = self.commit_unified_claim_locked(&pool, plan)?;
             let handle = handles
                 .pop()
@@ -5231,11 +5277,19 @@ impl VulkanBackend {
                         Ok(range)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let plan = pool.plan_exact_owner_claim(
+                let mut plan = pool.plan_exact_owner_claim(
                     &exact_ranges,
                     crate::unified::UnifiedVramClass::KvCache,
                     &protected,
                 )?;
+                if !plan.victims().is_empty() && self.quiesce_decode_prefetch_for_vram_claim()? {
+                    let protected = self.protected_unified_experts();
+                    plan = pool.plan_exact_owner_claim(
+                        &exact_ranges,
+                        crate::unified::UnifiedVramClass::KvCache,
+                        &protected,
+                    )?;
+                }
                 debug_assert_eq!(plan.len(), sizes.len());
                 self.commit_unified_claim_locked(&pool, plan)?
             } else {
@@ -5751,7 +5805,13 @@ impl VulkanBackend {
             if pool.expert_layout().is_some() {
                 self.with_unified_exclusive(|| {
                     let protected = self.protected_unified_experts();
-                    let plan = pool.plan_owner_claim(sizes, class, &protected)?;
+                    let mut plan = pool.plan_owner_claim(sizes, class, &protected)?;
+                    if !plan.victims().is_empty()
+                        && self.quiesce_decode_prefetch_for_vram_claim()?
+                    {
+                        let protected = self.protected_unified_experts();
+                        plan = pool.plan_owner_claim(sizes, class, &protected)?;
+                    }
                     let handles = self.commit_unified_claim_locked(&pool, plan)?;
                     if handles.len() != sizes.len() {
                         return Err(be(

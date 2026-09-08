@@ -13,7 +13,10 @@ use infr_core::backend::Buffer;
 use infr_core::error::Result;
 use infr_core::pager_profile;
 
-use crate::{as_vk_buf, be, copy_to_mapped, ImportedHostAllocation, VkBuffer, VulkanBackend};
+use crate::{
+    as_vk_buf, be, copy_to_mapped, Backing, ImportedHostAllocation, VkBuffer, VulkanBackend,
+    VulkanShared,
+};
 
 /// One source/destination group submitted to the optional dedicated transfer queue. Both owners
 /// are retained by the queue's command slot until its timeline value completes.
@@ -434,6 +437,81 @@ struct PreparedCopy {
     dedicated: bool,
 }
 
+/// Cloneable, transfer-only view of a Vulkan backend. Decode prefetch workers retain this instead
+/// of a complete model backend, avoiding both a backend ownership cycle and access to graph/runtime
+/// state that the worker must never touch.
+#[derive(Clone)]
+pub(crate) struct BackgroundTransferExecutor {
+    shared: Arc<VulkanShared>,
+}
+
+impl BackgroundTransferExecutor {
+    pub(crate) fn from_backend(be_: &VulkanBackend) -> Option<Self> {
+        (be_.shared.dedicated_transfer.is_some() && be_.shared.host_overflow_type.is_some()).then(
+            || Self {
+                shared: Arc::clone(&be_.shared),
+            },
+        )
+    }
+
+    fn stage_host_bytes(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)> {
+        let staging = make_dedicated_host_transfer_buffer(&self.shared, src.len())?;
+        let ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("background transfer staging allocation is not mapped"))?;
+        let started = pager_profile::active().then(std::time::Instant::now);
+        copy_to_mapped(src, ptr);
+        if let Some(t0) = started {
+            pager_profile::record_memcpy(src.len(), t0.elapsed());
+        }
+        Ok((Arc::new(staging), ptr as usize, true))
+    }
+
+    fn submit_batches(&self, batches: &[TransferCopyBatch]) -> Result<u64> {
+        self.shared
+            .submit_transfer_batches(batches)?
+            .ok_or_else(|| be("background transfer requested without a transfer-only queue"))
+    }
+
+    pub(crate) fn wait(&self, value: u64) -> Result<()> {
+        self.shared.wait_dedicated_transfer(value)
+    }
+}
+
+impl TransferExecutor for BackgroundTransferExecutor {
+    fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)> {
+        self.stage_host_bytes(src)
+    }
+
+    fn complete_copies_now(
+        &self,
+        _copies: &[(Arc<dyn Buffer>, usize, DeviceTransferTarget, usize)],
+    ) -> Result<()> {
+        Err(be(
+            "background expert transfer unexpectedly resolved to the synchronous copy path",
+        ))
+    }
+
+    fn relocate_device_ranges_now(
+        &self,
+        _copies: &[(DeviceTransferTarget, DeviceTransferTarget)],
+    ) -> Result<()> {
+        Err(be(
+            "background expert transfer cannot relocate unified VRAM ranges",
+        ))
+    }
+
+    fn fill_target_now(
+        &self,
+        _target: &DeviceTransferTarget,
+        _fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        Err(be(
+            "background expert transfer cannot synchronously fill a device target",
+        ))
+    }
+}
+
 /// One backend-resolved transfer batch. The source route and staging ownership are frozen before
 /// this value reaches the scheduler; it only records the batch into a command stream or completes
 /// it immediately when no recorder is available.
@@ -502,13 +580,17 @@ impl PreparedTransfer {
     /// Start this batch on the transfer-only queue without attaching the resulting wait to the
     /// current compute recorder. Decode prefetch carries the returned timeline value forward and
     /// waits only when the predicted target layer actually consumes these slots.
-    pub(crate) fn submit_background(mut self, be_: &VulkanBackend) -> Result<Option<u64>> {
+    pub(crate) fn submit_background(
+        mut self,
+        executor: &BackgroundTransferExecutor,
+    ) -> Result<Option<u64>> {
         if self.copies.is_empty() {
             return Ok(None);
         }
         if self.copies.iter().any(|copy| !copy.dedicated) {
-            self.complete_now(be_)?;
-            return Ok(None);
+            return Err(be(
+                "background expert transfer contains a main-queue-only copy",
+            ));
         }
 
         let mut groups: Vec<TransferCopyBatch> = Vec::new();
@@ -536,10 +618,7 @@ impl PreparedTransfer {
                     .size(copy.len as u64),
             );
         }
-        let value = be_
-            .shared
-            .submit_transfer_batches(&groups)?
-            .ok_or_else(|| be("background transfer requested without a transfer-only queue"))?;
+        let value = executor.submit_batches(&groups)?;
         if pager_profile::active() {
             for copy in &self.copies {
                 pager_profile::record_gpu_copy(copy.len);
@@ -685,6 +764,89 @@ impl DeviceTransferTarget {
             dedicated_compatible: self.dedicated_compatible,
         })
     }
+}
+
+fn make_dedicated_host_transfer_buffer(
+    shared: &Arc<VulkanShared>,
+    size: usize,
+) -> Result<VkBuffer> {
+    let memory_type = shared
+        .host_overflow_type
+        .ok_or_else(|| be("background transfer has no host-visible system-memory type"))?;
+    let queue_families = shared
+        .dedicated_transfer_families()
+        .ok_or_else(|| be("background transfer has no transfer-only queue family"))?;
+    let info = vk::BufferCreateInfo::default()
+        .size(crate::fill_span(size))
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::CONCURRENT)
+        .queue_family_indices(&queue_families);
+    let buffer = unsafe { shared.device.create_buffer(&info, None) }.map_err(|error| {
+        be(format!(
+            "create_buffer(background-transfer-staging): {error}"
+        ))
+    })?;
+    let requirements = unsafe { shared.device.get_buffer_memory_requirements(buffer) };
+    if requirements.memory_type_bits & (1 << memory_type) == 0 {
+        unsafe { shared.device.destroy_buffer(buffer, None) };
+        return Err(be(
+            "background transfer staging is incompatible with host-visible system memory",
+        ));
+    }
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type);
+    let memory = match unsafe { shared.device.allocate_memory(&alloc_info, None) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            unsafe { shared.device.destroy_buffer(buffer, None) };
+            return Err(be(format!(
+                "allocate_memory(background-transfer-staging, {}): {error}",
+                requirements.size
+            )));
+        }
+    };
+    let ptr = match unsafe {
+        shared
+            .device
+            .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+    } {
+        Ok(ptr) => ptr as *mut u8,
+        Err(error) => {
+            unsafe {
+                shared.device.free_memory(memory, None);
+                shared.device.destroy_buffer(buffer, None);
+            }
+            return Err(be(format!(
+                "map_memory(background-transfer-staging): {error}"
+            )));
+        }
+    };
+    if let Err(error) = unsafe { shared.device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            shared.device.unmap_memory(memory);
+            shared.device.free_memory(memory, None);
+            shared.device.destroy_buffer(buffer, None);
+        }
+        return Err(be(format!(
+            "bind_buffer_memory(background-transfer-staging): {error}"
+        )));
+    }
+    Ok(VkBuffer {
+        shared: Arc::clone(shared),
+        buffer,
+        backing: Backing::Vram {
+            memory,
+            ptr,
+            spilled: true,
+        },
+        size,
+        mem_size: requirements.size,
+        location: MemoryLocation::GpuOnly,
+        sub_offset: 0,
+        own_addr: None,
+        act_bytes: 0,
+    })
 }
 
 impl VulkanBackend {

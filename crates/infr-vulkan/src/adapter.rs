@@ -9,13 +9,15 @@ use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
 use infr_core::graph::{
-    Activation, AttnMask, Dsv4CacheFormat, Graph, Op, TensorKind, QSA_MAX_TOP_BLOCKS,
+    Activation, AttnMask, Dsv4CacheFormat, Graph, MoePrefetchHint, Op, TensorKind,
+    EXPERT_PREFETCH_CANDIDATES, QSA_MAX_TOP_BLOCKS,
 };
 use infr_core::shutdown::shutdown_requested;
 use infr_core::{Backend, TensorId};
 use std::collections::{HashMap, HashSet};
 use std::ops::Index;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use crate::recorder::RecordedCmd;
 
@@ -6153,11 +6155,274 @@ fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
     }
 }
 
+struct DecodePrefetchControl {
+    target_layer: u32,
+    cancel: AtomicBool,
+    latest_transfer: AtomicU64,
+    error: Mutex<Option<String>>,
+}
+
+struct DecodePrefetchJob {
+    control: Arc<DecodePrefetchControl>,
+    role_buf_ids: Vec<usize>,
+    predicted_ids: Vec<u32>,
+}
+
+/// One persistent worker per paged Vulkan backend. Persistence matters for Qwen3.8: layer 0 and
+/// layers 1..end are separate graph executions around the CPU PLE hand-off, while a layer-0
+/// prediction should remain live across that boundary.
+pub(crate) struct DecodePrefetchScheduler {
+    tx: Option<mpsc::Sender<Option<DecodePrefetchJob>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    active: Option<Arc<DecodePrefetchControl>>,
+    handed_off_transfer: u64,
+    pager: Arc<crate::pager::MoePagerCell>,
+    executor: crate::transfer::BackgroundTransferExecutor,
+}
+
+impl DecodePrefetchScheduler {
+    pub(crate) fn spawn(
+        pager: Arc<crate::pager::MoePagerCell>,
+        executor: crate::transfer::BackgroundTransferExecutor,
+    ) -> std::io::Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let worker_pager = Arc::clone(&pager);
+        let worker_executor = executor.clone();
+        let thread = std::thread::Builder::new()
+            .name("infr-moe-decode-prefetch".to_owned())
+            .spawn(move || run_decode_prefetch_worker(worker_pager, worker_executor, rx))?;
+        Ok(Self {
+            tx: Some(tx),
+            thread: Some(thread),
+            active: None,
+            handed_off_transfer: 0,
+            pager,
+            executor,
+        })
+    }
+
+    fn active_target(&self) -> Option<u32> {
+        self.active.as_ref().map(|active| active.target_layer)
+    }
+
+    fn issue(
+        &mut self,
+        target_layer: u32,
+        role_buf_ids: Vec<usize>,
+        predicted_ids: Vec<u32>,
+    ) -> Result<()> {
+        if let Some(active) = self.active.as_ref() {
+            return Err(be(format!(
+                "decode expert prefetch for layer {} is still active while layer {target_layer} was issued",
+                active.target_layer
+            )));
+        }
+        let control = Arc::new(DecodePrefetchControl {
+            target_layer,
+            cancel: AtomicBool::new(false),
+            latest_transfer: AtomicU64::new(0),
+            error: Mutex::new(None),
+        });
+        self.tx
+            .as_ref()
+            .ok_or_else(|| be("decode expert prefetch worker is closed"))?
+            .send(Some(DecodePrefetchJob {
+                control: Arc::clone(&control),
+                role_buf_ids,
+                predicted_ids,
+            }))
+            .map_err(|_| be("decode expert prefetch worker stopped unexpectedly"))?;
+        self.active = Some(control);
+        Ok(())
+    }
+
+    /// Stop the producer exactly when the real target router has completed. A matching target
+    /// returns the last transfer timeline value for a GPU-side wait; a stale target is drained on
+    /// the CPU before its speculative slots may be reused by an unrelated layer.
+    fn finish_target(&mut self, layer: u32) -> Result<u64> {
+        let Some(control) = self.active.take() else {
+            return Ok(0);
+        };
+        let matched = control.target_layer == layer;
+        let value = self.quiesce(&control, !matched)?;
+        if !matched {
+            tracing::debug!(
+                stale_target = control.target_layer,
+                observed_layer = layer,
+                "discarded stale decode expert prefetch"
+            );
+            return Ok(0);
+        }
+        self.handed_off_transfer = self.handed_off_transfer.max(value);
+        Ok(value)
+    }
+
+    pub(crate) fn cancel_active(&mut self) -> Result<bool> {
+        let had_active = if let Some(control) = self.active.take() {
+            self.quiesce(&control, true)?;
+            true
+        } else {
+            false
+        };
+        let handed_off = std::mem::take(&mut self.handed_off_transfer);
+        self.executor.wait(handed_off)?;
+        Ok(had_active || handed_off != 0)
+    }
+
+    fn complete_handoffs(&mut self) {
+        self.handed_off_transfer = 0;
+    }
+
+    fn quiesce(&self, control: &DecodePrefetchControl, wait_cpu: bool) -> Result<u64> {
+        control.cancel.store(true, Ordering::Release);
+        // The worker checks cancellation both before and after acquiring this same lock. Taking it
+        // here is therefore a barrier: after it returns, no later candidate can mutate residency or
+        // enqueue another transfer for this job.
+        drop(self.pager.lock().unwrap());
+        let value = control.latest_transfer.load(Ordering::Acquire);
+        let worker_error = control.error.lock().unwrap().clone().or_else(|| {
+            self.thread
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+                .then(|| "worker terminated before the target layer".to_owned())
+        });
+        let wait_result = if wait_cpu || worker_error.is_some() {
+            self.executor.wait(value)
+        } else {
+            Ok(())
+        };
+        match (worker_error, wait_result) {
+            (Some(error), Ok(())) => Err(be(format!("decode expert prefetch failed: {error}"))),
+            (Some(error), Err(wait)) => Err(be(format!(
+                "decode expert prefetch failed: {error}; transfer drain also failed: {wait}"
+            ))),
+            (None, Err(wait)) => Err(wait),
+            (None, Ok(())) => Ok(value),
+        }
+    }
+}
+
+impl Drop for DecodePrefetchScheduler {
+    fn drop(&mut self) {
+        if let Err(error) = self.cancel_active() {
+            tracing::warn!("[infr] decode expert prefetch shutdown failed: {error}");
+        }
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(None);
+        }
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!("[infr] decode expert prefetch worker panicked during shutdown");
+            }
+        }
+    }
+}
+
+fn run_decode_prefetch_worker(
+    pager: Arc<crate::pager::MoePagerCell>,
+    executor: crate::transfer::BackgroundTransferExecutor,
+    rx: mpsc::Receiver<Option<DecodePrefetchJob>>,
+) {
+    while let Ok(Some(job)) = rx.recv() {
+        for expert in job.predicted_ids {
+            if job.control.cancel.load(Ordering::Acquire) {
+                break;
+            }
+            let mut guard = pager.lock().unwrap();
+            if job.control.cancel.load(Ordering::Acquire) {
+                break;
+            }
+            let result = guard
+                .as_mut()
+                .ok_or_else(|| be("decode expert prefetch has no pager session"))
+                .and_then(|session| {
+                    session.prefetch_roles_cpu(&executor, &job.role_buf_ids, expert)
+                })
+                .and_then(|push| push.submit_background(&executor));
+            match result {
+                Ok(Some(value)) => {
+                    job.control
+                        .latest_transfer
+                        .fetch_max(value, Ordering::Release);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    *job.control.error.lock().unwrap() = Some(error.to_string());
+                    job.control.cancel.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn decode_prefetch_active_target(be_: &VulkanBackend) -> Option<u32> {
+    be_.decode_prefetch_scheduler()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(DecodePrefetchScheduler::active_target)
+}
+
+fn decode_prefetch_available(be_: &VulkanBackend) -> bool {
+    be_.decode_prefetch_scheduler().lock().unwrap().is_some()
+}
+
+fn finish_decode_prefetch_target(be_: &VulkanBackend, layer: u32) -> Result<u64> {
+    be_.decode_prefetch_scheduler()
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map_or(Ok(0), |scheduler| scheduler.finish_target(layer))
+}
+
+fn issue_decode_prefetch(
+    be_: &VulkanBackend,
+    target_layer: u32,
+    role_buf_ids: Vec<usize>,
+    predicted_ids: Vec<u32>,
+) -> Result<()> {
+    be_.decode_prefetch_scheduler()
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map_or(Ok(()), |scheduler| {
+            scheduler.issue(target_layer, role_buf_ids, predicted_ids)
+        })
+}
+
+fn cancel_decode_prefetch(be_: &VulkanBackend) -> Result<()> {
+    be_.decode_prefetch_scheduler()
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map_or(Ok(false), DecodePrefetchScheduler::cancel_active)
+        .map(|_| ())
+}
+
+fn complete_decode_prefetch_handoffs(be_: &VulkanBackend) {
+    if let Some(scheduler) = be_.decode_prefetch_scheduler().lock().unwrap().as_mut() {
+        scheduler.complete_handoffs();
+    }
+}
+
 /// Per-execute static recording: prepare zeroed `Internal` scratch, record every op via `lower_op`
 /// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Paged plans
 /// retain shape-stable scratch within one decode/prefill phase; other plans allocate it per call.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    match execute_static_inner(be_, graph, bindings) {
+        Ok(()) => Ok(()),
+        Err(error) => match cancel_decode_prefetch(be_) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(be(format!(
+                "{error} (decode expert prefetch teardown also failed: {cleanup})"
+            ))),
+        },
+    }
+}
+
+fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
     let layout = scratch_layout(graph)?;
     // Paged decode plans are rebuilt per token, but their pooled workspace is shape-stable across
     // the whole decode phase. Retain that pool on the model backend so freeing one token's scratch
@@ -6167,6 +6432,9 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     let mut scratch_reused = false;
     let mut phase_arena = if be_.moe_paged() {
         if let Some(phase) = paged_static_phase(graph) {
+            if phase == RuntimePhase::Prefill {
+                cancel_decode_prefetch(be_)?;
+            }
             let mut arena = be_.runtime_phase.lock().unwrap();
             let start = arena.begin_execute(phase, &layout);
             scratch_reused = start.scratch_reused;
@@ -6432,6 +6700,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 execute_paged_moe(
                     be_,
                     graph,
+                    op_idx,
                     op,
                     scratch,
                     bindings,
@@ -6545,6 +6814,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             submits,
         );
     }
+    complete_decode_prefetch_handoffs(be_);
     Ok(())
 }
 
@@ -7433,6 +7703,7 @@ fn linear_paged_maybe_shared(
 fn execute_paged_moe<'a>(
     be_: &'a VulkanBackend,
     graph: &Graph,
+    op_idx: usize,
     op: &Op,
     scratch: &[Option<Box<dyn Buffer>>],
     bindings: &Bindings,
@@ -7537,6 +7808,105 @@ fn execute_paged_moe<'a>(
         BufferUsage::Staging,
     )?;
     let wts = pooled(pool, be_, "moe_paged_wts", n_slots * 4)?;
+    let prefetch_hint = decode_prefetch_available(be_)
+        .then(|| {
+            graph
+                .moe_prefetch_hints
+                .iter()
+                .find(|hint| hint.source_op == op_idx)
+                .copied()
+        })
+        .flatten();
+    let prefetch_gpu: Option<(MoePrefetchHint, ScratchKey, Vec<usize>)> =
+        if let Some(hint) = prefetch_hint {
+            if rows != 1
+                || hint.target_n_expert as usize != n_expert
+                || has_bias
+                || hash
+                || *n_expert_groups > 1
+                || !matches!(gating, infr_core::graph::MoeGating::Softmax)
+            {
+                return Err(be(
+                "vulkan adapter: expert prefetch only supports single-row uniform softmax Qwen MoE",
+            ));
+            }
+            let target_gate_id = buffer_identity(r(hint.target_gate_exps)?);
+            let target_up_id = buffer_identity(r(hint.target_up_exps)?);
+            let target_down_id = buffer_identity(r(hint.target_down_exps)?);
+            let role_buf_ids = if hint.target_fused_gate_up {
+                vec![target_gate_id, target_down_id]
+            } else {
+                vec![target_gate_id, target_up_id, target_down_id]
+            };
+            let target_all_resident = {
+                let guard = be_.moe_pager().lock().unwrap();
+                let session = guard.as_ref().expect("paged execution requires a session");
+                role_buf_ids
+                    .iter()
+                    .all(|&buf_id| session.all_resident(buf_id, hint.target_n_expert as usize))
+            };
+            if target_all_resident {
+                None
+            } else {
+                let target_n_expert = hint.target_n_expert as usize;
+                let predicted = EXPERT_PREFETCH_CANDIDATES.min(target_n_expert);
+                let next_logits = pooled(pool, be_, "moe_prefetch_logits", target_n_expert * 4)?;
+                let next_ids = pooled_usage(
+                    pool,
+                    be_,
+                    "moe_prefetch_ids",
+                    predicted * 4,
+                    BufferUsage::Staging,
+                )?;
+                let next_wts = pooled(pool, be_, "moe_prefetch_wts", predicted * 4)?;
+                let rc = rec.as_ref().expect("segment always Some between ops");
+                let rxb = r(*router_x)?;
+                let rw = r(hint.target_router)?;
+                let rdt = graph.desc(hint.target_router).dtype;
+                rc.label_next("expert_prefetch_router");
+                if native_dense_supported(rdt) {
+                    rc.linear_native(
+                        rdt,
+                        rw,
+                        0,
+                        rxb,
+                        pool[&next_logits].as_ref(),
+                        1,
+                        ne,
+                        target_n_expert,
+                    );
+                } else if matches!(rdt, infr_core::DType::F32) {
+                    rc.linear_f32(rw, rxb, pool[&next_logits].as_ref(), 1, ne, target_n_expert);
+                } else {
+                    rc.linear(rw, rxb, pool[&next_logits].as_ref(), 1, ne, target_n_expert);
+                }
+                let dummy = pool[dummy_key
+                    .as_ref()
+                    .expect("Qwen expert prefetch always has an absent-bias dummy")]
+                .as_ref();
+                rc.label_next("expert_prefetch_topk");
+                rc.moe_topk(
+                    pool[&next_logits].as_ref(),
+                    pool[&next_ids].as_ref(),
+                    pool[&next_wts].as_ref(),
+                    dummy,
+                    1,
+                    target_n_expert,
+                    predicted,
+                    1.0,
+                    0,
+                    true,
+                    false,
+                    0,
+                    0,
+                    dummy,
+                    false,
+                );
+                Some((hint, next_ids, role_buf_ids))
+            }
+        } else {
+            None
+        };
     {
         let rc = rec.as_ref().expect("segment always Some between ops");
         let rxb = r(*router_x)?;
@@ -7589,6 +7959,24 @@ fn execute_paged_moe<'a>(
         buffer_identity(up_buf),
         buffer_identity(down_buf),
     );
+
+    let current_layer = be_
+        .moe_pager()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("paged execution requires a session")
+        .registered_layer(gate_id, n_expert)?;
+    if let Some((hint, _, _)) = prefetch_gpu.as_ref() {
+        if hint.source_layer != current_layer {
+            return Err(be(format!(
+                "expert prefetch hint says source layer {}, pager resolved layer {current_layer}",
+                hint.source_layer
+            )));
+        }
+    }
+    let close_active_prefetch = decode_prefetch_active_target(be_).is_some();
+    let mut active_prefetch_finished = false;
 
     // ── Residency: pick the staging strategy (see the fn doc), ending with every needed expert
     // resident-at-execution and a frozen per-role LUT window in the session tape.
@@ -7645,12 +8033,46 @@ fn execute_paged_moe<'a>(
             // set into the fresh ambient segment (which then stays open for the layers after).
             sync_stream(be_, rec, ps)?;
             stream_synced_for_cpu_push = true;
+            if close_active_prefetch {
+                let value = finish_decode_prefetch_target(be_, current_layer)?;
+                if value != 0 {
+                    rec.as_ref()
+                        .expect("sync_stream installs a fresh recorder")
+                        .wait_for_dedicated_transfer(value);
+                }
+                active_prefetch_finished = true;
+            }
             let mut id_bytes = vec![0u8; n_slots * 4];
             be_.download(pool[&ids_key].as_ref(), &mut id_bytes)
                 .map_err(|e| be(e.to_string()))?;
             stage_ids = bytemuck::cast_slice(&id_bytes).to_vec();
         }
     }
+    if (prefetch_gpu.is_some() || close_active_prefetch) && !stream_synced_for_cpu_push {
+        sync_stream(be_, rec, ps)?;
+        stream_synced_for_cpu_push = true;
+    }
+    if close_active_prefetch && !active_prefetch_finished {
+        let value = finish_decode_prefetch_target(be_, current_layer)?;
+        if value != 0 {
+            rec.as_ref()
+                .expect("sync_stream installs a fresh recorder")
+                .wait_for_dedicated_transfer(value);
+        }
+    }
+    let pending_prefetch = if let Some((hint, ids_key, role_buf_ids)) = prefetch_gpu {
+        let predicted = EXPERT_PREFETCH_CANDIDATES.min(hint.target_n_expert as usize);
+        let mut id_bytes = vec![0u8; predicted * 4];
+        be_.download(pool[&ids_key].as_ref(), &mut id_bytes)
+            .map_err(|e| be(e.to_string()))?;
+        Some((
+            hint.target_layer,
+            role_buf_ids,
+            bytemuck::cast_slice(&id_bytes).to_vec(),
+        ))
+    } else {
+        None
+    };
     // CPU writes are not commands in the ambient recorder. The non-layer compatibility path must
     // drain earlier arena readers before overwriting LRU slots. Normal Prefill uses fenced dynamic
     // lanes; Decode already synced above in order to read router ids.
@@ -8012,6 +8434,10 @@ fn execute_paged_moe<'a>(
     // `_xpg` kernel builds (`infr_core::tensor::MOE_MMQ_PAGED_DTYPES` — the FULL
     // `MOE_MMQ_DTYPES` set, mirror checked by `moe_mmq_drift_test`) + activation + dp4a
     // support; anything else stays on the id-GEMV arm below, which is shape-general.
+    if let Some((target_layer, role_buf_ids, predicted_ids)) = pending_prefetch {
+        issue_decode_prefetch(be_, target_layer, role_buf_ids, predicted_ids)?;
+    }
+
     if let PagedMoeScratch::Mmq(scratch) = &moe_scratch {
         let n_pairs = n_slots;
         let counts = scratch.counts;

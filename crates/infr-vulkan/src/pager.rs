@@ -51,8 +51,8 @@ use infr_core::Backend;
 
 use super::{as_vk_buf, be, VulkanBackend};
 use crate::transfer::{
-    parallel_copy_to_mapped as par_copy_to_mapped, DeviceTransferTarget, PreparedTransfer,
-    SessionTransferPlan, TransferExecutor,
+    parallel_copy_to_mapped as par_copy_to_mapped, BackgroundTransferExecutor,
+    DeviceTransferTarget, PreparedTransfer, SessionTransferPlan, TransferExecutor,
 };
 use crate::unified::{
     ExpertSlotId, UnifiedAllocationHandle, UnifiedClaimPlan, UnifiedRange, UnifiedVramClass,
@@ -1538,8 +1538,11 @@ impl PreparedHostPush {
         Ok(self.requested)
     }
 
-    pub(crate) fn submit_background(self, be_: &VulkanBackend) -> Result<Option<u64>> {
-        self.transfer.submit_background(be_)
+    pub(crate) fn submit_background(
+        self,
+        executor: &BackgroundTransferExecutor,
+    ) -> Result<Option<u64>> {
+        self.transfer.submit_background(executor)
     }
 }
 
