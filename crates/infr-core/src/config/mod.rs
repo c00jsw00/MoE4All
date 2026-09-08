@@ -212,8 +212,8 @@ cfg_struct! {
         prefill_upload_async: bool = true,
         /// Predict the next Qwen3.8 Decode router from the current layer input and admit useful
         /// expert blocks at the cold LRU edge while the GPU executes intervening work.
-        /// `INFR_NO_EXPERT_PREFETCH` disables the feature for A/B diagnostics.
-        expert_prefetch: bool = true,
+        /// Experimental and opt-in: `INFR_EXPERT_PREFETCH` enables it for A/B diagnostics.
+        expert_prefetch: bool = false,
         /// `INFR_MOE_SIZE_CACHE_BIAS`: optional Decode arena weighting between distinct per-expert
         /// tensor sizes. Positive values favor larger tensors and negative values favor smaller.
         /// `None` auto-enables the validated `+2` bias only for a balanced two-size layout where

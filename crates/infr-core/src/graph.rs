@@ -1635,7 +1635,11 @@ impl Op {
 /// Maximum ordered next-layer expert candidates carried by a decode prefetch hint. Smaller
 /// working sets are prefixes of this one router result, so the backend can stop admission when
 /// the transfer window closes without running several top-k kernels.
-pub const EXPERT_PREFETCH_CANDIDATES: usize = 32;
+// The offline Qwen3.8 FATE trace shows a steep precision drop after rank 1: the first candidate
+// appears in the real top-10 on 87% of layer transitions, while deeper ranks rapidly turn into
+// cache pollution and extra PCIe traffic. Runtime cancellation still bounds the transfer window;
+// this cap bounds speculative breadth inside that window.
+pub const EXPERT_PREFETCH_CANDIDATES: usize = 1;
 
 /// Optional scheduling metadata attached to one [`Op::MoeFfn`]. It names the next layer's router
 /// and expert banks without turning prediction into model math: backends that cannot overlap
