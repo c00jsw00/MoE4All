@@ -3144,10 +3144,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // `MoePagerSession::register` does.
     let mut moe_host_offsets =
         std::collections::HashMap::<(usize, infr_vulkan::pager::Role), usize>::new();
-    let mut moe_host_by_size = std::collections::BTreeMap::<
-        usize,
-        std::sync::Arc<infr_core::hostpager::InclusiveHostCache>,
-    >::new();
+    let mut moe_host_tier = None::<std::sync::Arc<infr_core::hostpager::InclusiveHostTier>>;
     if first_load && n_paged > 0 {
         use infr_vulkan::pager::Role;
         let moe = cfg.moe.as_ref().expect("n_paged > 0 implies MoE");
@@ -3432,25 +3429,22 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .iter()
                     .map(|&(slot_bytes, blocks, _)| (slot_bytes, blocks))
                     .collect();
-                let ram_slots = infr_core::hostpager::plan_slots(host_cache_budget, &classes);
                 let io = std::sync::Arc::new(
                     infr_core::blockio::FileBlockIo::open_shards(&g.shards())
                         .map_err(|e| anyhow!("{e}"))?,
                 );
-                for (&(slot_bytes, _, _), &slots) in logical_pools.iter().zip(&ram_slots) {
-                    let cache = infr_core::hostpager::InclusiveHostCache::new(
-                        slots,
-                        slot_bytes,
-                        io.clone(),
-                    )
-                    .map_err(|e| anyhow!("{e}"))?;
-                    moe_host_by_size.insert(slot_bytes, std::sync::Arc::new(cache));
-                }
-                tracing::info!(
-                    "MoE host plan: bounded inclusive RAM cache {:.2} GiB / {:.2} GiB expert payload; GPU shadows share this budget and remaining Experts stream from SSD",
-                    host_cache_budget as f64 / GIB_F64,
-                    host_bytes as f64 / GIB_F64,
+                let tier = std::sync::Arc::new(
+                    infr_core::hostpager::InclusiveHostTier::new(host_cache_budget, &classes, io)
+                        .map_err(|e| anyhow!("{e}"))?,
                 );
+                tracing::info!(
+                    "MoE host plan: bounded inclusive RAM cache {:.2} GiB / {:.2} GiB budget / {:.2} GiB expert payload across {} size class(es); GPU shadows share this budget and remaining Experts stream from SSD",
+                    tier.arena_bytes() as f64 / GIB_F64,
+                    tier.budget_bytes() as f64 / GIB_F64,
+                    host_bytes as f64 / GIB_F64,
+                    tier.classes().len(),
+                );
+                moe_host_tier = Some(tier);
             } else {
                 // Keep the complete payload in one logical layer-major store, split only BETWEEN
                 // layers so each layer remains a contiguous Prefill source. Bounded-RAM mode does
@@ -3521,7 +3515,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                             slot_bytes: sb,
                             n_slots: budget_slots,
                             min_enabled_slots,
-                            host: moe_host_by_size.get(&sb).cloned(),
                         }
                     },
                 )
@@ -3562,6 +3555,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 load_reserve_bytes: 0,
                 n_blocks,
                 pools,
+                host_tier: moe_host_tier.clone(),
                 dynamic_state_reserve_bytes: plan.dynamic_state_reserve_bytes,
                 dynamic_state_max_allocation_bytes,
                 prefill_min_lane_bytes,
@@ -4059,7 +4053,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let host_offset = *moe_host_offsets.get(&(l, role)).ok_or_else(|| {
                     anyhow!("MoE permanent host-store plan has no offset for {name}")
                 })?;
-                let file = if let Some(host) = moe_host_by_size.get(&stride_bytes) {
+                let file = if let Some(host) = moe_host_tier
+                    .as_ref()
+                    .and_then(|tier| tier.cache(stride_bytes))
+                {
                     let (base, len) = bytes.file_range();
                     if len != stride_bytes * n_expert {
                         return Err(anyhow!(

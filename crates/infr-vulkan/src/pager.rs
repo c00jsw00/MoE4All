@@ -44,7 +44,7 @@ use indicatif::ProgressBar;
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::blockio::BlockDesc;
 use infr_core::error::Result;
-use infr_core::hostpager::{AlignedHostBuffer, HostPager, InclusiveHostCache};
+use infr_core::hostpager::{AlignedHostBuffer, HostPager, InclusiveHostCache, InclusiveHostTier};
 use infr_core::pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
 use infr_core::pager_profile;
 use infr_core::Backend;
@@ -1709,6 +1709,9 @@ pub struct MoePagerSession {
     /// The only owned host copy of all paged MoE weights. Plain CPU memory, deliberately not a
     /// Vulkan buffer: the full payload cannot be counted or accessed as shared/virtual VRAM.
     host_store: Vec<HostStoreChunk>,
+    /// Bounded RAM/SSD owner. Size classes retain independent LRUs, while this object freezes their
+    /// shared budget and lifetime for the model session. `None` selects the full host store above.
+    _host_tier: Option<Arc<InclusiveHostTier>>,
     /// Frozen host-to-device routes for this session. The pager submits opaque source/target
     /// requests through it and never branches on mapped memory, host import or staging details.
     transfer_plan: Arc<SessionTransferPlan>,
@@ -1774,9 +1777,6 @@ pub struct MoePoolSpec {
     pub n_slots: usize,
     /// Runtime loans may consume surplus slots, but must preserve this planner-derived batch floor.
     pub min_enabled_slots: usize,
-    /// Bounded inclusive RAM cache below this VRAM size class. `None` selects the permanent
-    /// full-Host-Store fast path.
-    pub host: Option<Arc<InclusiveHostCache>>,
 }
 
 /// One chunk of the unique permanent CPU store. Chunks are split only at complete layer boundaries
@@ -1801,6 +1801,9 @@ pub struct MoePagerLayout {
     /// it; other layers' entries stay `NOT_RESIDENT`).
     pub n_blocks: usize,
     pub pools: Vec<MoePoolSpec>,
+    /// One bounded RAM/SSD tier shared by all size classes. `None` selects the permanent full-RAM
+    /// host store described by `host_chunks`.
+    pub host_tier: Option<Arc<InclusiveHostTier>>,
     /// Maximum lazily committed KV/QSA bytes. The unified arena reserves this low-address
     /// corridor logically while allowing Expert filler to occupy uncommitted cells.
     pub dynamic_state_reserve_bytes: u64,
@@ -1856,14 +1859,19 @@ impl MoePagerSession {
                 layout.load_reserve_bytes as f64 / (1u64 << 30) as f64,
             );
         }
-        let tiered = layout.pools.iter().any(|pool| pool.host.is_some());
+        let tiered = layout.host_tier.is_some();
         if !tiered && layout.host_chunks.is_empty() {
             return Err(be("moe pager: permanent host-store plan has no chunks"));
         }
-        if tiered && layout.pools.iter().any(|pool| pool.host.is_none()) {
-            return Err(be(
-                "moe pager: bounded-RAM mode requires a host tier for every size class",
-            ));
+        if let Some(host_tier) = &layout.host_tier {
+            for pool in &layout.pools {
+                if host_tier.cache(pool.slot_bytes).is_none() {
+                    return Err(be(format!(
+                        "moe pager: bounded RAM tier has no {}-byte size class",
+                        pool.slot_bytes
+                    )));
+                }
+            }
         }
         let mut host_store = Vec::with_capacity(layout.host_chunks.len());
         let mut previous_end = 0usize;
@@ -1886,21 +1894,15 @@ impl MoePagerSession {
         for chunk in &host_store {
             transfer_sources.push((Arc::clone(&chunk.bytes), 1));
         }
-        for pool in &layout.pools {
-            if let Some(host) = &pool.host {
-                transfer_sources.push((host.arena_allocation(), pool.slot_bytes));
-            }
+        if let Some(host_tier) = &layout.host_tier {
+            transfer_sources.extend(host_tier.arena_allocations());
         }
-        if tiered {
-            let cache_bytes: usize = layout
-                .pools
-                .iter()
-                .filter_map(|pool| pool.host.as_ref())
-                .map(|host| host.arena_bytes())
-                .sum();
+        if let Some(host_tier) = &layout.host_tier {
             tracing::info!(
-                "[infr] paged-MoE host tier: inclusive bounded cache={} bytes; permanent full Host Store=0 bytes",
-                cache_bytes,
+                "[infr] paged-MoE host tier: inclusive bounded cache={} bytes of a {}-byte budget across {} size class(es); permanent full Host Store=0 bytes",
+                host_tier.arena_bytes(),
+                host_tier.budget_bytes(),
+                host_tier.classes().len(),
             );
         } else {
             tracing::info!(
@@ -1949,7 +1951,11 @@ impl MoePagerSession {
                 spec.n_slots,
                 spec.slot_bytes,
             )?;
-            let exchange_slot = if spec.host.is_some() {
+            let host = layout
+                .host_tier
+                .as_ref()
+                .and_then(|tier| tier.cache(spec.slot_bytes));
+            let exchange_slot = if host.is_some() {
                 Some(pager.reserve_exchange_slot()?)
             } else {
                 None
@@ -1966,7 +1972,7 @@ impl MoePagerSession {
                 slot_bytes: spec.slot_bytes,
                 pager,
                 min_enabled_slots: spec.min_enabled_slots,
-                host: spec.host.clone(),
+                host,
                 exchange_slot,
             });
         }
@@ -1988,6 +1994,7 @@ impl MoePagerSession {
             unified_pool,
             role_stride: layout.n_blocks,
             host_store,
+            _host_tier: layout.host_tier,
             transfer_plan: Arc::new(transfer_plan),
             prefill_host_worker_ready,
             pending_transfer_sources: transfer_sources,
