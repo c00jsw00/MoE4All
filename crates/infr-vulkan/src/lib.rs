@@ -1943,12 +1943,11 @@ pub struct VulkanBackend {
     /// arena/ring buffers free first; owned by the backend HANDLE, never `VulkanShared` — the Arc
     /// cycle lesson on `moe_pager`'s doc applies unchanged).
     dense_pager: crate::pager::DensePagerCell,
-    /// Pooled workspace retained across consecutive paged-MoE static executes. Paged decode plans
-    /// are intentionally rebuilt per token for router readback, so plan-owned scratch would be
-    /// dropped every token and make the unified arena restore then immediately re-loan an expert
-    /// slot. The adapter clears this cache only when execution switches between decode and
-    /// prefill; declaring it before `shared` also guarantees its Vulkan buffers drop first.
-    static_scratch: Arc<Mutex<adapter::StaticScratchCache>>,
+    /// Logical runtime phase arena retained across consecutive paged-MoE executes. Its Vulkan
+    /// ranges may be physically segmented, but graph scratch and pooled high-water workspaces have
+    /// one Decode/Prefill lifetime. This avoids restoring and immediately re-loaning expert slots
+    /// every token; declaring it before `shared` also guarantees its buffers drop first.
+    runtime_phase: Arc<Mutex<adapter::RuntimePhaseArena>>,
     /// Resident-weight sub-allocator (see [`BdaWeightArena`]) — `None` until the first weight alloc;
     /// `make_alloc` routes every `BufferUsage::Weights` here (the sole weight path).
     ///
@@ -1994,7 +1993,7 @@ enum UnifiedClient {
 struct UnifiedPhaseState {
     active: Option<u64>,
     next_id: u64,
-    caches: Vec<(u64, std::sync::Weak<Mutex<adapter::StaticScratchCache>>)>,
+    arenas: Vec<(u64, std::sync::Weak<Mutex<adapter::RuntimePhaseArena>>)>,
 }
 
 struct UnifiedPhaseRegistry {
@@ -2004,21 +2003,21 @@ struct UnifiedPhaseRegistry {
 impl UnifiedPhaseRegistry {
     const PRIMARY_ID: u64 = 1;
 
-    fn new(primary: &Arc<Mutex<adapter::StaticScratchCache>>) -> Arc<Self> {
+    fn new(primary: &Arc<Mutex<adapter::RuntimePhaseArena>>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(UnifiedPhaseState {
                 active: None,
                 next_id: Self::PRIMARY_ID + 1,
-                caches: vec![(Self::PRIMARY_ID, Arc::downgrade(primary))],
+                arenas: vec![(Self::PRIMARY_ID, Arc::downgrade(primary))],
             }),
         })
     }
 
-    fn register(&self, cache: &Arc<Mutex<adapter::StaticScratchCache>>) -> u64 {
+    fn register(&self, arena: &Arc<Mutex<adapter::RuntimePhaseArena>>) -> u64 {
         let mut state = self.state.lock().unwrap();
         let id = state.next_id;
         state.next_id = state.next_id.wrapping_add(1).max(Self::PRIMARY_ID + 1);
-        state.caches.push((id, Arc::downgrade(cache)));
+        state.arenas.push((id, Arc::downgrade(arena)));
         id
     }
 
@@ -2027,21 +2026,21 @@ impl UnifiedPhaseRegistry {
     fn activate(&self, id: u64) -> bool {
         let peers = {
             let mut state = self.state.lock().unwrap();
-            state.caches.retain(|(_, cache)| cache.strong_count() != 0);
+            state.arenas.retain(|(_, arena)| arena.strong_count() != 0);
             if state.active == Some(id) {
                 return false;
             }
             state.active = Some(id);
             state
-                .caches
+                .arenas
                 .iter()
-                .filter_map(|&(peer_id, ref cache)| {
-                    (peer_id != id).then(|| cache.upgrade()).flatten()
+                .filter_map(|&(peer_id, ref arena)| {
+                    (peer_id != id).then(|| arena.upgrade()).flatten()
                 })
                 .collect::<Vec<_>>()
         };
-        for cache in peers {
-            cache.lock().unwrap().release_phase();
+        for arena in peers {
+            arena.lock().unwrap().release_phase();
         }
         true
     }
@@ -3542,13 +3541,13 @@ impl VulkanBackend {
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
         cleanup.armed = false;
 
-        let static_scratch = Arc::new(Mutex::new(adapter::StaticScratchCache::default()));
-        let unified_phases = UnifiedPhaseRegistry::new(&static_scratch);
+        let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
+        let unified_phases = UnifiedPhaseRegistry::new(&runtime_phase);
         let backend = Self {
             moe_pager: Arc::new(Mutex::new(None)),
             session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dense_pager: Mutex::new(None),
-            static_scratch,
+            runtime_phase,
             bda_weight_arena: Mutex::new(None),
             unified_pool: Arc::new(Mutex::new(None)),
             unified_exec: Arc::new(RwLock::new(())),
@@ -4734,13 +4733,13 @@ impl VulkanBackend {
                 "cannot fork a unified Embedding backend before the MoE arena is initialized",
             ));
         }
-        let static_scratch = Arc::new(Mutex::new(adapter::StaticScratchCache::default()));
-        let unified_phase_id = self.unified_phases.register(&static_scratch);
+        let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
+        let unified_phase_id = self.unified_phases.register(&runtime_phase);
         Ok(Self {
             moe_pager: Arc::clone(&self.moe_pager),
             session_finalization_deferred: Arc::clone(&self.session_finalization_deferred),
             dense_pager: Mutex::new(None),
-            static_scratch,
+            runtime_phase,
             bda_weight_arena: Mutex::new(None),
             unified_pool: Arc::clone(&self.unified_pool),
             unified_exec: Arc::clone(&self.unified_exec),
@@ -6699,13 +6698,13 @@ mod tests {
 
     #[test]
     fn unified_phase_registry_switches_only_between_distinct_clients() {
-        let primary = Arc::new(Mutex::new(adapter::StaticScratchCache::default()));
+        let primary = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
         let registry = UnifiedPhaseRegistry::new(&primary);
 
         assert!(registry.activate(UnifiedPhaseRegistry::PRIMARY_ID));
         assert!(!registry.activate(UnifiedPhaseRegistry::PRIMARY_ID));
 
-        let auxiliary = Arc::new(Mutex::new(adapter::StaticScratchCache::default()));
+        let auxiliary = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
         let auxiliary_id = registry.register(&auxiliary);
         assert!(registry.activate(auxiliary_id));
         assert!(!registry.activate(auxiliary_id));

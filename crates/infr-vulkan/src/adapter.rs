@@ -546,45 +546,78 @@ impl Index<&ScratchKey> for ScratchPool {
 /// workspace; repeated executes in one phase keep the same buffers and therefore keep any expert
 /// slots loaned to LLM runtime stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StaticScratchPhase {
+enum RuntimePhase {
     Decode,
     Prefill,
 }
 
 #[derive(Default)]
-pub(crate) struct StaticScratchCache {
-    phase: Option<StaticScratchPhase>,
+pub(crate) struct RuntimePhaseArena {
+    phase: Option<RuntimePhase>,
     scratch_layout: ScratchLayout,
     scratch: ScratchSet,
     pool: ScratchPool,
 }
 
-impl StaticScratchCache {
-    fn enter(&mut self, phase: StaticScratchPhase) {
+struct RuntimePhaseStart {
+    previous: Option<RuntimePhase>,
+    scratch_reused: bool,
+}
+
+impl RuntimePhaseArena {
+    /// Enter one Decode or Prefill execute. The arena owns every graph and pooled runtime buffer
+    /// for that phase even though the physical ranges may be split across Vulkan arena shards.
+    fn begin_execute(&mut self, phase: RuntimePhase, layout: &ScratchLayout) -> RuntimePhaseStart {
+        let previous = self.phase;
         if self.phase != Some(phase) {
-            self.scratch.clear();
-            self.scratch_layout.clear();
-            self.pool.clear();
+            self.release_workspace();
             self.phase = Some(phase);
         }
+        self.pool.begin_execute();
+
+        let scratch_reused = self.scratch_layout == *layout && self.scratch.len() == layout.len();
+        if !scratch_reused {
+            // Release the prior graph as one logical owner before claiming its replacement. Pooled
+            // high-water workspaces remain valid within the same phase and grow independently.
+            self.scratch.clear();
+            self.scratch_layout.clear();
+        }
+        RuntimePhaseStart {
+            previous,
+            scratch_reused,
+        }
+    }
+
+    fn install_scratch(&mut self, layout: &ScratchLayout, scratch: ScratchSet) {
+        debug_assert!(self.scratch.is_empty());
+        self.scratch = scratch;
+        self.scratch_layout.clone_from(layout);
+    }
+
+    fn finish_execute(&mut self) {
+        self.pool.finish_execute();
     }
 
     /// Release one client's complete phase workspace at a service-level workload switch. This is
     /// never called between consecutive tokens of the same client; the shared execution gate
     /// guarantees that no command still references these buffers when another client takes over.
     pub(crate) fn release_phase(&mut self) {
+        self.release_workspace();
+        self.phase = None;
+    }
+
+    fn release_workspace(&mut self) {
         self.scratch.clear();
         self.scratch_layout.clear();
         self.pool.clear();
-        self.phase = None;
     }
 }
 
-fn moe_static_phase(rows: usize, n_used: usize, n_expert: usize) -> StaticScratchPhase {
+fn moe_static_phase(rows: usize, n_used: usize, n_expert: usize) -> RuntimePhase {
     if rows.saturating_mul(n_used) >= 3usize.saturating_mul(n_expert) {
-        StaticScratchPhase::Prefill
+        RuntimePhase::Prefill
     } else {
-        StaticScratchPhase::Decode
+        RuntimePhase::Decode
     }
 }
 
@@ -593,7 +626,7 @@ fn moe_static_phase(rows: usize, n_used: usize, n_expert: usize) -> StaticScratc
 /// Decode while selecting Prefill for the wide batches that switch residency strategy. `None`
 /// keeps graphs with no MoE work on the established local-pool path even when their backend also
 /// happens to own a pager.
-fn paged_static_phase(graph: &Graph) -> Option<StaticScratchPhase> {
+fn paged_static_phase(graph: &Graph) -> Option<RuntimePhase> {
     let mut phase = None;
     for op in &graph.ops {
         let Op::MoeFfn {
@@ -609,26 +642,24 @@ fn paged_static_phase(graph: &Graph) -> Option<StaticScratchPhase> {
         let rows = graph.desc(*x).numel() / *ne as usize;
         let op_phase = moe_static_phase(rows, *n_used as usize, *n_expert as usize);
         phase = Some(op_phase);
-        if op_phase == StaticScratchPhase::Prefill {
-            return Some(StaticScratchPhase::Prefill);
+        if op_phase == RuntimePhase::Prefill {
+            return Some(RuntimePhase::Prefill);
         }
     }
     phase
 }
 
 fn pager_static_transition(
-    previous: Option<StaticScratchPhase>,
-    next: StaticScratchPhase,
+    previous: Option<RuntimePhase>,
+    next: RuntimePhase,
     moe_layer_stream: bool,
-) -> Option<StaticScratchPhase> {
+) -> Option<RuntimePhase> {
     if !moe_layer_stream || previous == Some(next) {
         return None;
     }
     match (previous, next) {
-        (_, StaticScratchPhase::Prefill) => Some(StaticScratchPhase::Prefill),
-        (Some(StaticScratchPhase::Prefill), StaticScratchPhase::Decode) => {
-            Some(StaticScratchPhase::Decode)
-        }
+        (_, RuntimePhase::Prefill) => Some(RuntimePhase::Prefill),
+        (Some(RuntimePhase::Prefill), RuntimePhase::Decode) => Some(RuntimePhase::Decode),
         _ => None,
     }
 }
@@ -6134,20 +6165,13 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // existing unified execution gate serializes this model's executes, so the mutex is only a
     // lifetime container rather than a hot-path contention point.
     let mut scratch_reused = false;
-    let mut cached_pool = if be_.moe_paged() {
+    let mut phase_arena = if be_.moe_paged() {
         if let Some(phase) = paged_static_phase(graph) {
-            let mut cache = be_.static_scratch.lock().unwrap();
+            let mut arena = be_.runtime_phase.lock().unwrap();
+            let start = arena.begin_execute(phase, &layout);
+            scratch_reused = start.scratch_reused;
             let pager_transition =
-                pager_static_transition(cache.phase, phase, be_.cfg().paging.moe_layer_stream);
-            cache.enter(phase);
-            cache.pool.begin_execute();
-            scratch_reused = cache.scratch_layout == layout && cache.scratch.len() == layout.len();
-            if !scratch_reused {
-                // A same-phase shape change must also release its old scratch before the pager
-                // reserves Prefill lanes; otherwise those live allocations can fragment the arena.
-                cache.scratch.clear();
-                cache.scratch_layout.clear();
-            }
+                pager_static_transition(start.previous, phase, be_.cfg().paging.moe_layer_stream);
 
             // Finish the old phase before any scratch or lazy per-op pool for the new phase can
             // borrow unified VRAM. Prefill reserves/protects its whole-layer lanes; Decode releases
@@ -6158,18 +6182,18 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     .as_mut()
                     .ok_or_else(|| be("paged static execution requires a MoE pager session"))?;
                 match pager_phase {
-                    StaticScratchPhase::Prefill => sess.enter_prefill_layer(be_)?,
-                    StaticScratchPhase::Decode => {
+                    RuntimePhase::Prefill => sess.enter_prefill_layer(be_)?,
+                    RuntimePhase::Decode => {
                         sess.enter_decode();
                     }
                 }
             }
 
             if !scratch_reused {
-                cache.scratch = alloc_scratch_layout(be_, &layout)?;
-                cache.scratch_layout.clone_from(&layout);
+                let scratch = alloc_scratch_layout(be_, &layout)?;
+                arena.install_scratch(&layout, scratch);
             }
-            Some(cache)
+            Some(arena)
         } else {
             None
         }
@@ -6177,22 +6201,22 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         None
     };
     let mut local_scratch = None;
-    if cached_pool.is_none() {
+    if phase_arena.is_none() {
         local_scratch = Some(alloc_scratch_layout(be_, &layout)?);
     }
     if scratch_reused {
-        let cache = cached_pool
+        let arena = phase_arena
             .as_ref()
-            .expect("reused scratch requires a cache");
-        be_.zero_buffers_batch(cache.scratch.iter().filter_map(|buf| buf.as_deref()))?;
+            .expect("reused scratch requires a phase arena");
+        be_.zero_buffers_batch(arena.scratch.iter().filter_map(|buf| buf.as_deref()))?;
     }
 
-    let using_cached = cached_pool.is_some();
+    let using_phase_arena = phase_arena.is_some();
     let mut local_pool = ScratchPool::default();
-    let (scratch, pool): (&ScratchSet, &mut ScratchPool) = match cached_pool.as_mut() {
-        Some(cache) => {
-            let cache = &mut **cache;
-            (&cache.scratch, &mut cache.pool)
+    let (scratch, pool): (&ScratchSet, &mut ScratchPool) = match phase_arena.as_mut() {
+        Some(arena) => {
+            let arena = &mut **arena;
+            (&arena.scratch, &mut arena.pool)
         }
         None => (
             local_scratch
@@ -6486,7 +6510,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // Non-paged static execution keeps the established per-call lifetime: move its buffers beside
     // the other transient allocations until the final submit drains. Paged buffers remain in the
     // backend cache and are dropped only on a decode/prefill transition or model teardown.
-    if !using_cached {
+    if !using_phase_arena {
         transient.extend(pool.drain_values());
     }
     let last = rec.take().expect("segment always Some at loop end");
@@ -6500,10 +6524,13 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
     pstream.drain()?;
     pstream.finish_prefill_uploads(be_)?;
-    if using_cached {
+    if using_phase_arena {
         // All queue work and asynchronous Prefill uploads that can reference pooled buffers have
         // drained. It is now safe to release superseded capacities from this execute.
-        pool.finish_execute();
+        phase_arena
+            .as_mut()
+            .expect("phase arena exists when cached runtime is active")
+            .finish_execute();
     }
     // Every recorder and pager-owned pending segment has now resolved its two GPU timestamps.
     // Fold this complete sample into the finite auto-tuner; dropping the guard on an earlier error
@@ -8436,68 +8463,79 @@ mod tests {
     }
 
     #[test]
-    fn paged_static_scratch_lives_until_phase_transition() {
-        let mut cache = StaticScratchCache::default();
-        cache.enter(StaticScratchPhase::Decode);
-        cache.scratch_layout = vec![Some(4)];
-        cache.scratch = vec![Some(Box::new(TestBuffer(4)))];
-        cache
+    fn runtime_phase_arena_lives_until_phase_transition() {
+        let mut arena = RuntimePhaseArena::default();
+        let decode_layout = vec![Some(4)];
+        let start = arena.begin_execute(RuntimePhase::Decode, &decode_layout);
+        assert_eq!(start.previous, None);
+        assert!(!start.scratch_reused);
+        arena.install_scratch(&decode_layout, vec![Some(Box::new(TestBuffer(4)))]);
+        arena
             .pool
             .buffers
             .insert(("test_decode", 4), Box::new(TestBuffer(4)));
 
-        cache.enter(StaticScratchPhase::Decode);
-        assert_eq!(cache.scratch_layout, vec![Some(4)]);
-        assert!(cache.scratch[0].is_some());
+        let start = arena.begin_execute(RuntimePhase::Decode, &decode_layout);
+        assert_eq!(start.previous, Some(RuntimePhase::Decode));
+        assert!(start.scratch_reused);
+        assert_eq!(arena.scratch_layout, decode_layout);
+        assert!(arena.scratch[0].is_some());
         assert_eq!(
-            cache.pool.buffers.len(),
+            arena.pool.buffers.len(),
             1,
             "same-phase execute must retain scratch"
         );
 
-        cache.enter(StaticScratchPhase::Prefill);
+        let prefill_layout = vec![Some(8)];
+        let start = arena.begin_execute(RuntimePhase::Prefill, &prefill_layout);
+        assert_eq!(start.previous, Some(RuntimePhase::Decode));
+        assert!(!start.scratch_reused);
         assert!(
-            cache.pool.buffers.is_empty(),
+            arena.pool.buffers.is_empty(),
             "decode scratch must drop on the decode-to-prefill transition"
         );
-        assert!(cache.scratch_layout.is_empty());
-        assert!(cache.scratch.is_empty());
-        cache.scratch_layout = vec![Some(8)];
-        cache.scratch = vec![Some(Box::new(TestBuffer(8)))];
-        cache
+        assert!(arena.scratch_layout.is_empty());
+        assert!(arena.scratch.is_empty());
+        arena.install_scratch(&prefill_layout, vec![Some(Box::new(TestBuffer(8)))]);
+        arena
             .pool
             .buffers
             .insert(("test_prefill", 8), Box::new(TestBuffer(8)));
 
-        cache.enter(StaticScratchPhase::Prefill);
-        assert_eq!(cache.scratch_layout, vec![Some(8)]);
-        assert!(cache.scratch[0].is_some());
+        let start = arena.begin_execute(RuntimePhase::Prefill, &prefill_layout);
+        assert_eq!(start.previous, Some(RuntimePhase::Prefill));
+        assert!(start.scratch_reused);
+        assert_eq!(arena.scratch_layout, prefill_layout);
+        assert!(arena.scratch[0].is_some());
         assert_eq!(
-            cache.pool.buffers.len(),
+            arena.pool.buffers.len(),
             1,
             "same-phase prefill must retain scratch"
         );
 
-        cache.enter(StaticScratchPhase::Decode);
+        arena.begin_execute(RuntimePhase::Decode, &decode_layout);
         assert!(
-            cache.pool.buffers.is_empty(),
+            arena.pool.buffers.is_empty(),
             "prefill scratch must drop on the prefill-to-decode transition"
         );
-        assert!(cache.scratch_layout.is_empty());
-        assert!(cache.scratch.is_empty());
+        assert!(arena.scratch_layout.is_empty());
+        assert!(arena.scratch.is_empty());
     }
 
     #[test]
     fn service_client_transition_releases_the_whole_inactive_phase() {
         let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut cache = StaticScratchCache::default();
-        cache.enter(StaticScratchPhase::Decode);
-        cache.scratch_layout = vec![Some(4)];
-        cache.scratch = vec![Some(Box::new(DropCountBuffer {
-            bytes: 4,
-            drops: std::sync::Arc::clone(&drops),
-        }))];
-        cache.pool.buffers.insert(
+        let mut arena = RuntimePhaseArena::default();
+        let layout = vec![Some(4)];
+        arena.begin_execute(RuntimePhase::Decode, &layout);
+        arena.install_scratch(
+            &layout,
+            vec![Some(Box::new(DropCountBuffer {
+                bytes: 4,
+                drops: std::sync::Arc::clone(&drops),
+            }))],
+        );
+        arena.pool.buffers.insert(
             ("service_phase", 8),
             Box::new(DropCountBuffer {
                 bytes: 8,
@@ -8505,13 +8543,43 @@ mod tests {
             }),
         );
 
-        cache.release_phase();
+        arena.release_phase();
 
         assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert!(cache.phase.is_none());
-        assert!(cache.scratch.is_empty());
-        assert!(cache.scratch_layout.is_empty());
-        assert!(cache.pool.buffers.is_empty());
+        assert!(arena.phase.is_none());
+        assert!(arena.scratch.is_empty());
+        assert!(arena.scratch_layout.is_empty());
+        assert!(arena.pool.buffers.is_empty());
+    }
+
+    #[test]
+    fn runtime_phase_shape_change_replaces_graph_but_keeps_pooled_high_water() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut arena = RuntimePhaseArena::default();
+        let old_layout = vec![Some(4)];
+        arena.begin_execute(RuntimePhase::Prefill, &old_layout);
+        arena.install_scratch(
+            &old_layout,
+            vec![Some(Box::new(DropCountBuffer {
+                bytes: 4,
+                drops: std::sync::Arc::clone(&drops),
+            }))],
+        );
+        arena.pool.buffers.insert(
+            ("high_water", 8),
+            Box::new(DropCountBuffer {
+                bytes: 8,
+                drops: std::sync::Arc::clone(&drops),
+            }),
+        );
+
+        let new_layout = vec![Some(16)];
+        let start = arena.begin_execute(RuntimePhase::Prefill, &new_layout);
+
+        assert!(!start.scratch_reused);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(arena.scratch.is_empty());
+        assert!(arena.pool.buffers.contains_key(&("high_water", 8)));
     }
 
     #[test]
@@ -8597,44 +8665,32 @@ mod tests {
 
     #[test]
     fn paged_static_phase_matches_touch_all_boundary() {
-        assert_eq!(moe_static_phase(1, 8, 512), StaticScratchPhase::Decode);
-        assert_eq!(moe_static_phase(16, 8, 512), StaticScratchPhase::Decode);
-        assert_eq!(moe_static_phase(191, 8, 512), StaticScratchPhase::Decode);
-        assert_eq!(moe_static_phase(192, 8, 512), StaticScratchPhase::Prefill);
+        assert_eq!(moe_static_phase(1, 8, 512), RuntimePhase::Decode);
+        assert_eq!(moe_static_phase(16, 8, 512), RuntimePhase::Decode);
+        assert_eq!(moe_static_phase(191, 8, 512), RuntimePhase::Decode);
+        assert_eq!(moe_static_phase(192, 8, 512), RuntimePhase::Prefill);
         assert_eq!(
-            pager_static_transition(None, StaticScratchPhase::Decode, true),
+            pager_static_transition(None, RuntimePhase::Decode, true),
             None
         );
         assert_eq!(
-            pager_static_transition(None, StaticScratchPhase::Prefill, true),
-            Some(StaticScratchPhase::Prefill)
+            pager_static_transition(None, RuntimePhase::Prefill, true),
+            Some(RuntimePhase::Prefill)
         );
         assert_eq!(
-            pager_static_transition(
-                Some(StaticScratchPhase::Decode),
-                StaticScratchPhase::Prefill,
-                true
-            ),
-            Some(StaticScratchPhase::Prefill)
+            pager_static_transition(Some(RuntimePhase::Decode), RuntimePhase::Prefill, true),
+            Some(RuntimePhase::Prefill)
         );
         assert_eq!(
-            pager_static_transition(
-                Some(StaticScratchPhase::Prefill),
-                StaticScratchPhase::Decode,
-                true
-            ),
-            Some(StaticScratchPhase::Decode)
+            pager_static_transition(Some(RuntimePhase::Prefill), RuntimePhase::Decode, true),
+            Some(RuntimePhase::Decode)
         );
         assert_eq!(
-            pager_static_transition(
-                Some(StaticScratchPhase::Prefill),
-                StaticScratchPhase::Prefill,
-                true
-            ),
+            pager_static_transition(Some(RuntimePhase::Prefill), RuntimePhase::Prefill, true),
             None
         );
         assert_eq!(
-            pager_static_transition(None, StaticScratchPhase::Prefill, false),
+            pager_static_transition(None, RuntimePhase::Prefill, false),
             None
         );
     }
