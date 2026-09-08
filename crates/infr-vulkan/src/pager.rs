@@ -166,6 +166,12 @@ struct SlotRetirementPlan {
     relocations: Vec<SlotRelocation>,
 }
 
+struct PreparedSlotLoan {
+    slots: Vec<usize>,
+    retirement: SlotRetirementPlan,
+    copies: Vec<(DeviceTransferTarget, DeviceTransferTarget)>,
+}
+
 /// Select the same victims an ideal LRU cache resize would choose, independently of which physical
 /// slots a higher-priority owner happens to cover. A selected victim already inside `targets` is
 /// retired in place. Every other target resident is moved into an existing free cell or one
@@ -463,12 +469,14 @@ impl GpuPager {
         Ok(true)
     }
 
-    fn loan_slots<E: TransferExecutor>(
-        &mut self,
-        executor: &E,
+    /// Build one pool's physical compaction without changing residency. The session combines the
+    /// copy lists from every size class and executes them as one device transaction before any
+    /// pool commits its LRU/LUT changes.
+    fn plan_slot_loan(
+        &self,
         slots: &[usize],
         min_enabled_slots: usize,
-    ) -> Result<Vec<BlockId>> {
+    ) -> Result<PreparedSlotLoan> {
         let unified = self
             .unified
             .as_ref()
@@ -525,9 +533,22 @@ impl GpuPager {
             })
             .collect::<Result<_>>()?;
 
-        // Byte movement completes before any LRU/LUT/allocation metadata changes. A backend error
-        // therefore leaves the old cache completely valid and the caller can abandon the claim.
-        executor.relocate_device_ranges_now(&copies)?;
+        Ok(PreparedSlotLoan {
+            slots: slots.to_vec(),
+            retirement,
+            copies,
+        })
+    }
+
+    /// Publish a previously prepared loan after every device copy in the cross-pool transaction
+    /// has completed. The session mutex and unified execution gate keep this plan current, so the
+    /// remaining operations are infallible bookkeeping over the state it just validated.
+    fn commit_slot_loan(&mut self, plan: PreparedSlotLoan) -> Vec<BlockId> {
+        let PreparedSlotLoan {
+            slots,
+            retirement,
+            copies: _,
+        } = plan;
         for relocation in &retirement.relocations {
             let evicted = self.pager.disable_slot(relocation.to);
             debug_assert_eq!(evicted, relocation.evicted);
@@ -549,7 +570,7 @@ impl GpuPager {
             .unified
             .as_mut()
             .expect("unified backing was validated before relocation");
-        for &slot in slots {
+        for slot in slots {
             if unified.slots[slot].allocation.is_none() {
                 continue;
             }
@@ -576,7 +597,7 @@ impl GpuPager {
         debug_assert!(retired_in_place
             .iter()
             .all(|id| retirement.evicted.contains(id)));
-        Ok(retirement.evicted)
+        retirement.evicted
     }
 
     fn try_restore_loaned_slots(&mut self) -> usize {
@@ -2293,9 +2314,11 @@ impl MoePagerSession {
         }
 
         let loaned: usize = by_pool.iter().map(Vec::len).sum();
-        for (pool_index, (pool, slots)) in self.pools.iter_mut().zip(by_pool).enumerate() {
+        // Park rotating bounded-host exchange spares before planning physical moves. Parking is a
+        // complete valid cache state by itself: a later planning/copy error may lose one cold
+        // resident, but cannot lose capacity or leave a half-relocated address.
+        for (pool_index, (pool, slots)) in self.pools.iter_mut().zip(&by_pool).enumerate() {
             let claimed: HashSet<_> = slots.iter().copied().collect();
-            let mut evicted = Vec::new();
             if !floor_suspended {
                 if let Some(mut exchange) = pool.exchange_slot {
                     if let Some(id) = pool.pager.park_exchange_for_claim(
@@ -2303,17 +2326,38 @@ impl MoePagerSession {
                         &floor_slots[pool_index],
                         &claimed,
                     )? {
-                        evicted.push(id);
+                        if let Some(host) = &pool.host {
+                            host.release_gpu_blocks(&[id]);
+                        }
                     }
                     pool.exchange_slot = Some(exchange);
                 }
             }
-            let retained_floor = if floor_suspended {
-                0
-            } else {
-                pool.min_enabled_slots
-            };
-            evicted.extend(pool.pager.loan_slots(executor, &slots, retained_floor)?);
+        }
+
+        let loans = self
+            .pools
+            .iter()
+            .zip(&by_pool)
+            .map(|(pool, slots)| {
+                let retained_floor = if floor_suspended {
+                    0
+                } else {
+                    pool.min_enabled_slots
+                };
+                pool.pager.plan_slot_loan(slots, retained_floor)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let copies = loans
+            .iter()
+            .flat_map(|loan| loan.copies.iter().cloned())
+            .collect::<Vec<_>>();
+
+        // All physical movement succeeds before any size class changes its LRU, LUT or owner
+        // metadata. A transfer error therefore leaves every prepared pool untouched.
+        executor.relocate_device_ranges_now(&copies)?;
+        for (pool, loan) in self.pools.iter_mut().zip(loans) {
+            let evicted = pool.pager.commit_slot_loan(loan);
             if let Some(host) = &pool.host {
                 host.release_gpu_blocks(&evicted);
             }
