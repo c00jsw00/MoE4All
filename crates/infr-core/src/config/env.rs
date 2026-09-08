@@ -206,6 +206,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.paging.ring_slots = num(get, "INFR_PAGER_RING_SLOTS");
     p.paging.moe_layer_stream = presence_inv(get, "INFR_NO_MOE_LAYER_STREAM");
     p.paging.prefill_upload_async = presence_inv(get, "INFR_SYNC_PREFILL_UPLOAD");
+    p.paging.expert_prefetch = presence_inv(get, "INFR_NO_EXPERT_PREFETCH");
     p.paging.moe_size_cache_bias = opt_num(get, "INFR_MOE_SIZE_CACHE_BIAS");
     p.paging.dram = opt_size(get, "INFR_DRAM_CACHE");
     p.paging.dram_bypass = presence(get, "INFR_DRAM_BYPASS");

@@ -210,6 +210,10 @@ cfg_struct! {
         /// Upload future streamed MoE layers on the host worker while the GPU computes the current
         /// layer. `INFR_SYNC_PREFILL_UPLOAD` disables the overlap for diagnostics.
         prefill_upload_async: bool = true,
+        /// Predict the next Qwen3.8 Decode router from the current layer input and admit useful
+        /// expert blocks at the cold LRU edge while the GPU executes intervening work.
+        /// `INFR_NO_EXPERT_PREFETCH` disables the feature for A/B diagnostics.
+        expert_prefetch: bool = true,
         /// `INFR_MOE_SIZE_CACHE_BIAS`: optional Decode arena weighting between distinct per-expert
         /// tensor sizes. Positive values favor larger tensors and negative values favor smaller.
         /// `None` auto-enables the validated `+2` bias only for a balanced two-size layout where

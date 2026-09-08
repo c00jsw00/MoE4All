@@ -1632,6 +1632,27 @@ impl Op {
     }
 }
 
+/// Maximum ordered next-layer expert candidates carried by a decode prefetch hint. Smaller
+/// working sets are prefixes of this one router result, so the backend can stop admission when
+/// the transfer window closes without running several top-k kernels.
+pub const EXPERT_PREFETCH_CANDIDATES: usize = 32;
+
+/// Optional scheduling metadata attached to one [`Op::MoeFfn`]. It names the next layer's router
+/// and expert banks without turning prediction into model math: backends that cannot overlap
+/// transfer simply ignore the hint, and every ordinary graph op remains unchanged.
+#[derive(Clone, Copy, Debug)]
+pub struct MoePrefetchHint {
+    pub source_op: usize,
+    pub source_layer: u32,
+    pub target_layer: u32,
+    pub target_router: TensorId,
+    pub target_gate_exps: TensorId,
+    pub target_up_exps: TensorId,
+    pub target_down_exps: TensorId,
+    pub target_fused_gate_up: bool,
+    pub target_n_expert: u32,
+}
+
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].
 #[derive(Clone, Default)]
 pub struct Graph {
@@ -1640,6 +1661,8 @@ pub struct Graph {
     pub inputs: Vec<TensorId>,
     pub weights: Vec<TensorId>,
     pub outputs: Vec<TensorId>,
+    /// Decode-only scheduling hints. Empty for models without a validated next-layer predictor.
+    pub moe_prefetch_hints: Vec<MoePrefetchHint>,
     /// Producer-set opt-out of the Vulkan record-once decode replay: `true` forces the
     /// per-execute STATIC path even for an otherwise replay-eligible single-token decode.
     ///

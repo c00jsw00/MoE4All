@@ -19,7 +19,9 @@ use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
-use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, Op};
+use infr_core::graph::{
+    Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, MoePrefetchHint, Op,
+};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
@@ -472,6 +474,7 @@ pub(crate) fn generate_dense_backend(
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let state_trace = ec.debug.state_trace;
+    let expert_prefetch = c.qwen4exp && ec.paging.expert_prefetch;
     let state_was_cold = state.is_none();
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
@@ -2529,6 +2532,28 @@ pub(crate) fn generate_dense_backend(
                 pl_post_norm,
             });
         }
+        // Qwen3.8 executes layer 0 and layers 1..end as separate graphs around the CPU PLE
+        // hand-off. Keep an explicit directory so layer 0 can still name layer 1's router and
+        // expert banks; it stays empty for prefill and every architecture without the validated
+        // one-layer-ahead predictor.
+        let prefetch_targets: Vec<Option<(TensorId, TensorId, TensorId, TensorId, bool)>> =
+            if expert_prefetch && batch == 1 {
+                lw.iter()
+                    .map(|layer| match &layer.ffn {
+                        FfnW::Moe {
+                            router,
+                            gate_exps,
+                            up_exps,
+                            down_exps,
+                            fused_gate_up,
+                            ..
+                        } => Some((*router, *gate_exps, *up_exps, *down_exps, *fused_gate_up)),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let qwen_hc_head = c.qwen4exp.then(|| QwenHcW {
             norm: wpush(&mut g, &mut weights),
             down: wpush(&mut g, &mut weights),
@@ -5221,6 +5246,7 @@ pub(crate) fn generate_dense_backend(
                         });
                         sel
                     });
+                    let source_op = g.ops.len();
                     g.push(Op::MoeFfn {
                         x: hn,
                         router_x: hn, // qwen3moe/qwen35moe: router reads the SAME normed input as the experts
@@ -5249,6 +5275,26 @@ pub(crate) fn generate_dense_backend(
                         // `None` everywhere else, which is the router's own top-k.
                         expert_ids,
                     });
+                    if let Some(Some((
+                        target_router,
+                        target_gate_exps,
+                        target_up_exps,
+                        target_down_exps,
+                        target_fused_gate_up,
+                    ))) = prefetch_targets.get(l + 1)
+                    {
+                        g.moe_prefetch_hints.push(MoePrefetchHint {
+                            source_op,
+                            source_layer: l as u32,
+                            target_layer: (l + 1) as u32,
+                            target_router: *target_router,
+                            target_gate_exps: *target_gate_exps,
+                            target_up_exps: *target_up_exps,
+                            target_down_exps: *target_down_exps,
+                            target_fused_gate_up: *target_fused_gate_up,
+                            target_n_expert: mc.n_expert as u32,
+                        });
+                    }
                     if let Some(MoeSharedW {
                         gate_inp,
                         wgate,

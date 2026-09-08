@@ -84,6 +84,7 @@ fn default_config_matches_documented_defaults() {
     assert!(d.kv.dynamic);
     assert!(!d.kv.force_q8);
     assert_eq!(d.paging.trace, None);
+    assert!(d.paging.expert_prefetch);
 
     // §6.5 / §10.2: the mmv tier is ON by default — `INFR_NO_MMV` is presence-INV.
     assert!(d.kernels.vulkan.mmv);
@@ -171,6 +172,15 @@ fn pager_trace_path_is_config_backed() {
 
     let cfg = Config::load_from_layers(&[cli_layer(&["paging.trace=cli.csv"])]);
     assert_eq!(cfg.paging.trace.as_deref(), Some(Path::new("cli.csv")));
+}
+
+#[test]
+fn expert_prefetch_is_default_on_and_explicitly_disableable() {
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_NO_EXPERT_PREFETCH", "1")])]);
+    assert!(!cfg.paging.expert_prefetch);
+
+    let cfg = Config::load_from_layers(&[cli_layer(&["paging.expert_prefetch=false"])]);
+    assert!(!cfg.paging.expert_prefetch);
 }
 
 /// A CLI flag beats the environment.
