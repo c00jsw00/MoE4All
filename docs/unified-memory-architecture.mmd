@@ -13,7 +13,7 @@ flowchart TB
 
     subgraph Cache["Pager / 缓存层"]
         Lookup["resident directory<br/>hit / miss / in-flight epoch"]
-        Cluster["Expert Cluster planner<br/>固定尺寸类配方<br/>空间事务以整簇提交"]
+        Cluster["尺寸类平衡规划<br/>软目标比例、平滑交错<br/>claim 按实际字节提交"]
         VramLru["VRAM LRU[class]"]
         RamLru["RAM LRU[class]"]
         Lookup --> VramLru
