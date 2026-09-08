@@ -4776,7 +4776,7 @@ impl VulkanBackend {
     ) -> Result<Vec<Arc<crate::unified::UnifiedAllocationHandle>>> {
         let mut pager = self.moe_pager.lock().unwrap();
         if let Some(session) = pager.as_mut() {
-            return session.commit_unified_claim(plan);
+            return session.commit_unified_claim(self, plan);
         }
         if !plan.victims().is_empty() {
             return Err(be(
@@ -7458,7 +7458,7 @@ mod tests {
             .unwrap()
             .as_mut()
             .expect("pager")
-            .enter_prefill_layer()
+            .enter_prefill_layer(&be)
             .expect_err("the synthetic pager has no registered Prefill banks");
         assert!(error
             .to_string()

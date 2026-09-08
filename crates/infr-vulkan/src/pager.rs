@@ -148,6 +148,83 @@ struct InclusiveCpuPushPlan {
     evicted: Option<BlockId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotRelocation {
+    block: BlockId,
+    from: u32,
+    to: u32,
+    evicted: Option<BlockId>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SlotRetirementPlan {
+    /// Exactly the globally coldest resident blocks that disappear when the target slots are
+    /// loaned. Entries stay in LRU order so host-tier accounting sees deterministic victims.
+    evicted: Vec<BlockId>,
+    /// Hot residents physically blocking the target range, paired with cold same-size slots
+    /// outside it. The pager has one instance per size class, so every pair is byte-compatible.
+    relocations: Vec<SlotRelocation>,
+}
+
+/// Select the same victims an ideal LRU cache resize would choose, independently of which physical
+/// slots a higher-priority owner happens to cover. A selected victim already inside `targets` is
+/// retired in place. Every other target resident is moved into an existing free cell or one
+/// selected cold slot outside the target, preserving that resident's exact LRU node while making
+/// its old cell reclaimable.
+fn plan_slot_retirement(
+    resident_lru: &[(BlockId, u32)],
+    free_outside: &[u32],
+    targets: &HashSet<usize>,
+) -> SlotRetirementPlan {
+    let target_residents = resident_lru
+        .iter()
+        .filter(|(_, slot)| targets.contains(&(*slot as usize)))
+        .count();
+    let retire_count = target_residents.saturating_sub(free_outside.len());
+    if target_residents == 0 {
+        return SlotRetirementPlan::default();
+    }
+
+    let selected = &resident_lru[..retire_count];
+    let evicted: Vec<_> = selected.iter().map(|&(id, _)| id).collect();
+    let selected_ids: HashSet<_> = evicted.iter().copied().collect();
+    let free_destinations = target_residents - retire_count;
+    let destinations: Vec<_> = free_outside
+        .iter()
+        .copied()
+        .take(free_destinations)
+        .map(|slot| (None, slot))
+        .chain(
+            selected
+                .iter()
+                .copied()
+                .filter(|(_, slot)| !targets.contains(&(*slot as usize)))
+                .map(|(id, slot)| (Some(id), slot)),
+        )
+        .collect();
+    let movers: Vec<_> = resident_lru
+        .iter()
+        .copied()
+        .filter(|(id, slot)| targets.contains(&(*slot as usize)) && !selected_ids.contains(id))
+        .collect();
+    debug_assert_eq!(movers.len(), destinations.len());
+
+    let relocations = movers
+        .into_iter()
+        .zip(destinations)
+        .map(|((block, from), (evicted, to))| SlotRelocation {
+            block,
+            from,
+            to,
+            evicted,
+        })
+        .collect();
+    SlotRetirementPlan {
+        evicted,
+        relocations,
+    }
+}
+
 impl GpuPager {
     /// `n_blocks`: total distinct `BlockId`s that can ever be named (the LUT's fixed size — for
     /// MoE, `n_paged_layers * n_roles * n_experts`). `n_slots`: the VRAM budget in blocks
@@ -386,10 +463,15 @@ impl GpuPager {
         Ok(true)
     }
 
-    fn loan_slots(&mut self, slots: &[usize], min_enabled_slots: usize) -> Result<Vec<BlockId>> {
+    fn loan_slots<E: TransferExecutor>(
+        &mut self,
+        executor: &E,
+        slots: &[usize],
+        min_enabled_slots: usize,
+    ) -> Result<Vec<BlockId>> {
         let unified = self
             .unified
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| be("cannot loan a slot from a legacy pager arena"))?;
         let loan_count = slots
             .iter()
@@ -406,14 +488,74 @@ impl GpuPager {
                 self.pager.enabled_slots(),
             )));
         }
-        let mut victims = Vec::new();
+        if self.pager.pinned_blocks() != 0 {
+            return Err(be(
+                "unified VRAM cannot relocate expert slots while a pager read is pinned",
+            ));
+        }
+
+        let targets: HashSet<_> = slots
+            .iter()
+            .copied()
+            .filter(|&slot| {
+                unified
+                    .slots
+                    .get(slot)
+                    .is_some_and(|backing| backing.allocation.is_some())
+            })
+            .collect();
+        let resident_lru = self.pager.resident_slots_lru();
+        let occupied: HashSet<_> = resident_lru.iter().map(|&(_, slot)| slot).collect();
+        let free_outside: Vec<_> = (0..self.pager.n_slots() as u32)
+            .filter(|slot| {
+                self.pager.slot_enabled(*slot)
+                    && !occupied.contains(slot)
+                    && !targets.contains(&(*slot as usize))
+            })
+            .collect();
+        let retirement = plan_slot_retirement(&resident_lru, &free_outside, &targets);
+        let copies: Vec<_> = retirement
+            .relocations
+            .iter()
+            .map(|relocation| {
+                Ok((
+                    self.slot_copy_target(relocation.from)?,
+                    self.slot_copy_target(relocation.to)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        // Byte movement completes before any LRU/LUT/allocation metadata changes. A backend error
+        // therefore leaves the old cache completely valid and the caller can abandon the claim.
+        executor.relocate_device_ranges_now(&copies)?;
+        for relocation in &retirement.relocations {
+            let evicted = self.pager.disable_slot(relocation.to);
+            debug_assert_eq!(evicted, relocation.evicted);
+            let old = self
+                .pager
+                .rotate_resident_to_spare(relocation.block, relocation.to);
+            debug_assert_eq!(old, relocation.from);
+            apply_placement(
+                &mut self.lut_host,
+                relocation.block,
+                relocation.to,
+                relocation.evicted,
+            );
+            self.lut_dirty = true;
+        }
+
+        let mut retired_in_place = Vec::new();
+        let unified = self
+            .unified
+            .as_mut()
+            .expect("unified backing was validated before relocation");
         for &slot in slots {
             if unified.slots[slot].allocation.is_none() {
                 continue;
             }
             if self.pager.slot_enabled(slot as u32) {
                 if let Some(evicted) = self.pager.disable_slot(slot as u32) {
-                    victims.push(evicted);
+                    retired_in_place.push(evicted);
                     if let Some(entry) = self.lut_host.get_mut(evicted as usize) {
                         *entry = NOT_RESIDENT;
                     }
@@ -422,7 +564,19 @@ impl GpuPager {
             }
             unified.slots[slot].allocation.take();
         }
-        Ok(victims)
+        debug_assert_eq!(
+            retired_in_place.len()
+                + retirement
+                    .relocations
+                    .iter()
+                    .filter(|relocation| relocation.evicted.is_some())
+                    .count(),
+            retirement.evicted.len()
+        );
+        debug_assert!(retired_in_place
+            .iter()
+            .all(|id| retirement.evicted.contains(id)));
+        Ok(retirement.evicted)
     }
 
     fn try_restore_loaned_slots(&mut self) -> usize {
@@ -2089,8 +2243,9 @@ impl MoePagerSession {
     /// Retire exactly the Expert filler cells selected by the arena manager, then commit every
     /// higher-priority range as one allocator transaction. The manager owns geometry; the pager
     /// remains the sole owner of LRU/LUT and bounded-RAM shadow semantics.
-    pub(crate) fn commit_unified_claim(
+    pub(crate) fn commit_unified_claim<E: TransferExecutor>(
         &mut self,
+        executor: &E,
         plan: UnifiedClaimPlan,
     ) -> Result<Vec<Arc<UnifiedAllocationHandle>>> {
         let floor_suspended =
@@ -2158,7 +2313,7 @@ impl MoePagerSession {
             } else {
                 pool.min_enabled_slots
             };
-            evicted.extend(pool.pager.loan_slots(&slots, retained_floor)?);
+            evicted.extend(pool.pager.loan_slots(executor, &slots, retained_floor)?);
             if let Some(host) = &pool.host {
                 host.release_gpu_blocks(&evicted);
             }
@@ -2280,7 +2435,7 @@ impl MoePagerSession {
         true
     }
 
-    fn build_prefill_layout(&mut self) -> Result<()> {
+    fn build_prefill_layout<E: TransferExecutor>(&mut self, executor: &E) -> Result<()> {
         if !self.prefill_placement.is_empty() {
             return Ok(());
         }
@@ -2392,7 +2547,7 @@ impl MoePagerSession {
                 }
             };
             let retired = plan.victims().len();
-            let allocations = match self.commit_unified_claim(plan) {
+            let allocations = match self.commit_unified_claim(executor, plan) {
                 Ok(allocations) => allocations,
                 Err(error) => {
                     last_error = Some(error.to_string());
@@ -2476,11 +2631,11 @@ impl MoePagerSession {
 
     /// Select whole-layer interpretation for Prefill. The ring claims its frozen middle corridor;
     /// every Expert cell outside those exact physical ranges retains both residency and heat.
-    pub fn enter_prefill_layer(&mut self) -> Result<()> {
+    pub(crate) fn enter_prefill_layer<E: TransferExecutor>(&mut self, executor: &E) -> Result<()> {
         if self.mode != MoeArenaMode::PrefillLayer {
             // Decode/runtime allocations may have released ranges since the previous phase.
             self.restore_unified_slots_if_changed();
-            self.build_prefill_layout()?;
+            self.build_prefill_layout(executor)?;
             self.prefill_lane_layer.fill(None);
             self.prefill_loaded.clear();
         }
@@ -2510,11 +2665,12 @@ impl MoePagerSession {
 
     /// Reserve a layer's ring lane and resolve stable host/device ranges. `None` means the layer
     /// is already loaded or already queued.
-    pub(crate) fn prepare_prefill_layer_cpu(
+    pub(crate) fn prepare_prefill_layer_cpu<E: TransferExecutor>(
         &mut self,
+        executor: &E,
         buf_id: usize,
     ) -> Result<Option<PrefillCopyJob>> {
-        self.enter_prefill_layer()?;
+        self.enter_prefill_layer(executor)?;
         if self.layer_bank_current(buf_id)? || self.layer_bank_pending(buf_id)? {
             return Ok(None);
         }
@@ -2972,7 +3128,7 @@ impl MoePagerSession {
         executor: &E,
         buf_id: usize,
     ) -> Result<bool> {
-        self.enter_prefill_layer()?;
+        self.enter_prefill_layer(executor)?;
         if self.layer_bank_current(buf_id)? {
             return Ok(false);
         }
@@ -2982,7 +3138,7 @@ impl MoePagerSession {
             ));
         }
         let job = self
-            .prepare_prefill_layer_cpu(buf_id)?
+            .prepare_prefill_layer_cpu(executor, buf_id)?
             .ok_or_else(|| be("moe pager: failed to prepare synchronous Prefill layer"))?;
         job.execute(executor)?;
         self.complete_prefill_layer_cpu(buf_id)?;
@@ -3588,6 +3744,78 @@ mod tests {
         assert!(!loan_preserves_pool_floor(624, 113, 512));
         assert!(!loan_preserves_pool_floor(8, 1, 8));
         assert!(!loan_preserves_pool_floor(8, 9, 1));
+    }
+
+    #[test]
+    fn slot_retirement_evicts_global_lru_instead_of_physical_blockers() {
+        // Slots 4 and 5 are claimed. Both physical blockers are hotter than the globally-cold
+        // blocks in slots 0 and 1, so both move and the actual LRU victims disappear.
+        let lru = vec![(10, 0), (11, 1), (14, 4), (12, 2), (13, 3), (15, 5)];
+        let targets = HashSet::from([4usize, 5]);
+        let plan = plan_slot_retirement(&lru, &[], &targets);
+
+        assert_eq!(plan.evicted, vec![10, 11]);
+        assert_eq!(
+            plan.relocations,
+            vec![
+                SlotRelocation {
+                    block: 14,
+                    from: 4,
+                    to: 0,
+                    evicted: Some(10),
+                },
+                SlotRelocation {
+                    block: 15,
+                    from: 5,
+                    to: 1,
+                    evicted: Some(11),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn slot_retirement_needs_no_copy_when_cold_blocks_are_already_in_target() {
+        let lru = vec![(10, 4), (11, 5), (12, 0), (13, 1)];
+        let plan = plan_slot_retirement(&lru, &[], &HashSet::from([4usize, 5]));
+
+        assert_eq!(plan.evicted, vec![10, 11]);
+        assert!(plan.relocations.is_empty());
+    }
+
+    #[test]
+    fn slot_retirement_counts_only_occupied_target_slots() {
+        // Target slot 5 is free/disabled and therefore does not force an unrelated eviction.
+        let lru = vec![(10, 0), (11, 4), (12, 1)];
+        let plan = plan_slot_retirement(&lru, &[], &HashSet::from([4usize, 5]));
+
+        assert_eq!(plan.evicted, vec![10]);
+        assert_eq!(
+            plan.relocations,
+            vec![SlotRelocation {
+                block: 11,
+                from: 4,
+                to: 0,
+                evicted: Some(10),
+            }]
+        );
+    }
+
+    #[test]
+    fn slot_retirement_moves_into_free_capacity_without_an_eviction() {
+        let lru = vec![(10, 0), (11, 4), (12, 1)];
+        let plan = plan_slot_retirement(&lru, &[2, 3], &HashSet::from([4usize, 5]));
+
+        assert!(plan.evicted.is_empty());
+        assert_eq!(
+            plan.relocations,
+            vec![SlotRelocation {
+                block: 11,
+                from: 4,
+                to: 2,
+                evicted: None,
+            }]
+        );
     }
 
     #[test]

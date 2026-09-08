@@ -26,6 +26,13 @@ pub(crate) trait TransferExecutor: Sync {
         copies: &[(Arc<dyn Buffer>, usize, DeviceTransferTarget, usize)],
     ) -> Result<()>;
 
+    /// Relocate immutable device ranges as one ordered transaction. Residency policy decides
+    /// which ranges move; the executor owns queue choice, barriers and completion semantics.
+    fn relocate_device_ranges_now(
+        &self,
+        copies: &[(DeviceTransferTarget, DeviceTransferTarget)],
+    ) -> Result<()>;
+
     fn fill_target_now(
         &self,
         target: &DeviceTransferTarget,
@@ -542,6 +549,110 @@ impl VulkanBackend {
         }
         Ok(())
     }
+
+    /// Move device-resident ranges without exposing Vulkan queue or memory details to the pager.
+    /// This is a rare ownership-boundary operation (KV growth / phase arena claim), so one
+    /// synchronous batched submission is preferable to per-slot submissions or CPU round-trips.
+    fn relocate_device_targets_now(
+        &self,
+        copies: &[(DeviceTransferTarget, DeviceTransferTarget)],
+    ) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+
+        struct Group {
+            src: vk::Buffer,
+            dst: vk::Buffer,
+            regions: Vec<vk::BufferCopy>,
+        }
+
+        let mut groups: Vec<Group> = Vec::new();
+        let mut bytes = 0usize;
+        for (source, target) in copies {
+            if source.len() != target.len() {
+                return Err(be("device relocation source and target sizes differ"));
+            }
+            let src = as_vk_buf(source.buffer())?.buffer;
+            let dst = as_vk_buf(target.buffer())?.buffer;
+            let src_start = source.vk_offset();
+            let src_end = src_start
+                .checked_add(source.len())
+                .ok_or_else(|| be("device relocation source range overflow"))?;
+            let dst_start = target.vk_offset();
+            let dst_end = dst_start
+                .checked_add(target.len())
+                .ok_or_else(|| be("device relocation target range overflow"))?;
+            if src == dst && src_start < dst_end && dst_start < src_end {
+                return Err(be("device relocation ranges overlap in one Vulkan buffer"));
+            }
+            let group = match groups
+                .iter_mut()
+                .find(|group| group.src == src && group.dst == dst)
+            {
+                Some(group) => group,
+                None => {
+                    groups.push(Group {
+                        src,
+                        dst,
+                        regions: Vec::new(),
+                    });
+                    groups.last_mut().expect("group was just appended")
+                }
+            };
+            group.regions.push(
+                vk::BufferCopy::default()
+                    .src_offset(src_start as u64)
+                    .dst_offset(dst_start as u64)
+                    .size(source.len() as u64),
+            );
+            bytes = bytes.saturating_add(source.len());
+        }
+
+        let shared = Arc::clone(&self.shared);
+        self.one_shot(move |cmd| unsafe {
+            // The execution gate prevents new arena users while this transaction runs. These
+            // barriers close the write-after-read hazard against already-submitted expert reads
+            // and publish the relocated bytes to subsequent compute submissions.
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
+            shared.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            for group in &groups {
+                shared
+                    .device
+                    .cmd_copy_buffer(cmd, group.src, group.dst, &group.regions);
+            }
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ);
+            shared.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+        })?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                relocated_ranges = copies.len(),
+                relocated_bytes = bytes,
+                "compacted device-resident ranges for a unified VRAM claim"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl TransferExecutor for VulkanBackend {
@@ -554,6 +665,13 @@ impl TransferExecutor for VulkanBackend {
         copies: &[(Arc<dyn Buffer>, usize, DeviceTransferTarget, usize)],
     ) -> Result<()> {
         VulkanBackend::copy_transfer_targets_now(self, copies)
+    }
+
+    fn relocate_device_ranges_now(
+        &self,
+        copies: &[(DeviceTransferTarget, DeviceTransferTarget)],
+    ) -> Result<()> {
+        VulkanBackend::relocate_device_targets_now(self, copies)
     }
 
     fn fill_target_now(

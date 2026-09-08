@@ -6148,7 +6148,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     .as_mut()
                     .ok_or_else(|| be("paged static execution requires a MoE pager session"))?;
                 match pager_phase {
-                    StaticScratchPhase::Prefill => sess.enter_prefill_layer()?,
+                    StaticScratchPhase::Prefill => sess.enter_prefill_layer(be_)?,
                     StaticScratchPhase::Decode => {
                         sess.enter_decode();
                     }
@@ -7023,7 +7023,7 @@ fn stage_layer_and_window<'a>(
     {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
-        sess.enter_prefill_layer()?;
+        sess.enter_prefill_layer(be_)?;
     }
     let already_current = ps.wait_prefill_layer(be_, buf_id)?;
     let mut guard = be_.moe_pager().lock().unwrap();
@@ -7076,7 +7076,7 @@ fn prefetch_next_moe_layer<'a>(
     let (initial, replacement) = {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
-        sess.enter_prefill_layer()?;
+        sess.enter_prefill_layer(be_)?;
         sess.prefill_successors(current_gate_id)?
     };
     let (initial_jobs, replacement_job) = {
@@ -7084,12 +7084,12 @@ fn prefetch_next_moe_layer<'a>(
         let sess = guard.as_mut().expect("paged execution requires a session");
         let mut jobs = Vec::with_capacity(initial.len());
         for next in initial {
-            if let Some(job) = sess.prepare_prefill_layer_cpu(next)? {
+            if let Some(job) = sess.prepare_prefill_layer_cpu(be_, next)? {
                 jobs.push(job);
             }
         }
         let replacement = replacement
-            .map(|next| sess.prepare_prefill_layer_cpu(next))
+            .map(|next| sess.prepare_prefill_layer_cpu(be_, next))
             .transpose()?
             .flatten();
         (jobs, replacement)
