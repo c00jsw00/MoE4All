@@ -26,7 +26,7 @@ use crate::blockio::{BlockDesc, BlockIo};
 use crate::error::{Error, Result};
 use crate::pager::{BlockId, Insert, Pager, PagerStats, Resolution};
 use crate::pager_profile;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -433,6 +433,96 @@ pub struct InclusiveHostCache {
     shadow_releases: AtomicU64,
     bytes_read: AtomicU64,
     bytes_promoted: AtomicU64,
+}
+
+/// One bounded RAM/SSD tier containing every uniform expert size class for a model.
+///
+/// The tier owns capacity planning and class lookup; each [`InclusiveHostCache`] keeps its existing
+/// independent LRU because differently-sized blocks cannot exchange physical slots. The requested
+/// class ratio is therefore soft: [`plan_slots`] apportions bytes proportionally, while rounding at
+/// class boundaries is allowed to leave a small unspent tail.
+pub struct InclusiveHostTier {
+    budget_bytes: usize,
+    arena_bytes: usize,
+    classes: Vec<InclusiveHostClassPlan>,
+    caches: BTreeMap<usize, Arc<InclusiveHostCache>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InclusiveHostClassPlan {
+    pub slot_bytes: usize,
+    pub n_blocks: usize,
+    pub n_slots: usize,
+}
+
+impl InclusiveHostTier {
+    pub fn new(
+        budget_bytes: usize,
+        classes: &[(usize, usize)],
+        io: Arc<dyn BlockIo>,
+    ) -> Result<Self> {
+        let slots = plan_slots(budget_bytes, classes);
+        let mut plans = Vec::with_capacity(classes.len());
+        let mut caches = BTreeMap::new();
+        let mut arena_bytes = 0usize;
+
+        for (&(slot_bytes, n_blocks), &n_slots) in classes.iter().zip(&slots) {
+            if slot_bytes == 0 {
+                return Err(Error::backend(
+                    "inclusive host tier needs non-zero size classes".to_string(),
+                ));
+            }
+            if caches.contains_key(&slot_bytes) {
+                return Err(Error::backend(format!(
+                    "inclusive host tier received duplicate {slot_bytes}-byte size classes"
+                )));
+            }
+            let cache = Arc::new(InclusiveHostCache::new(n_slots, slot_bytes, io.clone())?);
+            arena_bytes = arena_bytes
+                .checked_add(cache.arena_bytes())
+                .ok_or_else(|| Error::backend("inclusive host tier size overflow".to_string()))?;
+            plans.push(InclusiveHostClassPlan {
+                slot_bytes,
+                n_blocks,
+                n_slots,
+            });
+            caches.insert(slot_bytes, cache);
+        }
+
+        debug_assert!(arena_bytes <= budget_bytes);
+        Ok(Self {
+            budget_bytes,
+            arena_bytes,
+            classes: plans,
+            caches,
+        })
+    }
+
+    pub fn budget_bytes(&self) -> usize {
+        self.budget_bytes
+    }
+
+    pub fn arena_bytes(&self) -> usize {
+        self.arena_bytes
+    }
+
+    pub fn classes(&self) -> &[InclusiveHostClassPlan] {
+        &self.classes
+    }
+
+    pub fn cache(&self, slot_bytes: usize) -> Option<Arc<InclusiveHostCache>> {
+        self.caches.get(&slot_bytes).cloned()
+    }
+
+    /// Stable host allocations that a device backend may import once when the model session is
+    /// finalized. Zero-slot SSD-through classes have no arena and are deliberately omitted.
+    pub fn arena_allocations(&self) -> Vec<(Arc<AlignedHostBuffer>, usize)> {
+        self.caches
+            .iter()
+            .filter(|(_, cache)| cache.arena_bytes() != 0)
+            .map(|(&slot_bytes, cache)| (cache.arena_allocation(), slot_bytes))
+            .collect()
+    }
 }
 
 impl InclusiveHostCache {
@@ -1765,6 +1855,67 @@ mod tests {
         assert_eq!(plan_slots(1 << 10, &[(1 << 20, 4)]), vec![0]);
         assert_eq!(plan_slots(0, &[(1 << 20, 4)]), vec![0]);
         assert!(plan_slots(1 << 30, &[]).is_empty());
+    }
+
+    #[test]
+    fn inclusive_host_tier_owns_the_existing_soft_class_plan() {
+        let classes = [(16usize, 5usize), (32, 3)];
+        let expected = plan_slots(128, &classes);
+        let tier =
+            InclusiveHostTier::new(128, &classes, Arc::new(FakeIo::new())).expect("host tier");
+
+        assert_eq!(tier.budget_bytes(), 128);
+        assert_eq!(
+            tier.classes(),
+            &[
+                InclusiveHostClassPlan {
+                    slot_bytes: 16,
+                    n_blocks: 5,
+                    n_slots: expected[0],
+                },
+                InclusiveHostClassPlan {
+                    slot_bytes: 32,
+                    n_blocks: 3,
+                    n_slots: expected[1],
+                },
+            ]
+        );
+        assert_eq!(
+            tier.arena_bytes(),
+            expected[0] * classes[0].0 + expected[1] * classes[1].0
+        );
+        assert_eq!(
+            tier.cache(16).expect("16-byte class").n_slots(),
+            expected[0]
+        );
+        assert_eq!(
+            tier.cache(32).expect("32-byte class").n_slots(),
+            expected[1]
+        );
+        assert!(tier.cache(64).is_none());
+        assert_eq!(
+            tier.arena_allocations().len(),
+            expected.iter().filter(|&&slots| slots != 0).count()
+        );
+    }
+
+    #[test]
+    fn inclusive_host_tier_keeps_zero_ram_classes_as_ssd_through() {
+        let tier = InclusiveHostTier::new(0, &[(16, 4), (32, 4)], Arc::new(FakeIo::new()))
+            .expect("zero-RAM host tier");
+
+        assert_eq!(tier.arena_bytes(), 0);
+        assert_eq!(tier.cache(16).expect("16-byte class").n_slots(), 0);
+        assert_eq!(tier.cache(32).expect("32-byte class").n_slots(), 0);
+        assert!(tier.arena_allocations().is_empty());
+    }
+
+    #[test]
+    fn inclusive_host_tier_rejects_ambiguous_duplicate_sizes() {
+        let error = InclusiveHostTier::new(128, &[(16, 2), (16, 3)], Arc::new(FakeIo::new()))
+            .err()
+            .expect("duplicate classes must fail");
+        assert!(error.to_string().contains("duplicate 16-byte size classes"));
     }
 
     /// A `BlockIo` with no file behind it: block `id` is `nbytes` copies of `id as u8`, so a slot
