@@ -568,6 +568,16 @@ impl StaticScratchCache {
             self.phase = Some(phase);
         }
     }
+
+    /// Release one client's complete phase workspace at a service-level workload switch. This is
+    /// never called between consecutive tokens of the same client; the shared execution gate
+    /// guarantees that no command still references these buffers when another client takes over.
+    pub(crate) fn release_phase(&mut self) {
+        self.scratch.clear();
+        self.scratch_layout.clear();
+        self.pool.clear();
+        self.phase = None;
+    }
 }
 
 fn moe_static_phase(rows: usize, n_used: usize, n_expert: usize) -> StaticScratchPhase {
@@ -8475,6 +8485,33 @@ mod tests {
         );
         assert!(cache.scratch_layout.is_empty());
         assert!(cache.scratch.is_empty());
+    }
+
+    #[test]
+    fn service_client_transition_releases_the_whole_inactive_phase() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut cache = StaticScratchCache::default();
+        cache.enter(StaticScratchPhase::Decode);
+        cache.scratch_layout = vec![Some(4)];
+        cache.scratch = vec![Some(Box::new(DropCountBuffer {
+            bytes: 4,
+            drops: std::sync::Arc::clone(&drops),
+        }))];
+        cache.pool.buffers.insert(
+            ("service_phase", 8),
+            Box::new(DropCountBuffer {
+                bytes: 8,
+                drops: std::sync::Arc::clone(&drops),
+            }),
+        );
+
+        cache.release_phase();
+
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(cache.phase.is_none());
+        assert!(cache.scratch.is_empty());
+        assert!(cache.scratch_layout.is_empty());
+        assert!(cache.pool.buffers.is_empty());
     }
 
     #[test]

@@ -1948,7 +1948,7 @@ pub struct VulkanBackend {
     /// dropped every token and make the unified arena restore then immediately re-loan an expert
     /// slot. The adapter clears this cache only when execution switches between decode and
     /// prefill; declaring it before `shared` also guarantees its Vulkan buffers drop first.
-    static_scratch: Mutex<adapter::StaticScratchCache>,
+    static_scratch: Arc<Mutex<adapter::StaticScratchCache>>,
     /// Resident-weight sub-allocator (see [`BdaWeightArena`]) — `None` until the first weight alloc;
     /// `make_alloc` routes every `BufferUsage::Weights` here (the sole weight path).
     ///
@@ -1966,6 +1966,10 @@ pub struct VulkanBackend {
     /// the write side because both primary and auxiliary graphs allocate elastic scratch lazily;
     /// the thread-local owner lets those nested allocations reuse the non-reentrant lease.
     unified_exec: Arc<RwLock<()>>,
+    /// Runtime ownership across backend forks. Switching between LLM and an auxiliary client drops
+    /// only the inactive client's phase scratch; same-client token execution stays untouched.
+    unified_phases: Arc<UnifiedPhaseRegistry>,
+    unified_phase_id: u64,
     /// Auxiliary-engine allocation routing. `None` keeps every established LLM allocation path;
     /// an Embedding fork sends only weights and graph activations into the shared elastic arena.
     unified_client: Option<UnifiedClient>,
@@ -1985,6 +1989,62 @@ pub struct VulkanBackend {
 #[derive(Clone, Copy)]
 enum UnifiedClient {
     Embedding,
+}
+
+struct UnifiedPhaseState {
+    active: Option<u64>,
+    next_id: u64,
+    caches: Vec<(u64, std::sync::Weak<Mutex<adapter::StaticScratchCache>>)>,
+}
+
+struct UnifiedPhaseRegistry {
+    state: Mutex<UnifiedPhaseState>,
+}
+
+impl UnifiedPhaseRegistry {
+    const PRIMARY_ID: u64 = 1;
+
+    fn new(primary: &Arc<Mutex<adapter::StaticScratchCache>>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(UnifiedPhaseState {
+                active: None,
+                next_id: Self::PRIMARY_ID + 1,
+                caches: vec![(Self::PRIMARY_ID, Arc::downgrade(primary))],
+            }),
+        })
+    }
+
+    fn register(&self, cache: &Arc<Mutex<adapter::StaticScratchCache>>) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1).max(Self::PRIMARY_ID + 1);
+        state.caches.push((id, Arc::downgrade(cache)));
+        id
+    }
+
+    /// Return true only for a real client transition. The caller holds `unified_exec`, so clearing
+    /// upgraded peer caches outside the registry lock cannot race another activation.
+    fn activate(&self, id: u64) -> bool {
+        let peers = {
+            let mut state = self.state.lock().unwrap();
+            state.caches.retain(|(_, cache)| cache.strong_count() != 0);
+            if state.active == Some(id) {
+                return false;
+            }
+            state.active = Some(id);
+            state
+                .caches
+                .iter()
+                .filter_map(|&(peer_id, ref cache)| {
+                    (peer_id != id).then(|| cache.upgrade()).flatten()
+                })
+                .collect::<Vec<_>>()
+        };
+        for cache in peers {
+            cache.lock().unwrap().release_phase();
+        }
+        true
+    }
 }
 
 /// Device memory info for a backend's shared state — the body of [`VulkanBackend::vram`],
@@ -3482,14 +3542,18 @@ impl VulkanBackend {
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
         cleanup.armed = false;
 
+        let static_scratch = Arc::new(Mutex::new(adapter::StaticScratchCache::default()));
+        let unified_phases = UnifiedPhaseRegistry::new(&static_scratch);
         let backend = Self {
             moe_pager: Arc::new(Mutex::new(None)),
             session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dense_pager: Mutex::new(None),
-            static_scratch: Mutex::new(adapter::StaticScratchCache::default()),
+            static_scratch,
             bda_weight_arena: Mutex::new(None),
             unified_pool: Arc::new(Mutex::new(None)),
             unified_exec: Arc::new(RwLock::new(())),
+            unified_phases,
+            unified_phase_id: UnifiedPhaseRegistry::PRIMARY_ID,
             unified_client: None,
             cfg,
             shared: Arc::new(VulkanShared {
@@ -4670,14 +4734,18 @@ impl VulkanBackend {
                 "cannot fork a unified Embedding backend before the MoE arena is initialized",
             ));
         }
+        let static_scratch = Arc::new(Mutex::new(adapter::StaticScratchCache::default()));
+        let unified_phase_id = self.unified_phases.register(&static_scratch);
         Ok(Self {
             moe_pager: Arc::clone(&self.moe_pager),
             session_finalization_deferred: Arc::clone(&self.session_finalization_deferred),
             dense_pager: Mutex::new(None),
-            static_scratch: Mutex::new(adapter::StaticScratchCache::default()),
+            static_scratch,
             bda_weight_arena: Mutex::new(None),
             unified_pool: Arc::clone(&self.unified_pool),
             unified_exec: Arc::clone(&self.unified_exec),
+            unified_phases: Arc::clone(&self.unified_phases),
+            unified_phase_id,
             unified_client: Some(UnifiedClient::Embedding),
             cfg: Arc::clone(&self.cfg),
             shared: Arc::clone(&self.shared),
@@ -4806,6 +4874,12 @@ impl VulkanBackend {
         );
         let _exclusive = self.unified_exec.write().unwrap();
         let _scope = UnifiedExecScope::enter(owner);
+        let client_changed = self.unified_phases.activate(self.unified_phase_id);
+        if client_changed && self.unified_client.is_none() {
+            if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+                session.restore_released_unified_slots();
+            }
+        }
         f()
     }
 
@@ -6621,6 +6695,21 @@ mod tests {
 
     fn submit_policy(profile: infr_core::config::AutoProfile) -> SubmitAutoPolicy {
         SubmitAutoPolicy::new(SubmitAutoSettings::for_profile(profile))
+    }
+
+    #[test]
+    fn unified_phase_registry_switches_only_between_distinct_clients() {
+        let primary = Arc::new(Mutex::new(adapter::StaticScratchCache::default()));
+        let registry = UnifiedPhaseRegistry::new(&primary);
+
+        assert!(registry.activate(UnifiedPhaseRegistry::PRIMARY_ID));
+        assert!(!registry.activate(UnifiedPhaseRegistry::PRIMARY_ID));
+
+        let auxiliary = Arc::new(Mutex::new(adapter::StaticScratchCache::default()));
+        let auxiliary_id = registry.register(&auxiliary);
+        assert!(registry.activate(auxiliary_id));
+        assert!(!registry.activate(auxiliary_id));
+        assert!(registry.activate(UnifiedPhaseRegistry::PRIMARY_ID));
     }
 
     #[test]

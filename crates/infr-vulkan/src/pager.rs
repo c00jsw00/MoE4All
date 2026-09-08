@@ -2416,6 +2416,13 @@ impl MoePagerSession {
         restored
     }
 
+    /// Reclaim ranges released by an auxiliary client at the service-level execution boundary,
+    /// without changing Decode/Prefill interpretation. This is intentionally absent from the
+    /// per-token pager path.
+    pub(crate) fn restore_released_unified_slots(&mut self) -> usize {
+        self.restore_unified_slots_if_changed()
+    }
+
     fn restore_exchange_spares(&mut self) {
         for pool in &mut self.pools {
             let Some(exchange) = pool.exchange_slot else {
