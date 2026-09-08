@@ -17,6 +17,9 @@ use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
 use infr_gguf::{Gguf, TensorBytes};
 
+const MIB_F64: f64 = (1u64 << 20) as f64;
+const GIB_F64: f64 = (1u64 << 30) as f64;
+
 pub mod model;
 mod ple;
 mod runner;
@@ -109,6 +112,7 @@ fn log_host_ram_request(
     what: &str,
     request: infr_core::hostmem::RamRequest,
     process_resident: Option<u64>,
+    planned_future_resident: u64,
     cache_bytes: u64,
 ) {
     match (request, process_resident) {
@@ -116,6 +120,7 @@ fn log_host_ram_request(
             tracing::info!(
                 total_process_ram_budget_bytes = total,
                 observed_process_resident_bytes = resident,
+                planned_future_resident_bytes = planned_future_resident,
                 host_cache_budget_bytes = cache_bytes,
                 "{what} host tier: resolved total-process RAM budget"
             )
@@ -173,13 +178,18 @@ fn cpu_paged_store(
         .sum();
     let available = infr_core::hostmem::available_bytes();
     let process_resident = infr_core::hostmem::process_resident_bytes();
-    let arena_plan =
-        infr_core::hostmem::cpu_arena_plan(ram_request, available, process_resident, pageable);
+    let arena_plan = infr_core::hostmem::cpu_arena_plan_for_profile(
+        ec.device.auto_profile,
+        ram_request,
+        available,
+        process_resident,
+        pageable,
+    );
     let cache_bytes = match arena_plan {
         infr_core::hostmem::ArenaPlan::Take(bytes) => bytes,
         _ => 0,
     };
-    log_host_ram_request("CPU", ram_request, process_resident, cache_bytes);
+    log_host_ram_request("CPU", ram_request, process_resident, 0, cache_bytes);
     let budget = match arena_plan {
         // Only the GPU tiers can want a reader with no cache under them (their arena IS the cache
         // on unified memory). For the CPU backend this arena is the only tier there is, so a
@@ -191,12 +201,12 @@ fn cpu_paged_store(
         infr_core::hostmem::ArenaPlan::Take(n) => {
             if ram_request == infr_core::hostmem::RamRequest::Auto {
                 tracing::info!(
-                    "host paging: {:.2} GB of weights exceed the {:.2} GB of host memory \
-                     available, so they stream from disk through a {:.2} GB arena instead of the \
+                    "host paging: {:.2} GiB of weights exceed the {:.2} GiB of host memory \
+                     available, so they stream from disk through a {:.2} GiB arena instead of the \
                      OS page cache (set INFR_RAM_BUDGET to override)",
-                    pageable as f64 / 1e9,
-                    available.unwrap_or(0) as f64 / 1e9,
-                    n as f64 / 1e9,
+                    pageable as f64 / GIB_F64,
+                    available.unwrap_or(0) as f64 / GIB_F64,
+                    n as f64 / GIB_F64,
                 );
             }
             n as usize
@@ -208,12 +218,12 @@ fn cpu_paged_store(
             // where the run is about to be slow for a reason the user can act on.
             if why == Skip::TooLittle {
                 tracing::warn!(
-                    "host paging: {:.2} GB of weights do not fit the {:.2} GB of host memory \
+                    "host paging: {:.2} GiB of weights do not fit the {:.2} GiB of host memory \
                      available, but too little is free to seat a useful arena — falling back to \
                      the OS page cache, which thrashes on a forward pass's cyclic sweep. Free \
                      memory, or set INFR_RAM_BUDGET explicitly",
-                    pageable as f64 / 1e9,
-                    available.unwrap_or(0) as f64 / 1e9,
+                    pageable as f64 / GIB_F64,
+                    available.unwrap_or(0) as f64 / GIB_F64,
                 );
             }
             return Ok(None);
@@ -222,9 +232,9 @@ fn cpu_paged_store(
     let plans = infr_cpu::paged::plan_pools(budget, g.tensors());
     if plans.is_empty() {
         tracing::warn!(
-            "host paging: a {:.2} GB budget seats no weight class of this model — keeping the \
+            "host paging: a {:.2} GiB budget seats no weight class of this model — keeping the \
              mmap path (raise INFR_RAM_BUDGET enough to leave room for one tensor)",
-            budget as f64 / 1e9,
+            budget as f64 / GIB_F64,
         );
         return Ok(None);
     }
@@ -233,10 +243,10 @@ fn cpu_paged_store(
     );
     let store = infr_cpu::paged::PagedWeights::new(&plans, io).map_err(|e| anyhow!("{e}"))?;
     tracing::info!(
-        "host paging: {} weight class(es), {:.2} GB arena of a {:.2} GB budget",
+        "host paging: {} weight class(es), {:.2} GiB arena of a {:.2} GiB budget",
         plans.len(),
-        store.arena_bytes() as f64 / 1e9,
-        budget as f64 / 1e9,
+        store.arena_bytes() as f64 / GIB_F64,
+        budget as f64 / GIB_F64,
     );
     Ok(Some(std::sync::Arc::new(store)))
 }
@@ -289,7 +299,8 @@ fn vulkan_host_tier(
     let available = infr_core::hostmem::available_bytes();
     let process_resident = infr_core::hostmem::process_resident_bytes();
     let pageable: u64 = classes.iter().map(|&(s, n)| (s * n) as u64).sum();
-    let arena_plan = infr_core::hostmem::streaming_arena_plan(
+    let arena_plan = infr_core::hostmem::streaming_arena_plan_for_profile(
+        ec.device.auto_profile,
         ram_request,
         available,
         process_resident,
@@ -300,7 +311,7 @@ fn vulkan_host_tier(
         infr_core::hostmem::ArenaPlan::Take(bytes) => bytes,
         _ => 0,
     };
-    log_host_ram_request(what, ram_request, process_resident, cache_bytes);
+    log_host_ram_request(what, ram_request, process_resident, 0, cache_bytes);
     let budget = match arena_plan {
         // Unified memory: the arena above is already GPU-accessible RAM, so there is nothing
         // to cache down here — but its misses still come from BLOCK reads instead of the
@@ -328,10 +339,10 @@ fn vulkan_host_tier(
         infr_core::hostmem::ArenaPlan::Take(n) => {
             if ram_request == infr_core::hostmem::RamRequest::Auto {
                 tracing::info!(
-                    "{what} host tier: sized automatically to {:.2} GB of {:.2} GB available host \
+                    "{what} host tier: sized automatically to {:.2} GiB of {:.2} GiB available host \
                      memory (set INFR_RAM_BUDGET to override)",
-                    n as f64 / 1e9,
-                    available.unwrap_or(0) as f64 / 1e9,
+                    n as f64 / GIB_F64,
+                    available.unwrap_or(0) as f64 / GIB_F64,
                 );
             }
             n as usize
@@ -346,10 +357,10 @@ fn vulkan_host_tier(
                      OS page cache"
                 ),
                 Skip::TooLittle => tracing::warn!(
-                    "{what} host tier: this model must stream, but only {:.2} GB of host memory \
+                    "{what} host tier: this model must stream, but only {:.2} GiB of host memory \
                      is available — too little to seat a useful arena, so the weights stay on the \
                      OS page cache. Free memory, or set INFR_RAM_BUDGET explicitly",
-                    available.unwrap_or(0) as f64 / 1e9,
+                    available.unwrap_or(0) as f64 / GIB_F64,
                 ),
                 // Off by name: say so once, because a user who set it and then wonders why
                 // streaming is slow should find the reason in the log.
@@ -367,9 +378,9 @@ fn vulkan_host_tier(
     let slots = infr_core::hostpager::plan_slots(budget, classes);
     if slots.iter().all(|&n| n == 0) {
         tracing::warn!(
-            "{what} host tier: a {:.2} GB budget seats no block class of this model — keeping \
+            "{what} host tier: a {:.2} GiB budget seats no block class of this model — keeping \
              the mmap path (raise INFR_RAM_BUDGET enough to leave room for one block)",
-            budget as f64 / 1e9,
+            budget as f64 / GIB_F64,
         );
         return Ok(unpaged());
     }
@@ -389,11 +400,11 @@ fn vulkan_host_tier(
         out.push(Some(std::sync::Arc::new(p)));
     }
     tracing::info!(
-        "{what} host tier: {} of {} pool(s) paged, {:.2} GB arena of a {:.2} GB budget",
+        "{what} host tier: {} of {} pool(s) paged, {:.2} GiB arena of a {:.2} GiB budget",
         slots.iter().filter(|&&n| n > 0).count(),
         classes.len(),
-        arena as f64 / 1e9,
-        budget as f64 / 1e9,
+        arena as f64 / GIB_F64,
+        budget as f64 / GIB_F64,
     );
     Ok(out)
 }
@@ -556,15 +567,15 @@ pub(crate) fn generate_dense_cpu_mode(
 fn report_host_paging(store: &infr_cpu::paged::PagedWeights) {
     for (slot_bytes, n_slots, s) in store.pool_stats() {
         tracing::info!(
-            "[host pager] {:.1}MB x {n_slots} slots: {} hits, {} misses ({:.1}% hit), {} evictions, \
-             {} reads, {:.2} GB from disk",
-            slot_bytes as f64 / 1e6,
+            "[host pager] {:.1} MiB x {n_slots} slots: {} hits, {} misses ({:.1}% hit), {} evictions, \
+             {} reads, {:.2} GiB from disk",
+            slot_bytes as f64 / MIB_F64,
             s.pager.hits,
             s.pager.misses,
             s.pager.hit_rate() * 100.0,
             s.pager.evictions,
             s.reads,
-            s.bytes_read as f64 / 1e9,
+            s.bytes_read as f64 / GIB_F64,
         );
     }
 }
@@ -681,6 +692,14 @@ pub(crate) fn generate_dense_vulkan_session(
         req,
     );
     if out.is_err() {
+        // A failed forward may already have committed several prefill chunks to KV/QSA and
+        // advanced recurrent/PLE state, while `cached` is published only at normal function exit.
+        // Never return that half-advanced slot to a persistent session pool as reusable. Keeping
+        // the allocations and weights is safe; an empty token ledger makes the next request take
+        // the existing full-reset + full-prefill path from position zero.
+        if let Some(kv) = state.as_mut() {
+            kv.reset();
+        }
         vk.release_moe_load_reservation();
     }
     let out = out?;
@@ -1037,7 +1056,9 @@ pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
             },
         )
     });
-    let selected = configured.or(placed).unwrap_or_else(default_ubatch_rows);
+    let selected = configured
+        .or(placed)
+        .unwrap_or_else(|| default_ubatch_rows(ec.device.auto_profile));
     match moe_cap {
         Some(cap) => selected.min(cap),
         None => selected,
@@ -1051,14 +1072,15 @@ pub(crate) fn user_pinned_ubatch(ec: &EngineConfig) -> bool {
     ec.device.ubatch_specified
 }
 
-/// The SHRINK ladder the dense placement sweeps walk when the default prefill chunk's activation
-/// reserve is what tips a model out of residency: 512 → 256 → 128 rows. A shorter chunk shrinks
+/// The SHRINK ladder the dense placement sweeps walk when the selected prefill chunk's activation
+/// reserve is what tips a model out of residency: 2048 → 1024 → 512 → 256 → 128 rows. A shorter
+/// chunk shrinks
 /// both the activation reserve (whole-chunk scratch scales with rows) and the SWA ring rows
 /// (`window + chunk`), and resident-at-512 decodes ~10x faster than streaming at the PCIe ceiling
 /// — so trading prefill chunk height for residency is strictly the right call.
 ///
 /// 128 is the floor: below it the per-dispatch launch overhead dominates prefill entirely.
-pub(crate) const DENSE_UBATCH_LADDER: [usize; 3] = [512, 256, 128];
+pub(crate) const DENSE_UBATCH_LADDER: [usize; 4] = [1024, 512, 256, 128];
 
 /// Every prefill chunk height a dense placement decision is allowed to settle on, TALLEST FIRST:
 /// the current/default height ([`ubatch_rows`]) followed by the [`DENSE_UBATCH_LADDER`] rungs
@@ -1097,18 +1119,22 @@ fn moe_ubatch_fallback_candidates(ec: &EngineConfig) -> Vec<usize> {
     candidates
 }
 
-/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows, EXCEPT
-/// on an integrated GPU, where a chunk that big is a single multi-second command buffer and trips
+/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows in the
+/// conservative profile and 2048 in the aggressive profile, EXCEPT on an integrated GPU, where a
+/// chunk that big is a single multi-second command buffer and trips
 /// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
 /// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
 ///
 /// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
-/// `device_class()` is `None`) takes the 1024 branch — byte-identical to before this existed, so
-/// no tuned dGPU shape moves.
-fn default_ubatch_rows() -> usize {
+/// `device_class()` is `None`) uses the profile default. Conservative remains byte-identical to
+/// the pre-profile behavior.
+fn default_ubatch_rows(profile: infr_core::config::AutoProfile) -> usize {
     match infr_vulkan::device_class() {
         Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
-        _ => 1024,
+        _ => match profile {
+            infr_core::config::AutoProfile::Conservative => 1024,
+            infr_core::config::AutoProfile::Aggressive => 2048,
+        },
     }
 }
 
@@ -2151,18 +2177,21 @@ fn resident_weight_packing_margin(dense_weight_bytes: u64) -> u64 {
 /// subtracting it there again would double-charge it and can collapse the selected context.
 const DEEPSEEK4_LOAD_DRIVER_RESERVE: u64 = 1536 * 1024 * 1024;
 
-/// WDDM charges large mapped ReBAR arenas more aggressively than the logical Vulkan allocation
-/// tally while they are being committed. On the Windows 7900 XTX target, Qwen35 and Ling sessions
-/// gain about 2 GiB of untracked heap usage between committing a large mapped arena and allocating
-/// their fixed weights/state. Keep that load-only movement out of the expert arena; Linux uses the
-/// live heap budget without this WDDM allowance and remains byte-for-byte unchanged.
+/// WDDM charged the original large mapped-arena path more aggressively than the logical Vulkan
+/// allocation tally while it was being committed. On the Windows 7900 XTX target, Qwen35 and Ling
+/// sessions gained about 2 GiB of untracked heap usage between committing the arena and allocating
+/// their fixed weights/state. Keep that established load-only margin independent of the physical
+/// arena backend; Linux uses the live heap budget without it and remains byte-for-byte unchanged.
 const WINDOWS_LARGE_REBAR_LOAD_DRIVER_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Cold WDDM startup has a small amount of run-to-run heap-budget movement beyond the measured
-/// large-ReBAR load reserve above. Automatic placement should favor a reliable first launch over the
-/// last few Expert slots. An explicit total VRAM budget/reserve remains authoritative and opts out
-/// of this extra policy margin.
-const WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE: u64 = 512 * 1024 * 1024;
+/// Cold WDDM startup and the first queue use of imported host-memory aliases have heap-budget
+/// movement beyond the measured large-ReBAR load reserve above. Automatic placement should favor a
+/// reliable first launch over the last few Expert slots. An explicit total VRAM budget/reserve
+/// remains authoritative and opts out of this extra policy margin.
+const WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE: u64 = 1024 * 1024 * 1024;
+/// The performance profile still keeps half of the observed cold-start fluctuation. The live
+/// allocation-feedback retry remains the final authority if this tighter margin proves optimistic.
+const WINDOWS_LARGE_REBAR_AGGRESSIVE_STARTUP_RESERVE: u64 = 512 * 1024 * 1024;
 
 fn load_driver_reserve(cfg: &Config) -> u64 {
     if cfg.deepseek4 {
@@ -2180,7 +2209,14 @@ fn session_load_driver_reserve(cfg: &Config, ec: &EngineConfig) -> u64 {
         && ec.device.vram_budget.is_none()
         && ec.device.vram_reserve.is_none()
     {
-        WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE
+        match ec.device.auto_profile {
+            infr_core::config::AutoProfile::Conservative => {
+                WINDOWS_LARGE_REBAR_AUTO_STARTUP_RESERVE
+            }
+            infr_core::config::AutoProfile::Aggressive => {
+                WINDOWS_LARGE_REBAR_AGGRESSIVE_STARTUP_RESERVE
+            }
+        }
     } else {
         0
     };
@@ -2324,6 +2360,30 @@ pub(crate) fn moe_prefill_floor_bytes(g: &Gguf, cfg: &Config) -> u64 {
     };
     let pools = moe_logical_pools(g, cfg, cfg.n_layer);
     moe_pool_floor_bytes(&pools, moe.n_expert.max(1)).unwrap_or(u64::MAX)
+}
+
+/// Exact minimum whole-layer Prefill lane: one maximum bank for each role position used by any
+/// paged layer. This mirrors the pager's one-lane layout without multiplying mutually exclusive
+/// size classes into the Decode dispatch floor.
+fn moe_prefill_min_lane_bytes(g: &Gguf, cfg: &Config) -> u64 {
+    let mut role_max = [0u64; 3];
+    for tensor in g.tensors() {
+        let Some(_layer) = moe_expert_layer(&tensor.name).filter(|&layer| layer < cfg.n_layer)
+        else {
+            continue;
+        };
+        let Some(role) = moe_role_index(&tensor.name) else {
+            continue;
+        };
+        role_max[role] = role_max[role].max(tensor.nbytes as u64);
+    }
+    role_max
+        .into_iter()
+        .try_fold(0u64, |sum, bytes| {
+            let aligned = bytes.checked_add(255).map(|value| value & !255)?;
+            sum.checked_add(aligned)
+        })
+        .unwrap_or(u64::MAX)
 }
 
 /// Whole-layer Prefill ring depth from the model's actual mixer topology. A recurrent run gives
@@ -2754,17 +2814,24 @@ enum MoeHostBacking {
     Bounded { bytes: usize },
 }
 
+/// Aggressive auto mode may spend down to this much currently-available host memory when doing so
+/// removes the runtime SSD expert tier entirely. Partial caches retain the normal profile-aware
+/// headroom: the extra pressure is worthwhile only at the full-residency discontinuity.
+const AGGRESSIVE_MOE_FULL_FIT_HEADROOM: u64 = 4 << 30;
+
 fn moe_host_backing(
+    profile: infr_core::config::AutoProfile,
     ram_request: infr_core::hostmem::RamRequest,
     available: Option<u64>,
     process_resident: Option<u64>,
+    planned_future_resident: u64,
     payload_bytes: usize,
 ) -> MoeHostBacking {
     let budget = match ram_request {
         infr_core::hostmem::RamRequest::TotalProcessBudget(total) => {
             infr_core::hostmem::cache_bytes_for_total_budget(
                 total,
-                process_resident,
+                process_resident.map(|resident| resident.saturating_add(planned_future_resident)),
                 payload_bytes as u64,
             )
         }
@@ -2772,7 +2839,17 @@ fn moe_host_backing(
         infr_core::hostmem::RamRequest::Bypass => 0,
         infr_core::hostmem::RamRequest::Auto => available
             .map(|available| {
-                infr_core::hostmem::auto_cache_bytes(available, 0, payload_bytes as u64)
+                let payload = payload_bytes as u64;
+                let aggressive_full_fit =
+                    matches!(profile, infr_core::config::AutoProfile::Aggressive)
+                        && payload
+                            .checked_add(AGGRESSIVE_MOE_FULL_FIT_HEADROOM)
+                            .is_some_and(|required| required <= available);
+                if aggressive_full_fit {
+                    payload
+                } else {
+                    infr_core::hostmem::auto_cache_bytes_for_profile(profile, available, 0, payload)
+                }
             })
             .unwrap_or(0),
     } as usize;
@@ -2810,7 +2887,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     //      caller (or a test) force the paged path deterministically instead of depending on
     //      this box's free VRAM — see the `gpu_seam_paged_moe_matches_*` tests. The value is the
     //      shared size grammar (`infr_core::parse_size`): plain bytes, `k/m/g/t` 1024-suffixes
-    //      (`INFR_CACHE=19g`), or a percentage of the device's AVAILABLE VRAM at first load
+    //      (`INFR_CACHE=19GiB`), or a percentage of the device's AVAILABLE VRAM at first load
     //      (`INFR_CACHE=80%` — device-appropriate base: the cache lives in VRAM).
     //   2. Auto (unset): fully resident (the fast path, zero change) when the banks fit VRAM;
     //      otherwise the pager with budget = remaining VRAM after dense+KV+headroom.
@@ -2825,12 +2902,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
     let mut expert_cache_target_bytes = 0u64;
     let mut pager_budget_bytes = 0u64;
     let mut pager_memory_plan = None;
+    let mut dynamic_state_max_allocation_bytes = 0u64;
+    let mut planned_future_host_resident_bytes = 0u64;
     // Placement is decided ONCE, on the session's FIRST load — the only call where `bind_weight`
     // runs (see the `state.is_none()` init block in `generate_dense_backend`) and the only moment
     // the tier-3 budget math is consistent: `vram.available` is LIVE (heapBudget − heapUsage), so
     // once this model's weights are resident a recompute would subtract `fp.dense` from an
     // `available` that ALREADY excludes it — double-counting the model against itself and
-    // collapsing the budget (observed: a fully-resident 16.4 GB model "re-placed" as 5/30
+    // collapsing the budget (observed: a fully-resident 15.3 GiB model "re-placed" as 5/30
     // resident on the warm second call of a bench). Warm calls leave `n_paged` at 0; nothing
     // consumes it (no binding, and the pager init below is first_load-gated anyway). A first
     // load racing ANOTHER resident model (swap mid-drain) still reads reduced `available` —
@@ -2844,6 +2923,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // `infr_vulkan::linear::moe_expert_dtype_ok` is true for all of them; the invariant is
         // pinned by `moe_expert_floor_covers_dense_set` in infr-vulkan's linear.rs tests.
         let fp = crate::weights::weight_footprint(g);
+        planned_future_host_resident_bytes = fp.dense;
         let vram = vk.vram();
         let room = planned_vram_room(&vram, ec);
         // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
@@ -2859,6 +2939,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let dynamic_kv_reserve = dynamic_layout
             .as_ref()
             .map(|layout| layout.committed_bytes(want_ctx))
+            .unwrap_or(0);
+        dynamic_state_max_allocation_bytes = dynamic_layout
+            .as_ref()
+            .and_then(|layout| {
+                layout
+                    .planes
+                    .iter()
+                    .map(|plane| plane.segment_bytes() as u64)
+                    .max()
+            })
             .unwrap_or(0);
         let kv_bytes_at = |ubatch| match (k_fmt, v_fmt) {
             (DType::Q8_0, DType::Q8_0) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, true),
@@ -2888,13 +2978,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
             POST_KV_DEVICE_RESERVE,
         ) else {
             return Err(anyhow!(
-                "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed the unified \
-                 VRAM room ({:.2} GB after guard/reserve/configured cap) — dense layer streaming \
+                "this MoE model's dense weights ({:.2} GiB) + KV cache ({:.2} GiB) exceed the unified \
+                 VRAM room ({:.2} GiB after guard/reserve/configured cap) — dense layer streaming \
                  does not cover MoE models' dense parts; reduce ctx or run on the CPU backend \
                  (INFR_DEV=cpu)",
-                fp.dense as f64 / 1e9,
-                kv_bytes as f64 / 1e9,
-                room as f64 / 1e9,
+                fp.dense as f64 / GIB_F64,
+                kv_bytes as f64 / GIB_F64,
+                room as f64 / GIB_F64,
             ));
         };
         let requested_cache = cache_override.map(|spec| spec.resolve(vram.available));
@@ -2960,10 +3050,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 expert_cache_target_bytes = requested.min(auto_budget);
                 if requested > auto_budget {
                     tracing::warn!(
-                        "INFR_CACHE requested {:.2} GB of expert arena but the unified VRAM plan \
-                         leaves {:.2} GB; clamping the arena to the safe remainder",
-                        requested as f64 / 1e9,
-                        auto_budget as f64 / 1e9,
+                        "INFR_CACHE requested {:.2} GiB of expert arena but the unified VRAM plan \
+                         leaves {:.2} GiB; clamping the arena to the safe remainder",
+                        requested as f64 / GIB_F64,
+                        auto_budget as f64 / GIB_F64,
                     );
                 }
             }
@@ -2995,25 +3085,25 @@ pub(crate) fn vulkan_moe_binder<'a>(
             format!("k={k_fmt:?}, v={v_fmt:?}")
         };
         tracing::info!(
-            "VRAM plan: total_room={:.2} GB fixed={:.2} GB state={:.2} GB runtime_elastic={:.2} GB \
-             dynamic_state_elastic={:.2} GB \
-             packing_margin={:.2} GB load_driver={:.2} GB post_load={:.2} GB \
-             expert_cache_target={:.2} GB elastic_pool={:.2} GB ({cache_layout}, ctx={want_ctx})",
-            room as f64 / 1e9,
-            plan.fixed_weight_bytes as f64 / 1e9,
-            plan.persistent_state_bytes as f64 / 1e9,
-            plan.runtime_reserve_bytes as f64 / 1e9,
-            plan.dynamic_state_reserve_bytes as f64 / 1e9,
-            plan.weight_packing_margin_bytes as f64 / 1e9,
-            plan.load_driver_reserve_bytes as f64 / 1e9,
-            plan.post_load_reserve_bytes as f64 / 1e9,
+            "VRAM plan: total_room={:.2} GiB fixed={:.2} GiB state={:.2} GiB runtime_elastic={:.2} GiB \
+             dynamic_state_elastic={:.2} GiB \
+             packing_margin={:.2} GiB load_driver={:.2} GiB post_load={:.2} GiB \
+             expert_cache_target={:.2} GiB elastic_pool={:.2} GiB ({cache_layout}, ctx={want_ctx})",
+            room as f64 / GIB_F64,
+            plan.fixed_weight_bytes as f64 / GIB_F64,
+            plan.persistent_state_bytes as f64 / GIB_F64,
+            plan.runtime_reserve_bytes as f64 / GIB_F64,
+            plan.dynamic_state_reserve_bytes as f64 / GIB_F64,
+            plan.weight_packing_margin_bytes as f64 / GIB_F64,
+            plan.load_driver_reserve_bytes as f64 / GIB_F64,
+            plan.post_load_reserve_bytes as f64 / GIB_F64,
             (if n_paged > 0 {
                 expert_cache_target_bytes
             } else {
                 fp.expert
             }) as f64
-                / 1e9,
-            pager_budget_bytes as f64 / 1e9,
+                / GIB_F64,
+            pager_budget_bytes as f64 / GIB_F64,
         );
     }
     // The layer index of a `blk.{l}.…_exps…` tensor name.
@@ -3167,15 +3257,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 None if auto_size_bias_layout => (2.0, "auto"),
                 None => (0.0, "off"),
             };
-            // Commit the mapped arena before allocating host caches or loading weights, then ask
+            // Commit the device arena before allocating host caches or loading weights, then ask
             // the driver how much room is ACTUALLY left. `VK_EXT_memory_budget` accounting for a
-            // large ReBAR mapping is card/driver dependent: WDDM can charge more than the logical
+            // large arena is card/driver/backing dependent: WDDM can charge more than the logical
             // VkDeviceMemory size, so a plan that fits arithmetically on one GPU can leave too
             // little room for the same fixed weights on another. Automatic placement shrinks and
             // retries while the arena is still empty; an explicit `paging.cache` remains exact.
             let plan = pager_memory_plan.expect("n_paged > 0 carries its selected memory plan");
+            let physical_pool_floors = moe_pool_slot_floors(&logical_pools, n_expert);
             let physical_pool_floor = moe_pool_physical_floor_bytes(&logical_pools, n_expert)
                 .ok_or_else(|| anyhow!("MoE physical pool floor size overflow"))?;
+            let prefill_min_lane_bytes = moe_prefill_min_lane_bytes(g, cfg);
             let planned_pager_budget = pager_budget_bytes;
             let elastic_reserve = plan.elastic_reserve_bytes();
             let minimum_pager_budget = elastic_reserve.saturating_add(physical_pool_floor);
@@ -3202,7 +3294,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let physical_bytes = moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
                 if physical_bytes.saturating_sub(elastic_reserve) < physical_pool_floor {
                     return Err(anyhow!(
-                        "MoE mapped arena cannot retain one complete Prefill layer after its \
+                        "MoE device arena cannot retain one complete Prefill layer after its \
                          runtime reserve plus the tiered-cache exchange slots (arena {:.2} MiB, \
                          runtime {:.2} MiB, physical floor {:.2} MiB)",
                         physical_bytes as f64 / 2f64.powi(20),
@@ -3210,13 +3302,22 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         physical_pool_floor as f64 / 2f64.powi(20),
                     ));
                 }
-                let specs: Vec<(usize, usize)> = logical_pools
+                let specs: Vec<(usize, usize, usize)> = logical_pools
                     .iter()
                     .zip(&candidate_slots)
-                    .map(|(&(slot_bytes, ..), &n_slots)| (slot_bytes, n_slots))
+                    .zip(&physical_pool_floors)
+                    .map(|((&(slot_bytes, ..), &n_slots), &floor_slots)| {
+                        (slot_bytes, n_slots, floor_slots)
+                    })
                     .collect();
 
-                let failure = match vk.prepare_moe_unified_vram(&specs) {
+                let failure = match vk.prepare_moe_unified_vram(
+                    &specs,
+                    plan.dynamic_state_reserve_bytes,
+                    dynamic_state_max_allocation_bytes,
+                    prefill_min_lane_bytes,
+                    plan.runtime_reserve_bytes,
+                ) {
                     Ok(committed) => {
                         debug_assert_eq!(committed as u64, physical_bytes);
                         let live_room = vk.alloc_room();
@@ -3291,16 +3392,36 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let ram_request = host_ram_request(ec);
             let host_available = infr_core::hostmem::available_bytes();
             let process_resident = infr_core::hostmem::process_resident_bytes();
-            let host_backing =
-                moe_host_backing(ram_request, host_available, process_resident, host_bytes);
+            let host_backing = moe_host_backing(
+                ec.device.auto_profile,
+                ram_request,
+                host_available,
+                process_resident,
+                planned_future_host_resident_bytes,
+                host_bytes,
+            );
             let (host_kind, host_resident_bytes) = match host_backing {
                 MoeHostBacking::Full => ("full-RAM", host_bytes),
                 MoeHostBacking::Bounded { bytes } => ("inclusive-RAM/SSD", bytes),
             };
+            if ram_request == infr_core::hostmem::RamRequest::Auto {
+                if let Some(available) = host_available {
+                    tracing::info!(
+                        auto_profile = ?ec.device.auto_profile,
+                        available_host_bytes = available,
+                        expert_payload_bytes = host_bytes,
+                        headroom_after_full_bytes = available.saturating_sub(host_bytes as u64),
+                        full_fit_shortfall_bytes = (host_bytes as u64).saturating_sub(available),
+                        decision = host_kind,
+                        "MoE automatic host residency decision"
+                    );
+                }
+            }
             log_host_ram_request(
                 "MoE",
                 ram_request,
                 process_resident,
+                planned_future_host_resident_bytes,
                 host_resident_bytes as u64,
             );
             if let MoeHostBacking::Bounded {
@@ -3326,9 +3447,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     moe_host_by_size.insert(slot_bytes, std::sync::Arc::new(cache));
                 }
                 tracing::info!(
-                    "MoE host plan: bounded inclusive RAM cache {:.2} GB / {:.2} GB expert payload; GPU shadows share this budget and remaining Experts stream from SSD",
-                    host_cache_budget as f64 / 1e9,
-                    host_bytes as f64 / 1e9,
+                    "MoE host plan: bounded inclusive RAM cache {:.2} GiB / {:.2} GiB expert payload; GPU shadows share this budget and remaining Experts stream from SSD",
+                    host_cache_budget as f64 / GIB_F64,
+                    host_bytes as f64 / GIB_F64,
                 );
             } else {
                 // Keep the complete payload in one logical layer-major store, split only BETWEEN
@@ -3360,9 +3481,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     })
                     .collect();
                 tracing::info!(
-                    "MoE host plan: full layer-contiguous RAM store {:.2} GB; RAM budget covers \
+                    "MoE host plan: full layer-contiguous RAM store {:.2} GiB; RAM budget covers \
                      every routed expert, runtime SSD tier disabled",
-                    host_bytes as f64 / 1e9,
+                    host_bytes as f64 / GIB_F64,
                 );
             }
             // No per-pool arena ceiling: each MoE pool is a `bufferDeviceAddress` buffer read by
@@ -3391,7 +3512,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         // that layer that must be simultaneously resident (the within-batch safety
                         // invariant — see `infr_core::pager::Pager::new`'s doc). Decode's rows=1 needs
                         // only `n_used`, but the batched bound subsumes it and `n_expert` slots is tiny
-                        // next to any real budget (Scout: 16 x ~18 MB per role). Capped at `nb` (no
+                        // next to any real budget (Scout: 16 x ~17.2 MiB per role). Capped at `nb` (no
                         // point holding more slots than the pool has distinct experts).
                         // The dynamic Prefill ring can legally degrade to one lane when the user
                         // budget cannot hold its topology target. The old A/B implementation
@@ -3411,19 +3532,24 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .iter()
                 .zip(&pools)
                 .map(|(&(sb, nb, _), p)| {
-                    format!("shared[{:.1}MB] {}/{}", sb as f64 / 1e6, p.n_slots, nb)
+                    format!(
+                        "shared[{:.1} MiB] {}/{}",
+                        sb as f64 / MIB_F64,
+                        p.n_slots,
+                        nb
+                    )
                 })
                 .collect();
             tracing::info!(
                 "MoE pager: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
-             {:.2} GB mapped ReBAR pool budget; Decode size bias {size_cache_bias:+.2} \
-             ({size_cache_bias_source}); host={} {:.2} GB in {host_chunk_count} chunks; \
+             {:.2} GiB device arena budget; Decode size bias {size_cache_bias:+.2} \
+             ({size_cache_bias_source}); host={} {:.2} GiB in {host_chunk_count} chunks; \
              ctx={want_ctx})",
                 cfg.n_layer,
                 pool_desc.join(", "),
-                pager_budget_bytes as f64 / 1e9,
+                pager_budget_bytes as f64 / GIB_F64,
                 host_kind,
-                host_resident_bytes as f64 / 1e9,
+                host_resident_bytes as f64 / GIB_F64,
             );
             // Recurrent hybrids use current + the longest consecutive recurrent run. The pager
             // may lower that target to fit the Expert-cache share, but never spends the runtime
@@ -3436,6 +3562,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 load_reserve_bytes: 0,
                 n_blocks,
                 pools,
+                dynamic_state_reserve_bytes: plan.dynamic_state_reserve_bytes,
+                dynamic_state_max_allocation_bytes,
+                prefill_min_lane_bytes,
+                runtime_reserve_bytes: plan.runtime_reserve_bytes,
                 host_chunks,
                 prefill_target_lanes,
                 prefill_cache_bytes: expert_cache_target_bytes,
@@ -3559,7 +3689,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // path) whenever weights + this session's KV + an HONEST dense activation estimate fit
         // the allocatable VRAM; only a genuine miss streams. The MoE tier's 2 GiB ACT_HEADROOM is
         // sized for pager arenas/staging that a dense-resident session doesn't have — reusing it
-        // here streamed gemma-4-31B (21.9 GB weights on a 24 GB card, decode 33 t/s resident vs
+        // here streamed gemma-4-31B (20.4 GiB weights on a 24 GiB card, decode 33 t/s resident vs
         // ~3 t/s streamed at the PCIe ceiling). If residency is chosen but a later activation
         // alloc still misses (fragmentation, another process grabbing VRAM), the alloc-time VRAM
         // guard fails that request cleanly — INFR_CACHE=<size> is the escape hatch that forces
@@ -3676,10 +3806,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 );
                 if requested > safe {
                     tracing::warn!(
-                        "INFR_CACHE requested {:.2} GB of dense streaming arena but the unified \
-                         VRAM plan leaves {:.2} GB; clamping the arena to the safe remainder",
-                        requested as f64 / 1e9,
-                        safe as f64 / 1e9,
+                        "INFR_CACHE requested {:.2} GiB of dense streaming arena but the unified \
+                         VRAM plan leaves {:.2} GiB; clamping the arena to the safe remainder",
+                        requested as f64 / GIB_F64,
+                        safe as f64 / GIB_F64,
                     );
                 }
                 Some(requested.min(safe))
@@ -3782,7 +3912,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // `DensePagerSession`), NEVER bound as a descriptor, so BOTH pre-BDA caps are
                     // gone — no `maxStorageBufferRange` binding ceiling and no u32 element-reach
                     // limit. A single pool may span well past 4 GiB (matching the paged-MoE arena,
-                    // e.g. Scout's 6.57 GB role pools).
+                    // e.g. Scout's 6.12 GiB role pools).
                     let share =
                         (budget as u128 * (stride * nb) as u128 / total_bytes as u128) as u64;
                     let floor = 2.min(nb).max(1);
@@ -3802,23 +3932,23 @@ pub(crate) fn vulkan_moe_binder<'a>(
             if alloc > budget.max(1) && cache_override.is_none() {
                 // Auto tier only: the floors overran what's actually free — streaming can't help.
                 return Err(anyhow!(
-                    "dense weights exceed VRAM and the leftover budget ({:.2} GB) can't hold \
-                     even the streaming floor ({:.2} GB) — reduce ctx or run on the CPU backend \
+                    "dense weights exceed VRAM and the leftover budget ({:.2} GiB) can't hold \
+                     even the streaming floor ({:.2} GiB) — reduce ctx or run on the CPU backend \
                      (INFR_DEV=cpu)",
-                    budget as f64 / 1e9,
-                    alloc as f64 / 1e9,
+                    budget as f64 / GIB_F64,
+                    alloc as f64 / GIB_F64,
                 ));
             }
             let cached: usize = specs.iter().map(|s| s.n_slots).sum();
             let n_blocks: usize = specs.iter().map(|s| s.n_blocks).sum();
             tracing::info!(
                 "dense streaming: {n_blocks} weight blocks across {} pools, {cached} slots \
-                 cached ({:.2} GB arena + {:.2} GB ring; budget {:.2} GB; ctx={want_ctx}; \
+                 cached ({:.2} GiB arena + {:.2} GiB ring; budget {:.2} GiB; ctx={want_ctx}; \
                  chunk={})",
                 specs.len(),
-                alloc as f64 / 1e9,
-                ring_bytes as f64 / 1e9,
-                (budget + ring_bytes as u64) as f64 / 1e9,
+                alloc as f64 / GIB_F64,
+                ring_bytes as f64 / GIB_F64,
+                (budget + ring_bytes as u64) as f64 / GIB_F64,
                 ubatch_rows(ec).min(want_ctx),
             );
             vk.init_dense_pager(infr_vulkan::pager::DensePagerLayout {
@@ -4909,7 +5039,7 @@ pub(crate) enum WBytes {
     ///
     /// Kept as its COMPONENTS rather than a concatenated buffer, because a binder that pages or
     /// streams the group never wants the bytes at all: it registers the components' file ranges and
-    /// has them read straight into a slot later. Materializing first meant building a multi-MB
+    /// has them read straight into a slot later. Materializing first meant building a multi-MiB
     /// concat per fused group at load and immediately dropping it (and touching every one of those
     /// pages, which for a model that does not fit memory is the cost this whole tier exists to
     /// avoid).
@@ -5178,9 +5308,11 @@ mod seam_helper_tests {
         let payload = 24 * GIB;
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::LegacyCacheBudget(payload as u64),
                 None,
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Full,
@@ -5188,16 +5320,25 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::LegacyCacheBudget((40 * GIB) as u64),
                 None,
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Full,
             "budget above the routed payload must not create a bounded SSD cache"
         );
         assert_eq!(
-            super::moe_host_backing(RamRequest::Auto, Some((64 * GIB) as u64), Some(0), payload,),
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
+                RamRequest::Auto,
+                Some((64 * GIB) as u64),
+                Some(0),
+                0,
+                payload,
+            ),
             super::MoeHostBacking::Full,
             "automatic sizing must select the full store when its post-headroom budget fits"
         );
@@ -5210,39 +5351,103 @@ mod seam_helper_tests {
         let payload = 24 * GIB;
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::LegacyCacheBudget((23 * GIB) as u64),
                 None,
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 23 * GIB }
         );
         assert!(matches!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::Auto,
                 Some((25 * GIB) as u64),
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes } if bytes < payload
         ));
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::TotalProcessBudget(0),
                 Some((64 * GIB) as u64),
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 }
         );
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::Bypass,
                 Some((64 * GIB) as u64),
                 Some(0),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 }
+        );
+    }
+
+    #[test]
+    fn aggressive_moe_auto_spends_to_four_gib_only_for_a_complete_host_store() {
+        use infr_core::config::AutoProfile;
+        use infr_core::hostmem::RamRequest;
+
+        let payload = 24 * GIB;
+        assert_eq!(
+            super::moe_host_backing(
+                AutoProfile::Aggressive,
+                RamRequest::Auto,
+                Some((payload + 4 * GIB) as u64),
+                Some(0),
+                0,
+                payload,
+            ),
+            super::MoeHostBacking::Full,
+            "aggressive auto should remove SSD when the complete payload leaves four GiB"
+        );
+        assert!(matches!(
+            super::moe_host_backing(
+                AutoProfile::Aggressive,
+                RamRequest::Auto,
+                Some((payload + 4 * GIB - 1) as u64),
+                Some(0),
+                0,
+                payload,
+            ),
+            super::MoeHostBacking::Bounded { bytes } if bytes < payload
+        ));
+        assert!(matches!(
+            super::moe_host_backing(
+                AutoProfile::Conservative,
+                RamRequest::Auto,
+                Some((payload + 4 * GIB) as u64),
+                Some(0),
+                0,
+                payload,
+            ),
+            super::MoeHostBacking::Bounded { bytes } if bytes < payload
+        ));
+
+        let large_payload = 80 * GIB;
+        assert_eq!(
+            super::moe_host_backing(
+                AutoProfile::Aggressive,
+                RamRequest::Auto,
+                Some((40 * GIB) as u64),
+                Some(0),
+                0,
+                large_payload,
+            ),
+            super::MoeHostBacking::Bounded { bytes: 32 * GIB },
+            "below full fit, MoE must still use the selected profile's ordinary headroom"
         );
     }
 
@@ -5253,9 +5458,11 @@ mod seam_helper_tests {
         let payload = 80 * GIB;
         assert_eq!(
             super::moe_host_backing(
+                infr_core::config::AutoProfile::Conservative,
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((48 * GIB) as u64),
                 Some((2 * GIB) as u64),
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded {
@@ -5264,7 +5471,28 @@ mod seam_helper_tests {
             "the total target also covers persistent process objects created after planning"
         );
         assert_eq!(
-            super::moe_host_backing(RamRequest::Auto, None, Some(0), payload),
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                Some((48 * GIB) as u64),
+                Some((2 * GIB) as u64),
+                (5 * GIB) as u64,
+                payload,
+            ),
+            super::MoeHostBacking::Bounded {
+                bytes: 43 * GIB - (512 << 20),
+            },
+            "known fixed weights that have not been touched yet still count toward the process total"
+        );
+        assert_eq!(
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::Auto,
+                None,
+                Some(0),
+                0,
+                payload,
+            ),
             super::MoeHostBacking::Bounded { bytes: 0 },
             "auto sizing without a probe must not assume the whole payload fits RAM"
         );
@@ -5302,6 +5530,14 @@ mod seam_helper_tests {
             super::ubatch_rows(&unset),
             1024,
             "no pin, no iGPU: the 1024 default"
+        );
+
+        let mut aggressive = EngineConfig::default();
+        aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        assert_eq!(
+            super::ubatch_rows(&aggressive),
+            2048,
+            "the aggressive discrete default uses a larger prefill chunk"
         );
 
         let pinned = EngineConfig {
@@ -6049,7 +6285,7 @@ mod seam_helper_tests {
     // are this box's 7900 XTX (`/sys/class/drm/card1/device/mem_info_vram_total` = 25 753 026 560,
     // live free ~23.94 GiB on an idle desktop).
 
-    /// RX 7900 XTX, 24 GB.
+    /// RX 7900 XTX, 24 GiB.
     const XTX_TOTAL: u64 = 25_753_026_560;
     /// Live FREE bytes on an idle XTX (~23.94 GiB) — the raw `VramInfo::available` figure, which is
     /// NOT the budget: see [`XTX_ROOM`].
@@ -6506,10 +6742,17 @@ mod seam_helper_tests {
     #[test]
     fn dense_ubatch_ladder_is_the_only_one() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
-        assert_eq!(super::DENSE_UBATCH_LADDER, [512, 256, 128]);
+        assert_eq!(super::DENSE_UBATCH_LADDER, [1024, 512, 256, 128]);
         let unset = EngineConfig::default();
         assert_eq!(super::ubatch_rows(&unset), 1024);
         assert_eq!(super::ubatch_candidates(&unset), vec![1024, 512, 256, 128]);
+
+        let mut aggressive = EngineConfig::default();
+        aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        assert_eq!(
+            super::ubatch_candidates(&aggressive),
+            vec![2048, 1024, 512, 256, 128]
+        );
 
         // Rungs at or above the current height are filtered out — a SHRINK ladder must never
         // raise an integrated GPU past its watchdog-safe default.
@@ -6723,6 +6966,12 @@ mod seam_helper_tests {
         let automatic = EngineConfig::default();
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &automatic),
+            if cfg!(windows) { 3 * GIB } else { 0 }
+        );
+        let mut aggressive = EngineConfig::default();
+        aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
+        assert_eq!(
+            super::session_load_driver_reserve(&cfg, &aggressive),
             if cfg!(windows) {
                 2 * GIB + 512 * MIB
             } else {
@@ -6744,11 +6993,18 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &automatic),
-            if cfg!(windows) {
-                2 * GIB + 512 * MIB
-            } else {
-                0
-            }
+            if cfg!(windows) { 3 * GIB } else { 0 }
+        );
+        assert_eq!(
+            super::session_load_driver_reserve(&cfg, &explicit),
+            if cfg!(windows) { 2 * GIB } else { 0 }
+        );
+
+        cfg.bailingmoe3 = false;
+        cfg.qwen4exp = true;
+        assert_eq!(
+            super::session_load_driver_reserve(&cfg, &automatic),
+            if cfg!(windows) { 3 * GIB } else { 0 }
         );
         assert_eq!(
             super::session_load_driver_reserve(&cfg, &explicit),

@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 
-use super::{ConfigError, PartialConfig};
+use super::{AutoProfile, ConfigError, PartialConfig};
 use crate::{DType, SizeSpec};
 
 /// An environment reader: variable name → value, `None` when unset. An empty value is
@@ -134,6 +134,12 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // policy and stays at its site, and `resolve_infr_dev_index` tolerates an empty value.
     p.device.dev = opt_text(get, "INFR_DEV");
     p.device.ctx = opt_size(get, "INFR_CTX");
+    if let Some(v) = get("INFR_AUTO_PROFILE") {
+        p.device.auto_profile = Some(v.parse::<AutoProfile>().map_err(|()| ConfigError::Env {
+            key: "INFR_AUTO_PROFILE",
+            message: format!("expected conservative or aggressive (got {v:?})"),
+        })?);
+    }
     p.device.vram_budget = opt_size(get, "INFR_VRAM_BUDGET");
     p.device.ram_budget = opt_size(get, "INFR_RAM_BUDGET");
     p.device.vram_reserve = opt_size(get, "INFR_VRAM_RESERVE");
@@ -199,6 +205,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.paging.ring = opt_size(get, "INFR_PAGER_RING");
     p.paging.ring_slots = num(get, "INFR_PAGER_RING_SLOTS");
     p.paging.moe_layer_stream = presence_inv(get, "INFR_NO_MOE_LAYER_STREAM");
+    p.paging.prefill_upload_async = presence_inv(get, "INFR_SYNC_PREFILL_UPLOAD");
     p.paging.moe_size_cache_bias = opt_num(get, "INFR_MOE_SIZE_CACHE_BIAS");
     p.paging.dram = opt_size(get, "INFR_DRAM_CACHE");
     p.paging.dram_bypass = presence(get, "INFR_DRAM_BYPASS");
@@ -399,6 +406,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.debug.coopmat = presence(get, "INFR_DEBUG_COOPMAT");
     p.debug.wide_dispatch = presence(get, "INFR_DEBUG_WIDE_DISPATCH");
     p.debug.chat = presence(get, "INFR_DEBUG_CHAT");
+    p.debug.state_trace = presence(get, "INFR_STATE_TRACE");
     p.debug.moe_counts = presence(get, "INFR_MOE_COUNTS_DEBUG");
     p.debug.moe_counts_dump = presence(get, "INFR_MOE_COUNTS_DUMP");
     p.debug.poison_uninit = presence(get, "INFR_POISON_UNINIT");

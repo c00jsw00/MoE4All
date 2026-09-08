@@ -417,7 +417,7 @@ pub(crate) struct SeamKv {
     /// slots for free (a pure function of the model, not per-conversation state).
     pub(super) self_cond_w: Option<std::sync::Arc<SelfCondWeights>>,
     /// Phase-B/D perf: the in-graph SC soft-embedding weight (`token_embd` dequantized + transposed
-    /// to f16 `[n_embd, n_vocab]`, ~1.4 GB — see the reference's `dg_ensure_sc_embT` and
+    /// to f16 `[n_embd, n_vocab]`, ~1.4 GiB — see the reference's `dg_ensure_sc_embT` and
     /// `build_sc_embt`), built lazily on the FIRST Vulkan/Metal denoise call with SC on. `None` for
     /// CPU (it never sets it) and for every non-diffusion-gemma caller. `Arc` so `fork()`
     /// shares it with forked conversation slots for free — mirrors `self_cond_w`.
@@ -495,25 +495,24 @@ impl SegmentedKvState {
         let layout = SegmentedKvLayout::for_qwen(cfg, max_ctx, k_fmt, v_fmt)
             .ok_or_else(|| anyhow!("segmented KV enabled for a non-Qwen session"))?;
         let segments = layout.segments_for_tokens(tokens);
-        for plane in &layout.planes {
-            let buffer: &dyn Buffer = match plane.kind {
-                PlaneKind::K => kbufs[plane.layer].as_ref(),
-                PlaneKind::V => vbufs[plane.layer].as_ref(),
-                PlaneKind::QsaRaw => qsa_kbufs[plane.layer]
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("missing QSA raw cache for layer {}", plane.layer))?,
-                PlaneKind::QsaBlock => qsa_cbufs[plane.layer]
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("missing QSA block cache for layer {}", plane.layer))?,
-            };
-            be.ensure_segmented_kv(buffer, segments).map_err(|e| {
-                anyhow!(
-                    "commit segmented KV layer {} {:?}: {e}",
-                    plane.layer,
-                    plane.kind
-                )
-            })?;
-        }
+        let buffers: Vec<&dyn Buffer> = layout
+            .planes
+            .iter()
+            .map(|plane| -> AResult<&dyn Buffer> {
+                Ok(match plane.kind {
+                    PlaneKind::K => kbufs[plane.layer].as_ref(),
+                    PlaneKind::V => vbufs[plane.layer].as_ref(),
+                    PlaneKind::QsaRaw => qsa_kbufs[plane.layer].as_deref().ok_or_else(|| {
+                        anyhow!("missing QSA raw cache for layer {}", plane.layer)
+                    })?,
+                    PlaneKind::QsaBlock => qsa_cbufs[plane.layer].as_deref().ok_or_else(|| {
+                        anyhow!("missing QSA block cache for layer {}", plane.layer)
+                    })?,
+                })
+            })
+            .collect::<AResult<_>>()?;
+        be.ensure_segmented_kv_batch(&buffers, segments)
+            .map_err(|e| anyhow!("commit segmented KV growth transaction: {e}"))?;
         self.committed_tokens = (segments * KV_GROW_ROWS).min(max_ctx);
         tracing::info!(
             requested_tokens = tokens,
@@ -589,9 +588,13 @@ pub(super) struct MtpDeltaCkpt {
 pub(super) struct TurnRecurrentCkpt {
     kbufs: Vec<Box<dyn Buffer>>,
     vbufs: Vec<Box<dyn Buffer>>,
+    /// Qwen3.8's model-level PLE convolution history is recurrent state too. Keeping it beside
+    /// the per-layer DeltaNet snapshots makes one stable conversation boundary self-contained.
+    ple_state: Option<Box<dyn Buffer>>,
     layers: Vec<usize>,
     tokens: Vec<u32>,
     copied: Vec<bool>,
+    ple_copied: bool,
     valid: bool,
 }
 
@@ -601,6 +604,13 @@ fn checkpoint_extension_start(checkpoint: &[u32], prompt: &[u32]) -> Option<usiz
 }
 
 impl TurnRecurrentCkpt {
+    pub(super) fn invalidate(&mut self) {
+        self.valid = false;
+        self.tokens.clear();
+        self.copied.fill(false);
+        self.ple_copied = false;
+    }
+
     /// Start replacing the rolling checkpoint with `tokens`. The existing device buffers are
     /// retained; validity is published only after every recurrent layer has been copied.
     pub(super) fn begin(
@@ -609,6 +619,7 @@ impl TurnRecurrentCkpt {
         cfg: &Config,
         src_k: &[Box<dyn Buffer>],
         src_v: &[Box<dyn Buffer>],
+        src_ple: Option<&dyn Buffer>,
         tokens: &[u32],
     ) -> AResult<()> {
         if slot.is_none() {
@@ -630,20 +641,34 @@ impl TurnRecurrentCkpt {
                         .map_err(|e| anyhow!("{e}"))?,
                 );
             }
+            let ple_state = src_ple
+                .map(|src| {
+                    be.alloc(src.len_bytes().max(1), BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))
+                })
+                .transpose()?;
             let copied = vec![false; layers.len()];
             *slot = Some(Self {
                 kbufs,
                 vbufs,
+                ple_state,
                 layers,
                 tokens: Vec::new(),
                 copied,
+                ple_copied: false,
                 valid: false,
             });
         }
         let ck = slot.as_mut().expect("checkpoint was just allocated");
+        if ck.ple_state.is_some() != src_ple.is_some() {
+            return Err(anyhow!(
+                "stable recurrent checkpoint PLE shape changed within one session"
+            ));
+        }
         ck.tokens.clear();
         ck.tokens.extend_from_slice(tokens);
         ck.copied.fill(false);
+        ck.ple_copied = src_ple.is_none();
         ck.valid = false;
         Ok(())
     }
@@ -686,8 +711,37 @@ impl TurnRecurrentCkpt {
         )
         .map_err(|e| anyhow!("{e}"))?;
         self.copied[i] = true;
-        self.valid = !self.tokens.is_empty() && self.copied.iter().all(|&done| done);
+        self.refresh_valid();
         Ok(())
+    }
+
+    /// Capture Qwen3.8's PLE history after the span containing its state update reaches the stable
+    /// boundary. Other recurrent architectures carry no PLE buffer and are already complete.
+    pub(super) fn snapshot_ple(
+        &mut self,
+        be: &dyn Backend,
+        src: Option<&dyn Buffer>,
+    ) -> AResult<()> {
+        match (self.ple_state.as_ref(), src) {
+            (Some(dst), Some(src)) if !self.ple_copied => {
+                be.copy_buffer(src, dst.as_ref(), src.len_bytes())
+                    .map_err(|e| anyhow!("{e}"))?;
+                self.ple_copied = true;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(anyhow!(
+                    "stable recurrent checkpoint PLE source differs from its allocation"
+                ));
+            }
+            _ => {}
+        }
+        self.refresh_valid();
+        Ok(())
+    }
+
+    fn refresh_valid(&mut self) {
+        self.valid =
+            !self.tokens.is_empty() && self.copied.iter().all(|&done| done) && self.ple_copied;
     }
 
     /// Capture every recurrent layer. Used by chunk-major prefill and the per-token path.
@@ -696,10 +750,12 @@ impl TurnRecurrentCkpt {
         be: &dyn Backend,
         src_k: &[Box<dyn Buffer>],
         src_v: &[Box<dyn Buffer>],
+        src_ple: Option<&dyn Buffer>,
     ) -> AResult<()> {
         for i in 0..self.layers.len() {
             self.snapshot_index(be, src_k, src_v, i)?;
         }
+        self.snapshot_ple(be, src_ple)?;
         Ok(())
     }
 }
@@ -865,9 +921,7 @@ impl SeamKv {
 
     fn invalidate_turn_checkpoint(&mut self) {
         if let Some(ck) = self.turn_recurrent_ckpt.as_mut() {
-            ck.valid = false;
-            ck.tokens.clear();
-            ck.copied.fill(false);
+            ck.invalidate();
         }
     }
 
@@ -902,6 +956,17 @@ impl SeamKv {
                 ck.vbufs[i].len_bytes(),
             )
             .map_err(|e| anyhow!("{e}"))?;
+        }
+        match (ck.ple_state.as_ref(), self.ple_state_buf.as_deref()) {
+            (Some(src), Some(dst)) => be
+                .copy_buffer(src.as_ref(), dst, src.len_bytes())
+                .map_err(|e| anyhow!("{e}"))?,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(anyhow!(
+                    "stable recurrent checkpoint PLE target differs from its snapshot"
+                ));
+            }
+            (None, None) => {}
         }
         self.cached.clone_from(&ck.tokens);
         Ok(Some(len))
@@ -1250,7 +1315,7 @@ impl SeamKv {
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoint_extension_start;
+    use super::{checkpoint_extension_start, TurnRecurrentCkpt};
 
     #[test]
     fn recurrent_checkpoint_requires_a_nonempty_strict_extension() {
@@ -1261,5 +1326,26 @@ mod tests {
         assert_eq!(checkpoint_extension_start(&[], &[10]), None);
         assert_eq!(checkpoint_extension_start(&[10, 20], &[10, 20]), None);
         assert_eq!(checkpoint_extension_start(&[10, 20], &[10, 99, 30]), None);
+    }
+
+    #[test]
+    fn invalidating_recurrent_checkpoint_clears_all_publish_metadata() {
+        let mut checkpoint = TurnRecurrentCkpt {
+            kbufs: Vec::new(),
+            vbufs: Vec::new(),
+            ple_state: None,
+            layers: Vec::new(),
+            tokens: vec![10, 20, 30],
+            copied: vec![true, true],
+            ple_copied: true,
+            valid: true,
+        };
+
+        checkpoint.invalidate();
+
+        assert!(!checkpoint.valid);
+        assert!(checkpoint.tokens.is_empty());
+        assert_eq!(checkpoint.copied, [false, false]);
+        assert!(!checkpoint.ple_copied);
     }
 }

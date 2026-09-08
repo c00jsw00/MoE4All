@@ -71,6 +71,7 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.sampling.max_new, 2048);
     // §6.1: `Option` means "the user pinned it"; the 1024 / iGPU-adaptive chain stays at its site.
     assert_eq!(d.device.ubatch, None);
+    assert_eq!(d.device.auto_profile, super::AutoProfile::Conservative);
     assert_eq!(d.device.vram_budget, None);
     assert_eq!(d.device.ram_budget, None);
     assert_eq!(d.device.vram_reserve, None);
@@ -128,6 +129,24 @@ fn default_config_matches_documented_defaults() {
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
     assert_eq!(d.spec.k, 6);
     assert_eq!(d.spec.decode_chain, 8);
+}
+
+#[test]
+fn auto_profile_parses_from_every_configuration_layer() {
+    let from_file =
+        Config::load_from_layers(&[file_layer("[device]\nauto_profile = 'aggressive'\n")]);
+    assert_eq!(
+        from_file.device.auto_profile,
+        super::AutoProfile::Aggressive
+    );
+
+    let from_env = Config::load_from_layers(&[env_layer(&[("INFR_AUTO_PROFILE", "performance")])]);
+    assert_eq!(from_env.device.auto_profile, super::AutoProfile::Aggressive);
+
+    let from_cli = Config::load_from_layers(&[cli_layer(&["device.auto_profile=aggressive"])]);
+    assert_eq!(from_cli.device.auto_profile, super::AutoProfile::Aggressive);
+
+    assert!(try_env_layer(&[("INFR_AUTO_PROFILE", "reckless")]).is_err());
 }
 
 // ── §8.2 / §8.3 / §8.4 — precedence ──────────────────────────────────────────
@@ -327,9 +346,9 @@ fn bad_value_is_an_error_not_a_silent_default() {
 ///
 /// `banana` is not repeated here: [`bad_value_is_an_error_not_a_silent_default`] already sweeps it
 /// across every value-carrying knob. What is here is the spellings that fail for a DIFFERENT reason
-/// than "not a number at all" — a float and a negative for a `u64` MiB count, the empty value, and
-/// a size suffix (`GiB`) that reads like the grammar but is not it. Each must leave the field
-/// unspecified rather than half-parse.
+/// than "not a number at all" — a float and a negative for a `u64` MiB count, plus the empty
+/// value. Each must leave the field unspecified rather than half-parse. The shared size grammar's
+/// canonical IEC suffix is pinned here as accepted alongside its historical short alias.
 #[test]
 fn mib_and_size_string_spellings() {
     let d = Config::default();
@@ -345,19 +364,22 @@ fn mib_and_size_string_spellings() {
     let cfg = Config::load_from_layers(&[env_layer(&[("INFR_KV_OVERFLOW_VRAM_MB", "  512  ")])]);
     assert_eq!(cfg.kv.overflow_vram_mb, Some(512));
 
-    // Size: `1GiB` is NOT the shared grammar's spelling (`1g` is) — it must read as unset, not as
-    // a `1`-byte ring.
-    for raw in ["", "1GiB"] {
+    // Size: canonical IEC and historical short spellings mean the same binary quantity.
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING", "")])]);
+    assert_eq!(
+        cfg.paging.ring, d.paging.ring,
+        "an empty INFR_PAGER_RING must not specify a ring size"
+    );
+    for raw in ["1GiB", "1g"] {
         let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING", raw)])]);
         assert_eq!(
-            cfg.paging.ring, d.paging.ring,
-            "INFR_PAGER_RING={raw:?} must not specify a ring size"
+            cfg.paging.ring,
+            Some(super::SizeSpec::Bytes(1 << 30)),
+            "INFR_PAGER_RING={raw:?}"
         );
     }
-    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_PAGER_RING", "1g")])]);
-    assert_eq!(cfg.paging.ring, Some(super::SizeSpec::Bytes(1 << 30)));
 
-    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_RAM_BUDGET", "50g")])]);
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_RAM_BUDGET", "50GiB")])]);
     assert_eq!(
         cfg.device.ram_budget,
         Some(super::SizeSpec::Bytes(50 << 30))
@@ -1158,6 +1180,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// gpu_pos}` (§6.12's two-crate knobs — the llama half moved, S5 takes the Vulkan half).
     const S4: &[&str] = &[
         "INFR_CACHE",
+        "INFR_AUTO_PROFILE",
         "INFR_DECODE_CHAIN",
         "INFR_MOE_SIZE_CACHE_BIAS",
         "INFR_PROF_STAGES",
@@ -1359,6 +1382,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_API_KEY",
         "INFR_CTX",
         "INFR_DEBUG_CHAT",
+        "INFR_STATE_TRACE",
         "INFR_MAX_TOKENS_CAP",
         "INFR_NO_THINK",
         "INFR_PROF_OUT",
@@ -1397,6 +1421,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_MLA_SG",
         "INFR_NO_Q8_DECODE_CHUNK1024",
         "INFR_NO_MOE_LAYER_STREAM",
+        "INFR_SYNC_PREFILL_UPLOAD",
         "INFR_PAGER_TRACE",
         "INFR_SHUTDOWN_FILE",
         "INFR_EMBEDDING_RUNNER",

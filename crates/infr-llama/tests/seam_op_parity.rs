@@ -54,8 +54,67 @@ fn run(
     o
 }
 
+/// As [`run`], but also download one input that the op mutates in place. Recurrent kernels can
+/// produce the right rows for the current batch while persisting the wrong state for the next
+/// execute, so output-only parity is not enough for them.
+fn run_with_mutated_state(
+    be: &dyn Backend,
+    g: &Graph,
+    inputs: &[(TensorId, &[f32])],
+    weights: &[(TensorId, &[f32])],
+    out: TensorId,
+    out_len: usize,
+    state: TensorId,
+    state_len: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let plan = be.compile(g).expect("compile");
+    let mut keep: Vec<(TensorId, Box<dyn infr_core::backend::Buffer>)> = Vec::new();
+    for (id, data) in inputs {
+        let buf = be
+            .alloc(data.len() * 4, BufferUsage::Activations)
+            .expect("alloc in");
+        be.upload(buf.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        keep.push((*id, buf));
+    }
+    for (id, data) in weights {
+        let buf = be
+            .alloc(data.len() * 4, BufferUsage::Weights)
+            .expect("alloc w");
+        be.upload(buf.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        keep.push((*id, buf));
+    }
+    let obuf = be
+        .alloc(out_len * 4, BufferUsage::Readback)
+        .expect("alloc out");
+    let mut b = Bindings::new();
+    for (id, buf) in &keep {
+        b.bind(*id, buf.as_ref());
+    }
+    b.bind(out, obuf.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+
+    let mut o = vec![0f32; out_len];
+    be.download(obuf.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    let state_buf = keep
+        .iter()
+        .find_map(|(id, buf)| (*id == state).then_some(buf.as_ref()))
+        .expect("mutated state input");
+    let mut s = vec![0f32; state_len];
+    be.download(state_buf, bytemuck::cast_slice_mut(&mut s))
+        .unwrap();
+    (o, s)
+}
+
 fn gpu() -> Option<infr_vulkan::VulkanBackend> {
-    infr_vulkan::VulkanBackend::new().ok()
+    if let Some(index) = std::env::var("INFR_TEST_VULKAN_DEVICE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        infr_vulkan::VulkanBackend::new_on(index).ok()
+    } else {
+        infr_vulkan::VulkanBackend::new().ok()
+    }
 }
 
 /// Does an in-place-mutated recurrent state Input PERSIST across `execute` calls? (Decode runs one
@@ -791,11 +850,14 @@ fn conv1d_silu_parity() {
         return;
     };
     let cpu = infr_cpu::CpuBackend::new();
-    let (rows, cc, kernel) = (4usize, 32usize, 4usize);
+    // Qwen3.8 PLE expands its dilated 4-tap convolution into a 10-tap dense kernel. Use a
+    // realistic short conversation suffix and a nonzero incoming history: output-only parity can
+    // miss a wrong final history that poisons the following decode/turn.
+    let (rows, cc, kernel) = (155usize, 32usize, 10usize);
     let mut g = Graph::new();
     let x = g.input(f32d(rows * cc));
     let w = g.weight(f32d(cc * kernel));
-    let state = g.input(f32d((kernel - 1) * cc)); // zeroed history (calloc)
+    let state = g.input(f32d((kernel - 1) * cc));
     let dst = g.output(f32d(rows * cc));
     g.push(Op::Conv1dSilu {
         x,
@@ -808,25 +870,114 @@ fn conv1d_silu_parity() {
     });
     let xi = gen(rows * cc, 6);
     let wi = gen(cc * kernel, 7);
-    let st = vec![0f32; (kernel - 1) * cc];
-    let c = run(
+    let st = gen((kernel - 1) * cc, 8);
+
+    // Independent token-serial oracle for both the batch output and the persisted history.
+    let mut expected_state = st.clone();
+    let mut expected = vec![0.0f32; rows * cc];
+    for t in 0..rows {
+        for ch in 0..cc {
+            let mut acc = 0.0f32;
+            for k in 0..kernel - 1 {
+                acc += expected_state[k * cc + ch] * wi[ch * kernel + k];
+            }
+            acc += xi[t * cc + ch] * wi[ch * kernel + kernel - 1];
+            expected[t * cc + ch] = acc / (1.0 + (-acc).exp());
+        }
+        expected_state.copy_within(cc.., 0);
+        expected_state[(kernel - 2) * cc..].copy_from_slice(&xi[t * cc..(t + 1) * cc]);
+    }
+
+    let (c, c_state) = run_with_mutated_state(
         &cpu,
         &g,
         &[(x, &xi), (state, &st)],
         &[(w, &wi)],
         dst,
         rows * cc,
+        state,
+        (kernel - 1) * cc,
     );
-    let v = run(
+    let (v, v_state) = run_with_mutated_state(
         &vk,
         &g,
         &[(x, &xi), (state, &st)],
         &[(w, &wi)],
         dst,
         rows * cc,
+        state,
+        (kernel - 1) * cc,
     );
-    println!("Conv1dSilu max_err={:e}", maxerr(&c, &v));
-    assert!(maxerr(&c, &v) < 1e-3, "Conv1dSilu diverges");
+    println!(
+        "Conv1dSilu rows={rows} kernel={kernel} cpu_out={:e} vk_out={:e} cpu_state={:e} vk_state={:e}",
+        maxerr(&expected, &c),
+        maxerr(&expected, &v),
+        maxerr(&expected_state, &c_state),
+        maxerr(&expected_state, &v_state),
+    );
+    assert!(maxerr(&expected, &c) < 1e-5, "CPU Conv1dSilu diverges");
+    assert!(maxerr(&expected, &v) < 1e-3, "Vulkan Conv1dSilu diverges");
+    assert_eq!(c_state, expected_state, "CPU Conv1dSilu final state");
+    assert_eq!(v_state, expected_state, "Vulkan Conv1dSilu final state");
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn conv1d_silu_partition_invariance() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let (rows, split, cc, kernel) = (155usize, 91usize, 32usize, 10usize);
+    let xi = gen(rows * cc, 31);
+    let wi = gen(cc * kernel, 32);
+    let initial = gen((kernel - 1) * cc, 33);
+
+    let run_part = |start: usize, end: usize, state_in: &[f32]| {
+        let part_rows = end - start;
+        let mut g = Graph::new();
+        let x = g.input(f32d(part_rows * cc));
+        let w = g.weight(f32d(cc * kernel));
+        let state = g.input(f32d((kernel - 1) * cc));
+        let dst = g.output(f32d(part_rows * cc));
+        g.push(Op::Conv1dSilu {
+            x,
+            weight: w,
+            state,
+            dst,
+            rows: part_rows as u32,
+            channels: cc as u32,
+            kernel: kernel as u32,
+        });
+        run_with_mutated_state(
+            &vk,
+            &g,
+            &[(x, &xi[start * cc..end * cc]), (state, state_in)],
+            &[(w, &wi)],
+            dst,
+            part_rows * cc,
+            state,
+            (kernel - 1) * cc,
+        )
+    };
+
+    let (full_out, full_state) = run_part(0, rows, &initial);
+    let (prefix_out, prefix_state) = run_part(0, split, &initial);
+    let (suffix_out, split_state) = run_part(split, rows, &prefix_state);
+    let mut split_out = prefix_out;
+    split_out.extend(suffix_out);
+    println!(
+        "Conv1dSilu partition split={split}/{rows} output_max_err={:e} state_max_err={:e}",
+        maxerr(&full_out, &split_out),
+        maxerr(&full_state, &split_state),
+    );
+    assert_eq!(
+        split_out, full_out,
+        "Conv1dSilu output depends on partition"
+    );
+    assert_eq!(
+        split_state, full_state,
+        "Conv1dSilu state depends on partition"
+    );
 }
 
 #[test]
@@ -839,7 +990,7 @@ fn deltanet_chunked_parity() {
         return;
     };
     let cpu = infr_cpu::CpuBackend::new();
-    let (rows, nv, nk, kd, vd) = (130usize, 8usize, 4usize, 128usize, 128usize);
+    let (rows, nv, nk, kd, vd) = (130usize, 6usize, 2usize, 128usize, 128usize);
     let mut g = Graph::new();
     let q = g.input(f32d(rows * nk * kd));
     let k = g.input(f32d(rows * nk * kd));
@@ -887,14 +1038,268 @@ fn deltanet_chunked_parity() {
         (state, &st[..]),
     ];
     let ws = [(a_coef, &aci[..]), (dt_bias, &dti[..])];
-    let c = run(&cpu, &g, &ins, &ws, dst, rows * nv * vd);
-    let vv = run(&vk, &g, &ins, &ws, dst, rows * nv * vd);
+    let state_len = nv * kd * vd;
+    let (c, c_state) =
+        run_with_mutated_state(&cpu, &g, &ins, &ws, dst, rows * nv * vd, state, state_len);
+    let (vv, vv_state) =
+        run_with_mutated_state(&vk, &g, &ins, &ws, dst, rows * nv * vd, state, state_len);
     let e = maxerr(&c, &vv);
-    println!("DeltaNet-chunked rows={rows} max_err={e:e}");
+    let state_e = maxerr(&c_state, &vv_state);
+    println!("DeltaNet-chunked rows={rows} output_max_err={e:e} state_max_err={state_e:e}");
     assert!(
         e < 1e-3,
         "chunked DeltaNet diverges from the sequential oracle"
     );
+    assert!(
+        state_e < 1e-3,
+        "chunked DeltaNet persists a state that diverges from the sequential oracle"
+    );
+
+    // Feed one decode token through a second execute, initialized from each backend's prefill
+    // state. This is the real transition that a long-context chat takes after every prompt turn.
+    let mut dg = Graph::new();
+    let dq = dg.input(f32d(nk * kd));
+    let dk = dg.input(f32d(nk * kd));
+    let dv = dg.input(f32d(nv * vd));
+    let db = dg.input(f32d(nv));
+    let da = dg.input(f32d(nv));
+    let dac = dg.weight(f32d(nv));
+    let ddt = dg.weight(f32d(nv));
+    let ds = dg.input(f32d(state_len));
+    let dout = dg.output(f32d(nv * vd));
+    dg.push(Op::DeltaNet {
+        q: dq,
+        k: dk,
+        v: dv,
+        b: db,
+        a: da,
+        a_coef: dac,
+        dt_bias: ddt,
+        state: ds,
+        dst: dout,
+        rows: 1,
+        n_vhead: nv as u32,
+        n_khead: nk as u32,
+        head_k: kd as u32,
+        head_v: vd as u32,
+        eps: 1e-6,
+        src_stride: 0,
+    });
+    let (dqi, dki, dvi) = (gen(nk * kd, 21), gen(nk * kd, 22), gen(nv * vd, 23));
+    let (dbi, dai) = (gen(nv, 24), gen(nv, 25));
+    let cpu_inputs = [
+        (dq, &dqi[..]),
+        (dk, &dki[..]),
+        (dv, &dvi[..]),
+        (db, &dbi[..]),
+        (da, &dai[..]),
+        (ds, &c_state[..]),
+    ];
+    let vk_inputs = [
+        (dq, &dqi[..]),
+        (dk, &dki[..]),
+        (dv, &dvi[..]),
+        (db, &dbi[..]),
+        (da, &dai[..]),
+        (ds, &vv_state[..]),
+    ];
+    let dws = [(dac, &aci[..]), (ddt, &dti[..])];
+    let (c_next, c_next_state) =
+        run_with_mutated_state(&cpu, &dg, &cpu_inputs, &dws, dout, nv * vd, ds, state_len);
+    let (v_next, v_next_state) =
+        run_with_mutated_state(&vk, &dg, &vk_inputs, &dws, dout, nv * vd, ds, state_len);
+    let next_e = maxerr(&c_next, &v_next);
+    let next_state_e = maxerr(&c_next_state, &v_next_state);
+    println!("DeltaNet prefill->decode output_max_err={next_e:e} state_max_err={next_state_e:e}");
+    assert!(
+        next_e < 1e-3,
+        "first decode token diverges after DeltaNet prefill"
+    );
+    assert!(
+        next_state_e < 1e-3,
+        "first decode token persists a divergent DeltaNet state"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn deltanet_partition_invariance() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let (rows, split, nv, nk, kd, vd) = (155usize, 91usize, 6usize, 2usize, 128usize, 128usize);
+    let qi = gen(rows * nk * kd, 41);
+    let ki = gen(rows * nk * kd, 42);
+    let vi = gen(rows * nv * vd, 43);
+    let bi = gen(rows * nv, 44);
+    let ai = gen(rows * nv, 45);
+    let aci: Vec<f32> = gen(nv, 46).iter().map(|x| -x.abs() - 0.1).collect();
+    let dti = gen(nv, 47);
+    let initial = gen(nv * kd * vd, 48);
+    let state_len = nv * kd * vd;
+
+    let run_part = |start: usize, end: usize, state_in: &[f32]| {
+        let part_rows = end - start;
+        let mut g = Graph::new();
+        let q = g.input(f32d(part_rows * nk * kd));
+        let k = g.input(f32d(part_rows * nk * kd));
+        let v = g.input(f32d(part_rows * nv * vd));
+        let b = g.input(f32d(part_rows * nv));
+        let a = g.input(f32d(part_rows * nv));
+        let a_coef = g.weight(f32d(nv));
+        let dt_bias = g.weight(f32d(nv));
+        let state = g.input(f32d(state_len));
+        let dst = g.output(f32d(part_rows * nv * vd));
+        g.push(Op::DeltaNet {
+            q,
+            k,
+            v,
+            b,
+            a,
+            a_coef,
+            dt_bias,
+            state,
+            dst,
+            rows: part_rows as u32,
+            n_vhead: nv as u32,
+            n_khead: nk as u32,
+            head_k: kd as u32,
+            head_v: vd as u32,
+            eps: 1e-6,
+            src_stride: 0,
+        });
+        run_with_mutated_state(
+            &vk,
+            &g,
+            &[
+                (q, &qi[start * nk * kd..end * nk * kd]),
+                (k, &ki[start * nk * kd..end * nk * kd]),
+                (v, &vi[start * nv * vd..end * nv * vd]),
+                (b, &bi[start * nv..end * nv]),
+                (a, &ai[start * nv..end * nv]),
+                (state, state_in),
+            ],
+            &[(a_coef, &aci), (dt_bias, &dti)],
+            dst,
+            part_rows * nv * vd,
+            state,
+            state_len,
+        )
+    };
+
+    let (full_out, full_state) = run_part(0, rows, &initial);
+    let (prefix_out, prefix_state) = run_part(0, split, &initial);
+    let (suffix_out, split_state) = run_part(split, rows, &prefix_state);
+    let mut split_out = prefix_out;
+    split_out.extend(suffix_out);
+    println!(
+        "DeltaNet partition split={split}/{rows} output_max_err={:e} state_max_err={:e}",
+        maxerr(&full_out, &split_out),
+        maxerr(&full_state, &split_state),
+    );
+    assert_eq!(split_out, full_out, "DeltaNet output depends on partition");
+    assert_eq!(
+        split_state, full_state,
+        "DeltaNet state depends on partition"
+    );
+}
+
+/// Reproduce Qwen3.8's real recurrent shape and repeatedly rebuild/execute the fast sequential
+/// prefill path from identical inputs. The production failure is probabilistic and turns the first
+/// recurrent layer's entire state into NaNs, so a small-shape parity test cannot cover it.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn deltanet_qwen38_seq_is_deterministic() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    const ROWS: usize = 93;
+    const NV: usize = 8;
+    const NK: usize = 16;
+    const KD: usize = 128;
+    const VD: usize = 768;
+    const ATTEMPTS: usize = 32;
+
+    let mut g = Graph::new();
+    let q = g.input(f32d(ROWS * NK * KD));
+    let k = g.input(f32d(ROWS * NK * KD));
+    let v = g.input(f32d(ROWS * NV * VD));
+    let b = g.input(f32d(ROWS * NV));
+    let a = g.input(f32d(ROWS * NV));
+    let a_coef = g.weight(f32d(NV));
+    let dt_bias = g.weight(f32d(NV));
+    let state = g.input(f32d(NV * KD * VD));
+    let dst = g.output(f32d(ROWS * NV * VD));
+    g.push(Op::DeltaNet {
+        q,
+        k,
+        v,
+        b,
+        a,
+        a_coef,
+        dt_bias,
+        state,
+        dst,
+        rows: ROWS as u32,
+        n_vhead: NV as u32,
+        n_khead: NK as u32,
+        head_k: KD as u32,
+        head_v: VD as u32,
+        eps: 1e-6,
+        src_stride: 0,
+    });
+
+    let qi = gen(ROWS * NK * KD, 61);
+    let ki = gen(ROWS * NK * KD, 62);
+    let vi = gen(ROWS * NV * VD, 63);
+    let bi = gen(ROWS * NV, 64);
+    let ai = gen(ROWS * NV, 65);
+    let aci: Vec<f32> = gen(NV, 66).iter().map(|x| -x.abs() - 0.1).collect();
+    let dti = gen(NV, 67);
+    let initial = gen(NV * KD * VD, 68);
+    let inputs = [
+        (q, &qi[..]),
+        (k, &ki[..]),
+        (v, &vi[..]),
+        (b, &bi[..]),
+        (a, &ai[..]),
+        (state, &initial[..]),
+    ];
+    let weights = [(a_coef, &aci[..]), (dt_bias, &dti[..])];
+
+    let mut expected: Option<(Vec<f32>, Vec<f32>)> = None;
+    for attempt in 0..ATTEMPTS {
+        let (out, final_state) = run_with_mutated_state(
+            &vk,
+            &g,
+            &inputs,
+            &weights,
+            dst,
+            ROWS * NV * VD,
+            state,
+            NV * KD * VD,
+        );
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "Qwen3.8 DeltaNet output contains non-finite values on attempt {attempt}"
+        );
+        assert!(
+            final_state.iter().all(|x| x.is_finite()),
+            "Qwen3.8 DeltaNet state contains non-finite values on attempt {attempt}"
+        );
+        if let Some((expected_out, expected_state)) = &expected {
+            assert_eq!(
+                &out, expected_out,
+                "Qwen3.8 DeltaNet output is nondeterministic on attempt {attempt}"
+            );
+            assert_eq!(
+                &final_state, expected_state,
+                "Qwen3.8 DeltaNet state is nondeterministic on attempt {attempt}"
+            );
+        } else {
+            expected = Some((out, final_state));
+        }
+    }
 }
 
 #[test]

@@ -424,6 +424,37 @@ struct ScratchPool {
     in_use: HashSet<ScratchKey>,
 }
 
+struct PagedMmqScratch {
+    counts: ScratchKey,
+    offsets: ScratchKey,
+    fill: ScratchKey,
+    bucket_rows: ScratchKey,
+    bucket_wts: ScratchKey,
+    inv_pos: ScratchKey,
+    qa: ScratchKey,
+    qda: ScratchKey,
+    qsa: ScratchKey,
+    ge: ScratchKey,
+    ue: Option<ScratchKey>,
+    ae: ScratchKey,
+    dqa: ScratchKey,
+    dda: ScratchKey,
+    dsa: ScratchKey,
+    ye: ScratchKey,
+}
+
+struct PagedSmallScratch {
+    gbuf: ScratchKey,
+    ubuf: Option<ScratchKey>,
+    abuf: ScratchKey,
+    ybuf: ScratchKey,
+}
+
+enum PagedMoeScratch {
+    Mmq(PagedMmqScratch),
+    Small(PagedSmallScratch),
+}
+
 impl ScratchPool {
     /// Start a new recording after the previous execute has fully drained. Compact here as well as
     /// at the success tail so an execute that returned through an error path cannot leave several
@@ -650,7 +681,7 @@ fn mmv_decode_enabled(vk: &infr_core::config::VulkanCfg) -> bool {
 /// Multi-warp int8 dp4a decode GEMV route (`native_mmv_mw.comp`, llama's mul_mat_vec_q block:
 /// warp-per-row subgroupAdd, WARPS warps/block) for wave32-native GPUs (NVIDIA/Intel — on Intel
 /// the warps are pinned SG=16 via `caps.sg_pref`). There the AMD-tuned scalar-dequant decode GEMV
-/// runs memory-LATENCY-starved (~30 GB/s of 616 on an RTX 2080 Ti) — a per-op dead end for the
+/// runs memory-LATENCY-starved (~27.9 GiB/s of 574 on an RTX 2080 Ti) — a per-op dead end for the
 /// scalar path, since it is the f32 dequant ALU + the `v[32]` register pressure (not the
 /// reduction) that cap it (a scalar multi-warp variant measured SLOWER than the tree). Only dp4a
 /// (raw int8 blocks, no f32 dequant) breaks the ceiling: Qwen3-1.7B Q4_K_M tg128 17.9 → 61.7 t/s
@@ -916,6 +947,80 @@ fn pooled(
     pool.acquire(tag, bytes, |capacity| {
         be_.alloc_uninit(capacity, BufferUsage::Activations)
     })
+    .map_err(|error| {
+        be(format!(
+            "pooled activation scratch '{tag}' ({bytes} bytes) allocation failed: {error}"
+        ))
+    })
+}
+
+/// Reserve every DeltaNet prefill workspace before a paged graph freezes its first expert LUT.
+/// These buffers are reused across serialized layers; allocating them lazily inside `lower_op`
+/// would let unified VRAM retire an expert slot that an earlier recorded layer still addresses.
+fn preallocate_paged_deltanet_scratch(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    pool: &mut ScratchPool,
+) -> Result<()> {
+    let mut seq = [0usize; 4];
+    let mut split = [0usize; 6];
+    for op in &graph.ops {
+        let Op::DeltaNet {
+            rows,
+            n_vhead,
+            n_khead,
+            head_k,
+            head_v,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let (rows, nv, nk, kd, vd) = (
+            *rows as usize,
+            *n_vhead as usize,
+            *n_khead as usize,
+            *head_k as usize,
+            *head_v as usize,
+        );
+        let chunked = rows >= 2 && be_.cfg().kernels.vulkan.dn_chunk;
+        if chunked
+            && kd == 128
+            && vd.is_multiple_of(crate::recorder::DN_SEQ_NCOL)
+            && be_.cfg().kernels.vulkan.dn_chunk_scan
+            && be_.cfg().kernels.vulkan.dn_split
+        {
+            seq[0] = seq[0].max((rows * nk * kd * 4).max(4));
+            seq[1] = seq[1].max((rows * nk * kd * 4).max(4));
+            seq[2] = seq[2].max((rows * nv * 4).max(4));
+            seq[3] = seq[3].max((rows * nv * 4).max(4));
+        } else if chunked && be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.dn_split {
+            let nchunk = rows.div_ceil(32);
+            split[0] = split[0].max((rows * nk * kd * 4).max(4));
+            split[1] = split[1].max((rows * nk * kd * 4).max(4));
+            split[2] = split[2].max((nchunk * nk * 1024 * 4).max(4));
+            split[3] = split[3].max((nchunk * nk * 1024 * 4).max(4));
+            split[4] = split[4].max((nchunk * nv * 32 * 4).max(4));
+            split[5] = split[5].max((nchunk * nv * 32 * 4).max(4));
+        }
+    }
+    for (tag, bytes) in [
+        ("dn_seq_kn", seq[0]),
+        ("dn_seq_qn", seq[1]),
+        ("dn_seq_bet", seq[2]),
+        ("dn_seq_dec", seq[3]),
+        ("dn_split_kn", split[0]),
+        ("dn_split_qn", split[1]),
+        ("dn_split_dk", split[2]),
+        ("dn_split_dq", split[3]),
+        ("dn_split_bg", split[4]),
+        ("dn_split_gg", split[5]),
+    ] {
+        if bytes != 0 {
+            pooled(pool, be_, tag, bytes)?;
+        }
+    }
+    Ok(())
 }
 
 /// Small-m MoE scratch handle: a pooled `(tag, bytes)` key (the default — rides the per-execute
@@ -1582,7 +1687,7 @@ fn lower_op(
             // Decode (m=1) and non-tileable shapes fall through to the GEMV.
             // Small multi-row batches (m = 2..8: spec-decode verify rows, a short chat-turn
             // suffix prefill) take the multi-row GEMV first — the single-M-tile coopmat GEMM
-            // launches only n/64 workgroups (underfills the GPU: measured 51-182 GB/s effective
+            // launches only n/64 workgroups (underfills the GPU: measured 47-170 GiB/s effective
             // weight stream vs the GEMV class's 292-651 on a 7900 XTX), and the plain GEMV
             // re-streams the weight per row. 7900 XTX, 8B Q4_K shapes: m=2 is 5.6-8.3x the GEMM
             // route, m=4 1.4-4.1x, m=8 1.7-2.6x — EXCEPT very wide n at m>=5 (gate+up n=24576:
@@ -3849,7 +3954,7 @@ fn lower_op(
                 // without the feature (Intel Arc/ANV) previously ran ALL prefill attention on the
                 // scalar per-row `attention_kv` (31% of knob pp512 on Qwen3-14B) or, for rows<64 /
                 // ring-past shapes, the split-K path. This shared-memory fma tile (no subgroup
-                // ops, ≤54 KB shared) takes the flash tier's row floor; unlike flash/nonfa it
+                // ops, ≤54 KiB shared) takes the flash tier's row floor; unlike flash/nonfa it
                 // handles SWA windows AND ring caches (attn_partial's `cap` row-modulo mapping),
                 // so ring-past prefill rides it too. f16 KV only — quantized KV was already
                 // dequanted to the f16 ring-layout scratch above at rows>1 (`k/v_q8_eff` false by
@@ -3878,7 +3983,7 @@ fn lower_op(
                 // f16 scratch above, so k/v_q8_eff are false there by construction).
                 // Rows-BATCHED split tier (rows 12..flash-floor at deep kv): one workgroup per
                 // (head, chunk) streams K/V once per 4-row group through attn_partial_mrows_c256
-                // (7KB LDS). Measured wins over the per-row grid: pp12/16/20@d16384
+                // (7 KiB LDS). Measured wins over the per-row grid: pp12/16/20@d16384
                 // 741->799/822->924/882->1012 t/s, pp16@8k a wash — below rows=12 or kv=8192
                 // the per-row grid's extra workgroups fill the DRAM queue better than the
                 // bandwidth saving pays. hd<=128 (one q vec4 per lane per row); q8 never reaches
@@ -3898,7 +4003,7 @@ fn lower_op(
                     && !(k_q8_eff || v_q8_eff)
                     && mrows_attn != Some(false)
                     && ((rows >= 12 && kv_len >= 8192) || mrows_attn == Some(true));
-                // The batched kernel stages chunk scores in 4KB of LDS → chunk 256; the per-row
+                // The batched kernel stages chunk scores in 4 KiB of LDS → chunk 256; the per-row
                 // grid keeps the adaptive ~32-chunks policy.
                 //
                 // Canvas (DiffusionGemma denoise, slice 7 comparative-attribution against the
@@ -3972,9 +4077,9 @@ fn lower_op(
                 } else if (ring_past || cap_short) && rows >= 64 {
                     // Large-rows ring/capacity-limited prefill: the pm/pl/pacc partials are [rows,
                     // nh, n_chunks, hd] — the ordinary ~32-chunk policy would balloon them (1024
-                    // rows x 32 chunks x hd 256 ≈ 1 GB), and the span is already bounded (window +
+                    // rows x 32 chunks x hd 256 ≈ 1 GiB), and the span is already bounded (window +
                     // rows for a ring, kv_len itself here), so a few big chunks keep the scratch
-                    // ~100s of MB with plenty of workgroups (nh * n_chunks * rows).
+                    // ~100s of MiB with plenty of workgroups (nh * n_chunks * rows).
                     512
                 } else if rows == 1
                     && k_q8_eff
@@ -4005,7 +4110,7 @@ fn lower_op(
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
-                    // set serves every layer instead of n_layer live copies (~1GB each at 8B p8k).
+                    // set serves every layer instead of n_layer live copies (~1 GiB each at 8B p8k).
                     let po = pooled(pool, be_, "flash_po", 8 * mpad * nh * hd * 4)?;
                     let pm = pooled(pool, be_, "flash_pm", 8 * mpad * nh * 4)?;
                     let pl = pooled(pool, be_, "flash_pl", 8 * mpad * nh * 4)?;
@@ -4069,7 +4174,7 @@ fn lower_op(
                     let mpad = rows.div_ceil(64) * 64;
                     let kv_pad = kv_len.div_ceil(256) * 256;
                     // Pooled scores scratch [nh, mpad, kv_pad] f16 + split-K PV partials (≤8
-                    // splits) f32 — ~80MB per attention op, fully written before read (attn_qk
+                    // splits) f32 — ~80 MiB per attention op, fully written before read (attn_qk
                     // fills every [mpad, kv_pad] row; PV partials are written per split before
                     // the reduce), and one set serves every same-shape layer.
                     let s = pooled(pool, be_, "nonfa_s", nh * mpad * kv_pad * 2)?;
@@ -4467,12 +4572,10 @@ fn lower_op(
                 && be_.cfg().kernels.vulkan.dn_split
             {
                 // alloc_uninit: every slot the scan reads is written by norm/gates first.
-                let kn =
-                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
-                let qn =
-                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
-                let bet = be_.alloc_uninit((rows_ * nv_ * 4).max(4), BufferUsage::Activations)?;
-                let dec = be_.alloc_uninit((rows_ * nv_ * 4).max(4), BufferUsage::Activations)?;
+                let kn = pooled(pool, be_, "dn_seq_kn", rows_ * nk_ * kd_ * 4)?;
+                let qn = pooled(pool, be_, "dn_seq_qn", rows_ * nk_ * kd_ * 4)?;
+                let bet = pooled(pool, be_, "dn_seq_bet", rows_ * nv_ * 4)?;
+                let dec = pooled(pool, be_, "dn_seq_dec", rows_ * nv_ * 4)?;
                 rec.deltanet_seq_split(
                     r(*q)?,
                     r(*k)?,
@@ -4483,10 +4586,10 @@ fn lower_op(
                     r(*dt_bias)?,
                     r(*state)?,
                     r(*dst)?,
-                    kn.as_ref(),
-                    qn.as_ref(),
-                    bet.as_ref(),
-                    dec.as_ref(),
+                    pool[&kn].as_ref(),
+                    pool[&qn].as_ref(),
+                    pool[&bet].as_ref(),
+                    pool[&dec].as_ref(),
                     rows_,
                     nv_,
                     nk_,
@@ -4494,7 +4597,6 @@ fn lower_op(
                     vd_,
                     *eps,
                 );
-                transient.extend([kn, qn, bet, dec]);
                 return Ok(());
             }
             // deltanet_chunked_split's prep pass (deltanet_prep.comp) is the ONLY DeltaNet shader
@@ -4506,18 +4608,12 @@ fn lower_op(
             if chunked && be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.dn_split {
                 let nchunk = rows_.div_ceil(32);
                 // alloc_uninit: every slot the scan reads is written by prep/gates first.
-                let kn =
-                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
-                let qn =
-                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
-                let dk =
-                    be_.alloc_uninit((nchunk * nk_ * 1024 * 4).max(4), BufferUsage::Activations)?;
-                let dq =
-                    be_.alloc_uninit((nchunk * nk_ * 1024 * 4).max(4), BufferUsage::Activations)?;
-                let bg =
-                    be_.alloc_uninit((nchunk * nv_ * 32 * 4).max(4), BufferUsage::Activations)?;
-                let gg =
-                    be_.alloc_uninit((nchunk * nv_ * 32 * 4).max(4), BufferUsage::Activations)?;
+                let kn = pooled(pool, be_, "dn_split_kn", rows_ * nk_ * kd_ * 4)?;
+                let qn = pooled(pool, be_, "dn_split_qn", rows_ * nk_ * kd_ * 4)?;
+                let dk = pooled(pool, be_, "dn_split_dk", nchunk * nk_ * 1024 * 4)?;
+                let dq = pooled(pool, be_, "dn_split_dq", nchunk * nk_ * 1024 * 4)?;
+                let bg = pooled(pool, be_, "dn_split_bg", nchunk * nv_ * 32 * 4)?;
+                let gg = pooled(pool, be_, "dn_split_gg", nchunk * nv_ * 32 * 4)?;
                 rec.deltanet_chunked_split(
                     r(*q)?,
                     r(*k)?,
@@ -4528,12 +4624,12 @@ fn lower_op(
                     r(*dt_bias)?,
                     r(*state)?,
                     r(*dst)?,
-                    kn.as_ref(),
-                    qn.as_ref(),
-                    dk.as_ref(),
-                    dq.as_ref(),
-                    bg.as_ref(),
-                    gg.as_ref(),
+                    pool[&kn].as_ref(),
+                    pool[&qn].as_ref(),
+                    pool[&dk].as_ref(),
+                    pool[&dq].as_ref(),
+                    pool[&bg].as_ref(),
+                    pool[&gg].as_ref(),
                     rows_,
                     nv_,
                     nk_,
@@ -4541,7 +4637,6 @@ fn lower_op(
                     vd_,
                     *eps,
                 );
-                transient.extend([kn, qn, dk, dq, bg, gg]);
             } else {
                 // Strided DeltaNet: when q==k==v (all same source buffer), derive stride from
                 // dimensions: 2*nk*kd + nv*vd.  The runner only forms this graph for Vulkan
@@ -5790,9 +5885,8 @@ pub(crate) fn execute_chain(
     // advanced past the tokens it produced. Returning None hands the caller back to its per-token
     // path, which re-draws for the position it actually reaches.
     //
-    // Normally unreachable — the caller's own clamp already collapses the chain to 1 on any
-    // splitting device — but the cap is re-tuned from measurement (`observe_forward`) and can flip
-    // under a concurrent request between that clamp and this call.
+    // Normally unreachable: the caller clamps with the same persistent-replay cap. Keep the exact
+    // command-level check as a backstop for callers that bypass that hint.
     if n > replay.recorded.max_chain() {
         return Ok(None);
     }
@@ -5849,7 +5943,7 @@ fn record_decode_replay(
     // instead of one long one. This preserves the `_dyn`/params/ring decode semantics exactly — the
     // identical dispatch stream is just distributed across command buffers, with a seeded global
     // barrier at each continuation segment's head carrying the cross-segment ordering.
-    let cap = be_.submit_dispatch_cap();
+    let cap = be_.replay_submit_dispatch_cap();
     let mut segments: Vec<crate::recorder::RecordedSegment> = Vec::new();
     let mut rec = be_.recorder_persistent()?;
     // Device-side position stream: seed params to [pos0-1, pos0] and record a one-thread
@@ -6097,6 +6191,9 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &mut local_pool,
         ),
     };
+    if be_.moe_paged() {
+        preallocate_paged_deltanet_scratch(be_, graph, pool)?;
+    }
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
     // carries a `positions` i32 tensor. Read `positions[0]` (decode rows=1, or the start of a
@@ -6175,6 +6272,26 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // blocks (the small-m split's router readback) when residency actually demands it — see
     // `PagedStream`'s doc. Every non-paged graph (the overwhelming common case) never touches any
     // of this and records exactly like before — one recorder, one submit.
+    // A paged single-token graph already submits at its per-layer router/residency boundaries.
+    // On automatic discrete-GPU settings, do not inherit a prefill-calibrated splitter cap and
+    // subdivide those bounded decode segments again. This test is deliberately based on the MoE
+    // input shape rather than replay eligibility: QSA and other stateful decode ops correctly force
+    // this graph down the static path while still carrying exactly one token row.
+    let mut saw_moe = false;
+    let single_token_paged_moe = be_.moe_paged()
+        && graph.ops.iter().all(|op| {
+            let Op::MoeFfn { x, ne, .. } = op else {
+                return true;
+            };
+            saw_moe = true;
+            graph.desc(*x).numel() == *ne as usize
+        })
+        && saw_moe;
+    // Automatic submit calibration owns one complete prefill/batched execute as a sample. Open it
+    // before the first recorder so pager-driven recorder rotations are included in the same GPU-
+    // time round. Single-token paged decode intentionally does not consume a calibration round.
+    let submit_tune_round = be_.begin_submit_tune_round(single_token_paged_moe);
+    let cap = submit_tune_round.cap();
     let mut rec = Some(be_.recorder()?);
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
@@ -6189,11 +6306,10 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // default) bounds the dispatches per command buffer; segments are submitted WITHOUT waiting
     // and run back-to-back on the queue, so the GPU sees the same uninterrupted stream of work —
     // only the watchdog's view changes, from one long job to several short ones.
-    let cap = be_.submit_dispatch_cap();
     let pager_prof = infr_core::pager_profile::active();
     let submit_before = pager_prof.then(infr_core::pager_profile::queue_submit_count);
-    let t_forward = std::time::Instant::now();
     let mut submitted_dispatches = 0usize;
+    let mut splitter_splits = 0usize;
     /// In-flight segments allowed at once. Each one pins a command buffer plus its descriptor
     /// pools until the GPU is done reading them, and the devices that split are exactly the
     /// memory-tight ones — letting every segment of a forward pile up (6+ on a Qwen3-8B prefill
@@ -6246,6 +6362,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // share transient scratch, and the hazard tracking that orders them is per-recorder.
         // Crossing the cap therefore closes the segment at the next op boundary.
         if cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap) {
+            splitter_splits += 1;
             let seg = rec
                 .take()
                 .expect("segment always Some between ops")
@@ -6378,9 +6495,10 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // drained. It is now safe to release superseded capacities from this execute.
         pool.finish_execute();
     }
-    // Feed this forward back into the splitter: `finish` waited the queue idle, so the elapsed
-    // time now covers every segment's GPU execution. See `VulkanBackend::observe_forward`.
-    be_.observe_forward(t_forward.elapsed(), submitted_dispatches);
+    // Every recorder and pager-owned pending segment has now resolved its two GPU timestamps.
+    // Fold this complete sample into the finite auto-tuner; dropping the guard on an earlier error
+    // cancels the partial round instead.
+    submit_tune_round.finish(splitter_splits);
     if let Some(before) = submit_before {
         let submits = infr_core::pager_profile::queue_submit_count().saturating_sub(before);
         infr_core::pager_profile::record_splitter_forward(
@@ -6405,11 +6523,17 @@ fn pooled_usage(
     usage: BufferUsage,
 ) -> Result<ScratchKey> {
     pool.acquire(tag, bytes, |capacity| be_.alloc_uninit(capacity, usage))
+        .map_err(|error| {
+            be(format!(
+                "pooled {usage:?} scratch '{tag}' ({bytes} bytes) allocation failed: {error}"
+            ))
+        })
 }
 
 /// Host side of paged execution, per `execute_static` call: Dense streaming owns the ring cursor,
 /// MoE owns the LUT cursor plus in-flight compute, and both end fully drained. The full MoE payload
-/// is CPU-only; runtime transfers are direct writes into the mapped ReBAR arena.
+/// is CPU-only; runtime transfers select direct mapped writes, imported-host DMA, or staged copies
+/// according to the arena and source capabilities.
 ///
 /// Ring rotation (`rotate_stream`): when the current ring half can't hold a miss, the ambient
 /// recorder is submitted WITHOUT waiting (`Recorder::finish_nowait`) and staging continues into
@@ -6447,8 +6571,12 @@ impl PrefillUploader {
                     let result = command
                         .after
                         .map_or(Ok(()), |segment| segment.wait().map_err(|e| e.to_string()));
-                    let result =
-                        result.and_then(|()| command.job.execute().map_err(|e| e.to_string()));
+                    let result = result.and_then(|()| {
+                        command
+                            .job
+                            .execute_on_host_worker()
+                            .map_err(|e| e.to_string())
+                    });
                     if done
                         .send(PrefillUploadCompletion { buf_id, result })
                         .is_err()
@@ -6497,7 +6625,7 @@ struct PagedStream {
     tape_cursor: usize,
     /// Prefill compute segments that do not consume a staging-ring region.
     compute_pending: std::collections::VecDeque<crate::recorder::PendingSegment>,
-    /// Dedicated producer for whole-layer Host -> mapped-ReBAR copies. It owns the layer fence
+    /// Dedicated producer for whole-layer Host -> mapped-device-arena copies. It owns the layer fence
     /// while waiting for a ring lane to become reusable, so upload progress is independent from
     /// graph recording and from whether the active layer is Attention or DeltaNet.
     prefill_uploader: Option<PrefillUploader>,
@@ -6660,11 +6788,10 @@ fn retain_prefill_compute(
     Ok(())
 }
 
-// The small-m Decode Down-overlap path also submits the Gate/Up work without waiting, then
-// observes whether it is still live while the missing Down weights are pushed. Keep that probe
-// independent from the Prefill layer-ring producer: Decode may use either the dense staging ring
-// or the general compute queue, but it never transfers ownership of its segment to the Prefill
-// uploader.
+// Decode's hit-first path submits resident/shared UGD without waiting, then observes whether it is
+// still live while complete miss triplets are promoted. Keep that probe independent from the
+// Prefill layer-ring producer: Decode may use either the dense staging ring or the general compute
+// queue, but it never transfers ownership of its segment to the Prefill uploader.
 #[derive(Clone, Copy)]
 enum PrefetchComputeProbe {
     Ring(usize),
@@ -6847,7 +6974,7 @@ fn stage_dense_linear<'a>(
     }
 }
 
-/// CPU-push `ids` (layer-LOCAL) of `buf_id`'s role from the unique host store into final ReBAR LRU
+/// Upload `ids` (layer-LOCAL) of `buf_id`'s role from the unique host store into final device LRU
 /// slots, then freeze the layer's LUT window. `ids` empty means residency is already guaranteed.
 fn stage_and_window<'a>(
     be_: &'a VulkanBackend,
@@ -6870,15 +6997,13 @@ fn stage_and_window<'a>(
         let push = {
             let mut guard = be_.moe_pager().lock().unwrap();
             let sess = guard.as_mut().expect("paged execution requires a session");
-            sess.push_role_cpu(buf_id, ids, scan)?
+            sess.push_role_cpu(be_, buf_id, ids, scan)?
         };
         if let Some(recorder) = rec.as_ref() {
             push.record(recorder)?;
         } else {
-            // Full-Host-Store Down overlap intentionally has no open recorder here: Gate/Up is
-            // already executing while the host writes Down. Dropping preserves that established
-            // CPU-copy window instead of serializing Down DMA behind the submitted compute.
-            drop(push);
+            // Callers without an ambient recorder must explicitly complete prepared transfers.
+            push.complete_without_recorder(be_)?;
         }
     }
     let mut guard = be_.moe_pager().lock().unwrap();
@@ -6904,14 +7029,14 @@ fn stage_layer_and_window<'a>(
     let mut guard = be_.moe_pager().lock().unwrap();
     let sess = guard.as_mut().expect("paged execution requires a session");
     if !already_current {
-        sess.push_prefill_layer_cpu(buf_id)?;
+        sess.push_prefill_layer_cpu(be_, buf_id)?;
     }
     sess.layer_lut_window(&mut ps.tape_cursor, buf_id, n_expert)
 }
 
 fn run_prefill_job_sync(be_: &VulkanBackend, job: crate::pager::PrefillCopyJob) -> Result<()> {
     let buf_id = job.buf_id();
-    job.execute()?;
+    job.execute(be_)?;
     be_.moe_pager()
         .lock()
         .unwrap()
@@ -6932,10 +7057,18 @@ fn prefetch_next_moe_layer<'a>(
     current_gate_id: usize,
 ) -> Result<()> {
     ps.poll_prefill_uploads(be_)?;
-    // Dense streaming can attach staging-ring lifetime to this same segment. That uncommon mixed
-    // path keeps a synchronous correctness fallback; ordinary paged MoE has cursor=0 and uses the
-    // fully asynchronous worker below.
-    let synchronous = ps.cursor > 0;
+    // Dense streaming can attach staging-ring lifetime to this same segment. A transfer endpoint
+    // that cannot run on the existing host producer also takes the synchronous correctness path.
+    // This property is frozen during model setup, so previous uploads are drained before the next
+    // layer reserves a lane exactly as they were before transport was abstracted.
+    let synchronous = !be_.cfg().paging.prefill_upload_async
+        || !be_
+            .moe_pager()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("paged execution requires a session")
+            .prefill_host_worker_ready();
     if synchronous {
         ps.finish_prefill_uploads(be_)?;
     }
@@ -7487,13 +7620,67 @@ fn execute_paged_moe<'a>(
     if !layer_stream && !stage_ids.is_empty() && !stream_synced_for_cpu_push {
         sync_stream(be_, rec, ps)?;
     }
+
+    // Unified VRAM may loan cold expert cells to runtime scratch. Acquire the complete workspace
+    // before freezing any LUT address for this op; otherwise a later lazy allocation can retire a
+    // slot that the just-recorded LUT still names, turning the expert pointer into scratch memory.
+    let paged_mmq_ok = infr_core::tensor::moe_paged_mmq_ok;
+    let paged_mmq_act_ok = if *fused_gate_up {
+        matches!(act, Activation::Silu | Activation::Gelu)
+    } else {
+        matches!(act, Activation::Silu)
+    };
+    let use_paged_mmq = rows > moe_small_m_threshold(be_)
+        && be_.caps().i8_dot
+        && paged_mmq_act_ok
+        && paged_mmq_ok(gdt)
+        && paged_mmq_ok(udt)
+        && paged_mmq_ok(ddt);
+    let moe_scratch = if use_paged_mmq {
+        let n_pairs = n_slots;
+        let npad = n_pairs.div_ceil(64) * 64 + 64;
+        PagedMoeScratch::Mmq(PagedMmqScratch {
+            counts: pooled(pool, be_, "moe_pgb_counts", n_expert * 4)?,
+            offsets: pooled(pool, be_, "moe_pgb_offsets", n_expert * 4)?,
+            fill: pooled(pool, be_, "moe_pgb_fill", n_expert * 4)?,
+            bucket_rows: pooled(pool, be_, "moe_pgb_brows", n_pairs * 4)?,
+            bucket_wts: pooled(pool, be_, "moe_pgb_bwts", n_pairs * 4)?,
+            inv_pos: pooled(pool, be_, "moe_pgb_ipos", n_pairs * 4)?,
+            qa: pooled(pool, be_, "moe_pgb_qa", npad * ne)?,
+            qda: pooled(pool, be_, "moe_pgb_qda", npad * (ne / 32) * 2)?,
+            qsa: pooled(pool, be_, "moe_pgb_qsa", npad * (ne / 32) * 2)?,
+            ge: pooled(pool, be_, "moe_pgb_ge", npad * gu_width * 4)?,
+            ue: if *fused_gate_up {
+                None
+            } else {
+                Some(pooled(pool, be_, "moe_pgb_ue", npad * nff * 4)?)
+            },
+            ae: pooled(pool, be_, "moe_pgb_ae", npad * nff * 4)?,
+            dqa: pooled(pool, be_, "moe_pgb_dqa", npad * nff)?,
+            dda: pooled(pool, be_, "moe_pgb_dda", npad * (nff / 32) * 2)?,
+            dsa: pooled(pool, be_, "moe_pgb_dsa", npad * (nff / 32) * 2)?,
+            ye: pooled(pool, be_, "moe_pgb_ye", npad * ne * 4)?,
+        })
+    } else {
+        PagedMoeScratch::Small(PagedSmallScratch {
+            gbuf: pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?,
+            ubuf: if *fused_gate_up {
+                None
+            } else {
+                Some(pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?)
+            },
+            abuf: pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?,
+            ybuf: pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?,
+        })
+    };
     let mut active_mask = all_active_mask;
     let mut shared_batch_preopened = false;
-    // Decode-only hit-first trial: when some complete Gate/Up/Down triplets are already resident,
-    // launch those slots before blocking on the remaining host promotions. The original slot
-    // order is retained through a kernel mask, so router weights and the final accumulation stay
-    // byte-for-byte in their ordinary layout. Keep the pager epoch open across both halves: miss
-    // insertion may then use any cold slot except the hit weights still being read by the GPU.
+    let mut promotion_probe = None;
+    // Decode-only hit-first schedule: launch complete resident Gate/Up/Down triplets together with
+    // the shared expert while every missing triplet is promoted. The original slot order is
+    // retained through a kernel mask, so router weights and final accumulation stay byte-for-byte
+    // in their ordinary layout. Keep the pager epoch open across both halves: miss insertion may
+    // then use any cold slot except the hit weights still being read by the GPU.
     if !layer_stream
         && rows == 1
         && !*fused_gate_up
@@ -7501,17 +7688,14 @@ fn execute_paged_moe<'a>(
         && stage_ids.len() == n_used
         && n_used <= u32::BITS as usize
     {
-        let (hit_mask, bounded) = {
+        let hit_mask = {
             let guard = be_.moe_pager().lock().unwrap();
             let sess = guard.as_ref().expect("paged execution requires a session");
-            (
-                sess.routed_roles_resident_mask(&[gate_id, up_id, down_id], stage_ids.as_slice())?,
-                sess.role_uses_bounded_host_tier(gate_id)?,
-            )
+            sess.routed_roles_resident_mask(&[gate_id, up_id, down_id], stage_ids.as_slice())?
         };
         // Without a shared expert, an empty hit set still has no useful first-stage work. With
         // one, shared-only is useful work and overlaps the all-miss host promotion as requested.
-        if bounded && hit_mask != routed_mask && (hit_mask != 0 || shared.is_some()) {
+        if hit_mask != routed_mask && (hit_mask != 0 || shared.is_some()) {
             let mut hit_ids = Vec::with_capacity(n_used);
             let mut miss_ids = Vec::with_capacity(n_used);
             for (slot, &expert) in stage_ids.iter().enumerate() {
@@ -7521,32 +7705,47 @@ fn execute_paged_moe<'a>(
                     miss_ids.push(expert);
                 }
             }
-            let shared = {
+            let (shared, hit_push) = {
                 let mut guard = be_.moe_pager().lock().unwrap();
                 let sess = guard.as_mut().expect("paged execution requires a session");
                 let shared = sess.begin_shared_batch(&[gate_id, up_id, down_id])?;
-                if shared && !hit_ids.is_empty() {
-                    sess.push_roles_cpu(
+                let push = if shared && !hit_ids.is_empty() {
+                    Some(sess.push_roles_cpu(
+                        be_,
                         &[
                             (gate_id, hit_ids.as_slice()),
                             (up_id, hit_ids.as_slice()),
                             (down_id, hit_ids.as_slice()),
                         ],
                         false,
-                    )?;
-                }
-                shared
+                    )?)
+                } else {
+                    None
+                };
+                (shared, push)
             };
+            if let Some(push) = hit_push {
+                // The residency mask makes this empty in the ordinary case. Explicitly consume it
+                // so a future concurrent pager can never silently drop an unexpected promotion.
+                push.complete_without_recorder(be_)?;
+            }
             if shared {
                 let gate_hit_w =
                     stage_and_window(be_, rec, ps, gate_id, &[], n_expert, false, true)?;
                 let up_hit_w = stage_and_window(be_, rec, ps, up_id, &[], n_expert, false, true)?;
                 let down_hit_w =
                     stage_and_window(be_, rec, ps, down_id, &[], n_expert, false, true)?;
-                let gbuf = pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?;
-                let ubuf = pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?;
-                let abuf = pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?;
-                let ybuf = pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?;
+                let PagedMoeScratch::Small(scratch) = &moe_scratch else {
+                    unreachable!("decode hit-first path always uses small-m scratch")
+                };
+                let (gbuf, ubuf, abuf, ybuf) = (
+                    scratch.gbuf,
+                    scratch
+                        .ubuf
+                        .expect("hit-first excludes fused gate/up scratch"),
+                    scratch.abuf,
+                    scratch.ybuf,
+                );
                 let rec2 = rec.as_ref().expect("segment always Some between ops");
                 rec2.zero(pool[&gbuf].as_ref(), physical_slots * gu_width);
                 rec2.zero(pool[&ubuf].as_ref(), physical_slots * nff);
@@ -7647,7 +7846,7 @@ fn execute_paged_moe<'a>(
                         first_mask,
                     );
                 }
-                submit_prefill_compute(rec, ps)?;
+                promotion_probe = Some(submit_prefill_compute(rec, ps)?);
                 let fresh = be_.recorder()?;
                 fresh.seed_barrier();
                 fresh.arena_stream_barrier();
@@ -7666,29 +7865,32 @@ fn execute_paged_moe<'a>(
     rec.as_ref()
         .expect("segment always Some between ops")
         .arena_stream_barrier();
-    let (shared_batch, bounded_host_batch) = if shared_batch_preopened {
-        (true, true)
+    let shared_batch = if shared_batch_preopened {
+        true
     } else if !layer_stream && !stage_ids.is_empty() && !*fused_gate_up {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
-        let shared = sess.begin_shared_batch(&[gate_id, up_id, down_id])?;
-        let bounded = shared && sess.role_uses_bounded_host_tier(gate_id)?;
-        (shared, bounded)
+        sess.begin_shared_batch(&[gate_id, up_id, down_id])?
     } else {
-        (false, false)
+        false
     };
-    // On one shared size pool, resolving all three roles before moving bytes gives the host tier
-    // enough independent work to saturate SSD/RAM/ReBAR. Keep it restricted to the bounded tier:
-    // the complete Host Store has no parallel promotion work here, so batching Down would only
-    // discard its useful overlap with Gate/Up compute on Qwen/Ling-style models.
-    let roles_batched = bounded_host_batch;
+    // Resolve all roles before moving bytes whenever they share one physical pool. This preserves
+    // one pager epoch and one transfer batch for full-RAM, bounded-RAM and SSD backing alike.
+    let roles_batched = shared_batch;
     if roles_batched {
+        let overlap = if let Some(probe) = promotion_probe {
+            let profile = infr_core::pager_profile::active();
+            Some((probe, profile && prefetch_compute_live(ps, probe)?))
+        } else {
+            None
+        };
         let push = {
             let mut guard = be_.moe_pager().lock().unwrap();
             guard
                 .as_mut()
                 .expect("paged execution requires a session")
                 .push_roles_cpu(
+                    be_,
                     &[
                         (gate_id, stage_ids.as_slice()),
                         (up_id, stage_ids.as_slice()),
@@ -7698,6 +7900,14 @@ fn execute_paged_moe<'a>(
                 )?
         };
         push.record(rec.as_ref().expect("segment always Some between ops"))?;
+        if let Some((probe, compute_live_at_start)) = overlap {
+            if infr_core::pager_profile::active() {
+                infr_core::pager_profile::record_prefetch_window(
+                    compute_live_at_start,
+                    prefetch_compute_live(ps, probe)?,
+                );
+            }
+        }
     }
     let role_stage_ids = if roles_batched {
         &[][..]
@@ -7734,26 +7944,10 @@ fn execute_paged_moe<'a>(
             shared_batch,
         )?
     };
-    let down_has_miss = if roles_batched {
-        false
-    } else if !layer_stream && !stage_ids.is_empty() {
-        let guard = be_.moe_pager().lock().unwrap();
-        let sess = guard.as_ref().expect("paged execution requires a session");
-        !sess.routed_all_resident(down_id, &stage_ids)?
+    let down_w = if layer_stream {
+        stage_layer_and_window(be_, rec, ps, down_id, n_expert)?
     } else {
-        false
-    };
-    let overlap_down = !layer_stream
-        && !stage_ids.is_empty()
-        && down_has_miss
-        && rows <= moe_small_m_threshold(be_)
-        && be_.prefers_decode_down_overlap();
-    let down_w = if overlap_down {
-        None
-    } else if layer_stream {
-        Some(stage_layer_and_window(be_, rec, ps, down_id, n_expert)?)
-    } else {
-        Some(stage_and_window(
+        stage_and_window(
             be_,
             rec,
             ps,
@@ -7762,7 +7956,7 @@ fn execute_paged_moe<'a>(
             n_expert,
             touch_all,
             shared_batch,
-        )?)
+        )?
     };
     // RAW: make every direct HOST write to the mapped arena visible before the first dispatch
     // below reads it by pointer. Covers both batched and small-m paged expert kernels.
@@ -7781,226 +7975,196 @@ fn execute_paged_moe<'a>(
     // `_xpg` kernel builds (`infr_core::tensor::MOE_MMQ_PAGED_DTYPES` — the FULL
     // `MOE_MMQ_DTYPES` set, mirror checked by `moe_mmq_drift_test`) + activation + dp4a
     // support; anything else stays on the id-GEMV arm below, which is shape-general.
-    {
-        let paged_mmq_ok = infr_core::tensor::moe_paged_mmq_ok;
-        let act_ok = if *fused_gate_up {
-            // Fused callers ship GeGLU (gemma-4 MoE / DiffusionGemma) or SwiGLU — same set the
-            // resident fused arm accepts.
-            matches!(act, Activation::Silu | Activation::Gelu)
-        } else {
-            matches!(act, Activation::Silu)
-        };
-        if rows > moe_small_m_threshold(be_)
-            && be_.caps().i8_dot
-            && act_ok
-            && paged_mmq_ok(gdt)
-            && paged_mmq_ok(udt)
-            && paged_mmq_ok(ddt)
-        {
-            let n_pairs = n_slots;
-            // The GEMM As stage reads up to 63 rows past a segment end — pad the packed row
-            // dimension so the LAST expert's overread stays in-bounds (the resident arm's npad).
-            let npad = n_pairs.div_ceil(64) * 64 + 64;
-            let counts = pooled(pool, be_, "moe_pgb_counts", n_expert * 4)?;
-            let offsets = pooled(pool, be_, "moe_pgb_offsets", n_expert * 4)?;
-            let fill = pooled(pool, be_, "moe_pgb_fill", n_expert * 4)?;
-            let bucket_rows = pooled(pool, be_, "moe_pgb_brows", n_pairs * 4)?;
-            let bucket_wts = pooled(pool, be_, "moe_pgb_bwts", n_pairs * 4)?;
-            let inv_pos = pooled(pool, be_, "moe_pgb_ipos", n_pairs * 4)?;
-            let qa = pooled(pool, be_, "moe_pgb_qa", npad * ne)?;
-            let qda = pooled(pool, be_, "moe_pgb_qda", npad * (ne / 32) * 2)?;
-            let qsa = pooled(pool, be_, "moe_pgb_qsa", npad * (ne / 32) * 2)?;
-            // Fused: `ge` holds the single wide [n_pairs, 2*nff] gate|up GEMM output (the
-            // resident batched fused arm's shape); `ue` is unused/unallocated.
-            let ge = pooled(pool, be_, "moe_pgb_ge", npad * gu_width * 4)?;
-            let ue = if *fused_gate_up {
-                None
-            } else {
-                Some(pooled(pool, be_, "moe_pgb_ue", npad * nff * 4)?)
-            };
-            let ae = pooled(pool, be_, "moe_pgb_ae", npad * nff * 4)?;
-            let dqa = pooled(pool, be_, "moe_pgb_dqa", npad * nff)?;
-            let dda = pooled(pool, be_, "moe_pgb_dda", npad * (nff / 32) * 2)?;
-            let dsa = pooled(pool, be_, "moe_pgb_dsa", npad * (nff / 32) * 2)?;
-            let ye = pooled(pool, be_, "moe_pgb_ye", npad * ne * 4)?;
+    if let PagedMoeScratch::Mmq(scratch) = &moe_scratch {
+        let n_pairs = n_slots;
+        let counts = scratch.counts;
+        let offsets = scratch.offsets;
+        let fill = scratch.fill;
+        let bucket_rows = scratch.bucket_rows;
+        let bucket_wts = scratch.bucket_wts;
+        let inv_pos = scratch.inv_pos;
+        let qa = scratch.qa;
+        let qda = scratch.qda;
+        let qsa = scratch.qsa;
+        let ge = scratch.ge;
+        let ue = scratch.ue;
+        let ae = scratch.ae;
+        let dqa = scratch.dqa;
+        let dda = scratch.dda;
+        let dsa = scratch.dsa;
+        let ye = scratch.ye;
 
-            let rec2 = rec.as_ref().expect("segment always Some between ops");
-            let xb = r(*x)?;
-            rec2.zero(pool[&counts].as_ref(), n_expert);
-            // Clear the scatter's `fill` counters here (independent of `counts`) so the parallel
-            // clear overlaps the count/scan rather than riding the 1-lane serial scan.
-            rec2.zero(pool[&fill].as_ref(), n_expert);
-            rec2.moe_bucket_count(pool[&ids_key].as_ref(), pool[&counts].as_ref(), n_pairs);
-            rec2.moe_bucket_scan(pool[&counts].as_ref(), pool[&offsets].as_ref(), n_expert);
-            let dsb: Option<&dyn Buffer> = match down_scale {
-                Some(ds) => Some(r(*ds)?),
-                None => None,
-            };
-            rec2.moe_bucket_scatter(
-                pool[&ids_key].as_ref(),
-                pool[&wts].as_ref(),
-                pool[&offsets].as_ref(),
-                pool[&fill].as_ref(),
-                pool[&bucket_rows].as_ref(),
-                pool[&bucket_wts].as_ref(),
-                pool[&inv_pos].as_ref(),
-                dsb,
-                n_pairs,
-                n_used,
-            );
-            rec2.quant_q8_gather(
-                xb,
-                pool[&bucket_rows].as_ref(),
+        let rec2 = rec.as_ref().expect("segment always Some between ops");
+        let xb = r(*x)?;
+        rec2.zero(pool[&counts].as_ref(), n_expert);
+        // Clear the scatter's `fill` counters here (independent of `counts`) so the parallel
+        // clear overlaps the count/scan rather than riding the 1-lane serial scan.
+        rec2.zero(pool[&fill].as_ref(), n_expert);
+        rec2.moe_bucket_count(pool[&ids_key].as_ref(), pool[&counts].as_ref(), n_pairs);
+        rec2.moe_bucket_scan(pool[&counts].as_ref(), pool[&offsets].as_ref(), n_expert);
+        let dsb: Option<&dyn Buffer> = match down_scale {
+            Some(ds) => Some(r(*ds)?),
+            None => None,
+        };
+        rec2.moe_bucket_scatter(
+            pool[&ids_key].as_ref(),
+            pool[&wts].as_ref(),
+            pool[&offsets].as_ref(),
+            pool[&fill].as_ref(),
+            pool[&bucket_rows].as_ref(),
+            pool[&bucket_wts].as_ref(),
+            pool[&inv_pos].as_ref(),
+            dsb,
+            n_pairs,
+            n_used,
+        );
+        rec2.quant_q8_gather(
+            xb,
+            pool[&bucket_rows].as_ref(),
+            pool[&qa].as_ref(),
+            pool[&qda].as_ref(),
+            pool[&qsa].as_ref(),
+            n_pairs,
+            ne,
+        );
+        {
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().expect("checked above");
+            // Same `MOE_MMQ_SACT_DTYPES` split as the resident arm (gate/up can each
+            // independently be any `paged_mmq_ok` member).
+            let gate_needs_sact = infr_core::tensor::moe_mmq_needs_sact(gdt);
+            rec2.matmul_mmq_experts_paged(
+                gdt,
+                "expert_gateup",
                 pool[&qa].as_ref(),
                 pool[&qda].as_ref(),
-                pool[&qsa].as_ref(),
-                n_pairs,
+                gate_needs_sact.then(|| pool[&qsa].as_ref()),
+                sess.arena_addr(gate_id)?,
+                sess.slot_bytes(gate_id)? as u32,
+                sess.tape(),
+                gate_w as usize,
+                pool[&counts].as_ref(),
+                pool[&offsets].as_ref(),
+                pool[&ge].as_ref(),
+                rows,
                 ne,
+                gu_width,
+                n_expert,
+                n_used,
             );
-            {
-                let guard = be_.moe_pager().lock().unwrap();
-                let sess = guard.as_ref().expect("checked above");
-                // Same `MOE_MMQ_SACT_DTYPES` split as the resident arm (gate/up can each
-                // independently be any `paged_mmq_ok` member).
-                let gate_needs_sact = infr_core::tensor::moe_mmq_needs_sact(gdt);
+            if let Some(ue) = &ue {
+                // The up GEMM reads the same quantized activations and writes its own buffer —
+                // disjoint from the gate GEMM, no barrier needed (resident arm's pattern).
+                rec2.suppress_sync(true);
+                let up_needs_sact = infr_core::tensor::moe_mmq_needs_sact(udt);
                 rec2.matmul_mmq_experts_paged(
-                    gdt,
+                    udt,
                     "expert_gateup",
                     pool[&qa].as_ref(),
                     pool[&qda].as_ref(),
-                    gate_needs_sact.then(|| pool[&qsa].as_ref()),
-                    sess.arena_addr(gate_id)?,
-                    sess.slot_bytes(gate_id)? as u32,
+                    up_needs_sact.then(|| pool[&qsa].as_ref()),
+                    sess.arena_addr(up_id)?,
+                    sess.slot_bytes(up_id)? as u32,
                     sess.tape(),
-                    gate_w as usize,
+                    up_w as usize,
                     pool[&counts].as_ref(),
                     pool[&offsets].as_ref(),
-                    pool[&ge].as_ref(),
+                    pool[ue].as_ref(),
                     rows,
                     ne,
-                    gu_width,
+                    nff,
                     n_expert,
                     n_used,
                 );
-                if let Some(ue) = &ue {
-                    // The up GEMM reads the same quantized activations and writes its own buffer —
-                    // disjoint from the gate GEMM, no barrier needed (resident arm's pattern).
-                    rec2.suppress_sync(true);
-                    let up_needs_sact = infr_core::tensor::moe_mmq_needs_sact(udt);
-                    rec2.matmul_mmq_experts_paged(
-                        udt,
-                        "expert_gateup",
-                        pool[&qa].as_ref(),
-                        pool[&qda].as_ref(),
-                        up_needs_sact.then(|| pool[&qsa].as_ref()),
-                        sess.arena_addr(up_id)?,
-                        sess.slot_bytes(up_id)? as u32,
-                        sess.tape(),
-                        up_w as usize,
-                        pool[&counts].as_ref(),
-                        pool[&offsets].as_ref(),
-                        pool[ue].as_ref(),
-                        rows,
-                        ne,
-                        nff,
-                        n_expert,
-                        n_used,
-                    );
-                    rec2.suppress_sync(false);
-                }
+                rec2.suppress_sync(false);
             }
-            if *weight_before {
-                rec2.moe_weight_scale(
-                    pool[&ge].as_ref(),
-                    pool[&bucket_wts].as_ref(),
-                    n_pairs,
-                    gu_width,
-                );
-                if let Some(ue) = &ue {
-                    rec2.moe_weight_scale(
-                        pool[ue].as_ref(),
-                        pool[&bucket_wts].as_ref(),
-                        n_pairs,
-                        nff,
-                    );
-                }
+        }
+        if *weight_before {
+            rec2.moe_weight_scale(
+                pool[&ge].as_ref(),
+                pool[&bucket_wts].as_ref(),
+                n_pairs,
+                gu_width,
+            );
+            if let Some(ue) = &ue {
+                rec2.moe_weight_scale(pool[ue].as_ref(), pool[&bucket_wts].as_ref(), n_pairs, nff);
             }
-            match &ue {
-                // Split: gate and up are separate [n_pairs, nff] buffers.
-                Some(ue) => rec2.silu_mul(
+        }
+        match &ue {
+            // Split: gate and up are separate [n_pairs, nff] buffers.
+            Some(ue) => rec2.silu_mul(
+                pool[&ge].as_ref(),
+                pool[ue].as_ref(),
+                pool[&ae].as_ref(),
+                n_pairs * nff,
+                *swiglu_clamp,
+            ),
+            // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second per
+            // row) from the single wide GEMM above — the resident batched fused arm's shape.
+            None => match act {
+                Activation::Silu => rec2.silu_mul_fused(
                     pool[&ge].as_ref(),
-                    pool[ue].as_ref(),
                     pool[&ae].as_ref(),
-                    n_pairs * nff,
+                    n_pairs,
+                    nff,
                     *swiglu_clamp,
                 ),
-                // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second per
-                // row) from the single wide GEMM above — the resident batched fused arm's shape.
-                None => match act {
-                    Activation::Silu => rec2.silu_mul_fused(
-                        pool[&ge].as_ref(),
-                        pool[&ae].as_ref(),
-                        n_pairs,
-                        nff,
-                        *swiglu_clamp,
-                    ),
-                    Activation::Gelu => rec2.gelu_mul_fused(
-                        pool[&ge].as_ref(),
-                        pool[&ae].as_ref(),
-                        n_pairs,
-                        nff,
-                        *swiglu_clamp,
-                    ),
-                    Activation::Sigmoid => unreachable!("act_ok gate above excludes Sigmoid"),
-                },
-            }
-            rec2.quant_q8(
-                pool[&ae].as_ref(),
+                Activation::Gelu => rec2.gelu_mul_fused(
+                    pool[&ge].as_ref(),
+                    pool[&ae].as_ref(),
+                    n_pairs,
+                    nff,
+                    *swiglu_clamp,
+                ),
+                Activation::Sigmoid => unreachable!("act_ok gate above excludes Sigmoid"),
+            },
+        }
+        rec2.quant_q8(
+            pool[&ae].as_ref(),
+            pool[&dqa].as_ref(),
+            pool[&dda].as_ref(),
+            pool[&dsa].as_ref(),
+            n_pairs,
+            nff,
+        );
+        {
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_ref().expect("checked above");
+            let down_needs_sact = infr_core::tensor::moe_mmq_needs_sact(ddt);
+            rec2.matmul_mmq_experts_paged(
+                ddt,
+                "expert_down",
                 pool[&dqa].as_ref(),
                 pool[&dda].as_ref(),
-                pool[&dsa].as_ref(),
-                n_pairs,
-                nff,
-            );
-            {
-                let guard = be_.moe_pager().lock().unwrap();
-                let sess = guard.as_ref().expect("checked above");
-                let down_needs_sact = infr_core::tensor::moe_mmq_needs_sact(ddt);
-                rec2.matmul_mmq_experts_paged(
-                    ddt,
-                    "expert_down",
-                    pool[&dqa].as_ref(),
-                    pool[&dda].as_ref(),
-                    down_needs_sact.then(|| pool[&dsa].as_ref()),
-                    sess.arena_addr(down_id)?,
-                    sess.slot_bytes(down_id)? as u32,
-                    sess.tape(),
-                    down_w.expect("batched path stages Down before dispatch") as usize,
-                    pool[&counts].as_ref(),
-                    pool[&offsets].as_ref(),
-                    pool[&ye].as_ref(),
-                    rows,
-                    nff,
-                    ne,
-                    n_expert,
-                    n_used,
-                );
-            }
-            rec2.moe_scatter_reduce(
+                down_needs_sact.then(|| pool[&dsa].as_ref()),
+                sess.arena_addr(down_id)?,
+                sess.slot_bytes(down_id)? as u32,
+                sess.tape(),
+                down_w as usize,
+                pool[&counts].as_ref(),
+                pool[&offsets].as_ref(),
                 pool[&ye].as_ref(),
-                pool[&bucket_wts].as_ref(),
-                pool[&inv_pos].as_ref(),
-                r(*dst)?,
                 rows,
+                nff,
                 ne,
+                n_expert,
                 n_used,
-                *weight_before,
             );
-            if layer_stream {
-                prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
-            }
-            return Ok(()); // recorded inline — the ambient segment stays open
         }
+        rec2.moe_scatter_reduce(
+            pool[&ye].as_ref(),
+            pool[&bucket_wts].as_ref(),
+            pool[&inv_pos].as_ref(),
+            r(*dst)?,
+            rows,
+            ne,
+            n_used,
+            *weight_before,
+        );
+        if layer_stream {
+            prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
+        }
+        return Ok(()); // recorded inline — the ambient segment stays open
     }
 
     // ── Small-m id-GEMV arm: the paged expert GEMVs (arena + frozen tape window, LOCAL ids)
@@ -8008,14 +8172,13 @@ fn execute_paged_moe<'a>(
     // exactly mirroring the non-paged small-m arm (including its fused-gate_up shape: one
     // double-width GEMV into a gate|up buffer, split by the fused activation kernel). Recorded
     // inline into the ambient segment like the batched arm above.
-    let gbuf = pooled(pool, be_, "moe_paged_g", physical_slots * gu_width * 4)?;
-    let ubuf = if *fused_gate_up {
-        None
-    } else {
-        Some(pooled(pool, be_, "moe_paged_u", physical_slots * nff * 4)?)
+    let PagedMoeScratch::Small(scratch) = &moe_scratch else {
+        unreachable!("non-MMQ paged MoE path requires small-m scratch")
     };
-    let abuf = pooled(pool, be_, "moe_paged_a", physical_slots * nff * 4)?;
-    let ybuf = pooled(pool, be_, "moe_paged_y", physical_slots * ne * 4)?;
+    let gbuf = scratch.gbuf;
+    let ubuf = scratch.ubuf;
+    let abuf = scratch.abuf;
+    let ybuf = scratch.ybuf;
     let n_act = physical_slots * nff;
     let rec2 = rec.as_ref().expect("segment always Some between ops");
     let xb = r(*x)?;
@@ -8152,38 +8315,6 @@ fn execute_paged_moe<'a>(
             },
         }
     }
-    let down_w = if let Some(window) = down_w {
-        window
-    } else {
-        // Gate/Up and activation do not read the Down role pool. Launch them first, then direct-
-        // push Down misses while that independent GPU work is live. The fresh recorder is queue-
-        // ordered after the first segment and its seed/barrier publishes the Host writes before
-        // the Down GEMV. The next layer's ordinary sync drains this pending segment and tape.
-        let probe = submit_prefill_compute(rec, ps)?;
-        let profile = infr_core::pager_profile::active();
-        let compute_live_at_start = profile && prefetch_compute_live(ps, probe)?;
-        let window = stage_and_window(
-            be_,
-            rec,
-            ps,
-            down_id,
-            &stage_ids,
-            n_expert,
-            touch_all,
-            shared_batch,
-        )?;
-        if profile {
-            infr_core::pager_profile::record_prefetch_window(
-                compute_live_at_start,
-                prefetch_compute_live(ps, probe)?,
-            );
-        }
-        let fresh = be_.recorder()?;
-        fresh.seed_barrier();
-        fresh.arena_stream_barrier();
-        *rec = Some(fresh);
-        window
-    };
     let rec2 = rec.as_ref().expect("segment always Some between ops");
     {
         let guard = be_.moe_pager().lock().unwrap();

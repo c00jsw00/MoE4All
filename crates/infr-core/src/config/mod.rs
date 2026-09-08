@@ -46,6 +46,39 @@ pub use partial::{ConfigValue, SetPathError};
 
 use partial::cfg_struct;
 
+/// Policy used when a resource or execution knob is left to automatic selection.
+///
+/// Explicit values always win over this profile. `Conservative` is the shipped default and keeps
+/// the pre-profile behavior; `Aggressive` spends more of the measured RAM/VRAM headroom and lets
+/// startup calibration explore higher-throughput execution shapes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutoProfile {
+    #[default]
+    Conservative,
+    Aggressive,
+}
+
+impl std::str::FromStr for AutoProfile {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "conservative" | "safe" => Ok(Self::Conservative),
+            "aggressive" | "performance" | "perf" => Ok(Self::Aggressive),
+            _ => Err(()),
+        }
+    }
+}
+
+impl std::fmt::Display for AutoProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Conservative => "conservative",
+            Self::Aggressive => "aggressive",
+        })
+    }
+}
+
 // ── sections ─────────────────────────────────────────────────────────────────
 
 cfg_struct! {
@@ -57,6 +90,10 @@ cfg_struct! {
         dev: Option<String> = None,
         /// `INFR_CTX`: context length (the shared size grammar).
         ctx: Option<SizeSpec> = None,
+        /// `INFR_AUTO_PROFILE`: policy for values left on automatic selection. Explicit RAM/VRAM,
+        /// ubatch and submit-splitter values remain authoritative. The conservative default is the
+        /// behavior shipped before profiles were introduced.
+        auto_profile: AutoProfile = AutoProfile::Conservative,
         /// `INFR_VRAM_BUDGET`: total device-memory budget for this backend. Unlike
         /// `paging.cache`, this includes resident weights, KV, runtime scratch and paging arenas.
         /// Percentages resolve against total device-local memory.
@@ -170,6 +207,9 @@ cfg_struct! {
         /// Keep as many complete expert layers resident as fit and stream the remainder as whole
         /// layers during prefill. Decode reuses the same arena as the ordinary expert LRU.
         moe_layer_stream: bool = true,
+        /// Upload future streamed MoE layers on the host worker while the GPU computes the current
+        /// layer. `INFR_SYNC_PREFILL_UPLOAD` disables the overlap for diagnostics.
+        prefill_upload_async: bool = true,
         /// `INFR_MOE_SIZE_CACHE_BIAS`: optional Decode arena weighting between distinct per-expert
         /// tensor sizes. Positive values favor larger tensors and negative values favor smaller.
         /// `None` auto-enables the validated `+2` bias only for a balanced two-size layout where
@@ -475,7 +515,7 @@ cfg_struct! {
         /// AIR → GPU-ISA back end for every kernel, every launch.
         ///
         /// This caches the BACK end only: `MTLLibrary` exposes no way to serialize the AIR it
-        /// compiled from MSL, so the ~340 KB front-end compile in `Pipelines::build` still runs
+        /// compiled from MSL, so the ~340 KiB front-end compile in `Pipelines::build` still runs
         /// every launch (see `infr-metal/src/pcache.rs`).
         ///
         /// Has NO env key, like [`CpuCfg::reference`] — settable
@@ -695,8 +735,8 @@ cfg_struct! {
         ///
         /// A single HTTPS connection to the HF CDN is the ceiling, not the link, so a pull is
         /// worth spreading over several. Measured against `unsloth/DeepSeek-V3.2-GGUF`'s Q2_K
-        /// shards (`curl` to `/dev/null`, 25 s per run): one connection sustained 8.8 MB/s, five
-        /// sustained 78.7 MB/s — 15.7 MB/s EACH, so the per-connection rate went UP rather than
+        /// shards (`curl` to `/dev/null`, 25 s per run): one connection sustained 8.39 MiB/s, five
+        /// sustained 75.1 MiB/s — 15.0 MiB/s EACH, so the per-connection rate went UP rather than
         /// down. Five were nowhere near the point where they start competing, which is why the
         /// default sits above five.
         ///
@@ -705,10 +745,10 @@ cfg_struct! {
         ///
         /// * a split model is `-NNNNN-of-MMMMM` shards, fetched one file per connection;
         /// * a model shipped as ONE file — `unsloth/DeepSeek-V3.2-GGUF`'s `UD-TQ1_0` is a single
-        ///   161 GB GGUF — is split into byte ranges instead, fetched several at a time and
+        ///   150 GiB GGUF — is split into byte ranges instead, fetched several at a time and
         ///   reassembled (measured on that object through `infr pull` itself, same 60-second
-        ///   window: 11.4 MB/s at `1`, 80.5 MB/s at the default `8`; the whole 161 GB pull ran at
-        ///   80.0 MB/s end to end);
+        ///   window: 10.9 MiB/s at `1`, 76.8 MiB/s at the default `8`; the whole 150 GiB pull ran at
+        ///   76.3 MiB/s end to end);
         /// * and the tail of a shard set, where fewer files remain than there are connections,
         ///   gives the leftovers to the files still going.
         ///
@@ -737,6 +777,9 @@ cfg_struct! {
         wide_dispatch: bool = false,
         /// `INFR_DEBUG_CHAT`.
         chat: bool = false,
+        /// `INFR_STATE_TRACE`: one compact state-selection line per model request. Intended for
+        /// diagnosing recurrent/QSA continuation corruption without logging per token.
+        state_trace: bool = false,
         /// `INFR_MOE_COUNTS_DEBUG`.
         moe_counts: bool = false,
         /// `INFR_MOE_COUNTS_DUMP`.

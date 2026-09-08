@@ -31,7 +31,7 @@
 ///
 /// **A cgroup memory limit overrides it.** `/proc/meminfo` is host-wide and knows nothing about the
 /// limit a container or a `systemd-run --scope -p MemoryMax=` puts on this process — measured on
-/// this box, an 8 GB scope still reports 54.6 GB available. Sizing an anonymous arena from that
+/// this box, an 8 GiB scope still reports 54.6 GiB available. Sizing an anonymous arena from that
 /// figure is an OOM kill, so the smaller of the two wins.
 pub fn available_bytes() -> Option<u64> {
     let observed = platform_available_bytes()?;
@@ -155,8 +155,8 @@ fn windows_process_resident_bytes() -> Option<u64> {
 #[cfg(any(target_os = "linux", test))]
 fn parse_process_resident(text: &str) -> Option<u64> {
     let line = text.lines().find(|line| line.starts_with("VmRSS:"))?;
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 /// Memory this process may still commit before its cgroup kills it, or `None` when no ancestor
@@ -216,7 +216,7 @@ fn read_u64(path: &std::path::Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Pull `MemAvailable` (in kB, as `/proc/meminfo` always reports it) out of the file's text.
+/// Pull `MemAvailable` out of `/proc/meminfo`. Linux labels the binary KiB value as `kB`.
 ///
 /// Split from the read so the parse is testable against a literal — the one machine this runs on
 /// cannot produce a file with the field missing, which is the case worth checking.
@@ -224,15 +224,15 @@ fn read_u64(path: &std::path::Path) -> Option<u64> {
 fn parse_mem_available(text: &str) -> Option<u64> {
     let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
     // `MemAvailable:   12345678 kB`
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 #[cfg(any(target_os = "linux", test))]
 fn parse_mem_total(text: &str) -> Option<u64> {
     let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
 }
 
 /// Never take the last of the machine's memory: the larger of this and the bounded
@@ -251,6 +251,13 @@ const HEADROOM_FRACTION: u64 = 4;
 /// large hosts.
 const HEADROOM_FRACTION_MAX: u64 = 32 << 30;
 
+/// Opt-in performance profile: retain a smaller but still substantial host reserve. On the common
+/// 64 GiB workstation shape this gives the cache roughly 2-3 GiB more than the conservative
+/// policy while still leaving at least 8 GiB and one fifth of currently available memory alone.
+const AGGRESSIVE_HEADROOM_MIN: u64 = 8 << 30;
+const AGGRESSIVE_HEADROOM_FRACTION: u64 = 5;
+const AGGRESSIVE_HEADROOM_FRACTION_MAX: u64 = 24 << 30;
+
 /// Below this an arena is not worth building: the tier costs a copy per streamed block, and a
 /// budget this small holds so little of a model that the hit rate cannot pay for it.
 const MIN_USEFUL: u64 = 256 << 20;
@@ -267,8 +274,34 @@ const MIN_USEFUL: u64 = 256 << 20;
 ///
 /// Returns `0` when nothing worth having is left, which callers treat as "stay on the mmap path".
 pub fn auto_cache_bytes(available: u64, committed: u64, pageable: u64) -> u64 {
-    let proportional = (available / HEADROOM_FRACTION).min(HEADROOM_FRACTION_MAX);
-    let headroom = HEADROOM_MIN.max(proportional);
+    auto_cache_bytes_for_profile(
+        crate::config::AutoProfile::Conservative,
+        available,
+        committed,
+        pageable,
+    )
+}
+
+/// Profile-aware form of [`auto_cache_bytes`]. Explicit total-process/cache budgets do not call
+/// this function and therefore remain exact regardless of the automatic profile.
+pub fn auto_cache_bytes_for_profile(
+    profile: crate::config::AutoProfile,
+    available: u64,
+    committed: u64,
+    pageable: u64,
+) -> u64 {
+    let (minimum, fraction, maximum) = match profile {
+        crate::config::AutoProfile::Conservative => {
+            (HEADROOM_MIN, HEADROOM_FRACTION, HEADROOM_FRACTION_MAX)
+        }
+        crate::config::AutoProfile::Aggressive => (
+            AGGRESSIVE_HEADROOM_MIN,
+            AGGRESSIVE_HEADROOM_FRACTION,
+            AGGRESSIVE_HEADROOM_FRACTION_MAX,
+        ),
+    };
+    let proportional = (available / fraction).min(maximum);
+    let headroom = minimum.max(proportional);
     let usable = available
         .saturating_sub(committed)
         .saturating_sub(headroom)
@@ -379,6 +412,26 @@ pub fn streaming_arena_plan(
     unified: bool,
     pageable: u64,
 ) -> ArenaPlan {
+    streaming_arena_plan_for_profile(
+        crate::config::AutoProfile::Conservative,
+        request,
+        available,
+        process_resident,
+        unified,
+        pageable,
+    )
+}
+
+/// Profile-aware form of [`streaming_arena_plan`]. The profile is consulted only for
+/// [`RamRequest::Auto`]; every explicit request retains its existing exact semantics.
+pub fn streaming_arena_plan_for_profile(
+    profile: crate::config::AutoProfile,
+    request: RamRequest,
+    available: Option<u64>,
+    process_resident: Option<u64>,
+    unified: bool,
+    pageable: u64,
+) -> ArenaPlan {
     match request {
         // `Bypass` outranks a size: it is the one that says "no host cache at all", which a
         // number cannot express. It exists so the unified-memory shape can be exercised on a
@@ -403,7 +456,7 @@ pub fn streaming_arena_plan(
     let Some(available) = available else {
         return ArenaPlan::Skip(Skip::NoProbe);
     };
-    match auto_cache_bytes(available, 0, pageable) {
+    match auto_cache_bytes_for_profile(profile, available, 0, pageable) {
         0 => ArenaPlan::Skip(Skip::TooLittle),
         n => ArenaPlan::Take(n),
     }
@@ -416,6 +469,24 @@ pub fn streaming_arena_plan(
 /// path is zero-copy and an arena could only add copies, so paging a model that fits would be a
 /// regression. An explicit request still wins over that test in both directions.
 pub fn cpu_arena_plan(
+    request: RamRequest,
+    available: Option<u64>,
+    process_resident: Option<u64>,
+    pageable: u64,
+) -> ArenaPlan {
+    cpu_arena_plan_for_profile(
+        crate::config::AutoProfile::Conservative,
+        request,
+        available,
+        process_resident,
+        pageable,
+    )
+}
+
+/// Profile-aware form of [`cpu_arena_plan`]. Explicit requests bypass automatic headroom exactly
+/// as they do in the conservative compatibility wrapper.
+pub fn cpu_arena_plan_for_profile(
+    profile: crate::config::AutoProfile,
     request: RamRequest,
     available: Option<u64>,
     process_resident: Option<u64>,
@@ -445,7 +516,7 @@ pub fn cpu_arena_plan(
     if pageable <= available {
         return ArenaPlan::Skip(Skip::Fits);
     }
-    match auto_cache_bytes(available, 0, pageable) {
+    match auto_cache_bytes_for_profile(profile, available, 0, pageable) {
         0 => ArenaPlan::Skip(Skip::TooLittle),
         n => ArenaPlan::Take(n),
     }
@@ -458,7 +529,7 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     #[test]
-    fn parses_mem_available_in_kb() {
+    fn parses_mem_available_from_linux_kb_field() {
         let text = "MemTotal:       65780000 kB\nMemFree:         2000000 kB\n\
                     MemAvailable:   43000000 kB\nBuffers:          100000 kB\n";
         assert_eq!(parse_mem_available(text), Some(43_000_000 * 1024));
@@ -481,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_process_resident_in_kb() {
+    fn parses_process_resident_from_linux_kb_field() {
         let text = "Name:\tinfr\nVmSize:\t100000 kB\nVmRSS:\t12345 kB\nRssAnon:\t8000 kB\n";
         assert_eq!(parse_process_resident(text), Some(12_345 * 1024));
         assert_eq!(parse_process_resident("Name:\tinfr\n"), None);
@@ -568,6 +639,46 @@ mod tests {
     #[test]
     fn a_workstation_keeps_a_quarter_available() {
         assert_eq!(auto_cache_bytes(52 * GIB, 0, u64::MAX), 39 * GIB);
+    }
+
+    #[test]
+    fn aggressive_profile_uses_more_ram_but_keeps_substantial_headroom() {
+        let available = 52 * GIB;
+        let conservative = auto_cache_bytes(available, 0, u64::MAX);
+        let aggressive = auto_cache_bytes_for_profile(
+            crate::config::AutoProfile::Aggressive,
+            available,
+            0,
+            u64::MAX,
+        );
+        assert!(aggressive > conservative);
+        assert!(available - aggressive >= AGGRESSIVE_HEADROOM_MIN);
+        assert_eq!(
+            aggressive,
+            available - available / AGGRESSIVE_HEADROOM_FRACTION
+        );
+    }
+
+    #[test]
+    fn explicit_ram_budget_is_profile_independent() {
+        let request = RamRequest::TotalProcessBudget(40 * GIB);
+        let conservative = streaming_arena_plan_for_profile(
+            crate::config::AutoProfile::Conservative,
+            request,
+            Some(52 * GIB),
+            Some(2 * GIB),
+            false,
+            u64::MAX,
+        );
+        let aggressive = streaming_arena_plan_for_profile(
+            crate::config::AutoProfile::Aggressive,
+            request,
+            Some(52 * GIB),
+            Some(2 * GIB),
+            false,
+            u64::MAX,
+        );
+        assert_eq!(aggressive, conservative);
     }
 
     #[test]

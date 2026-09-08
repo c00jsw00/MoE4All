@@ -62,7 +62,7 @@ fn flash_split_count(
 /// `deltanet_seq.comp`'s `NCOL`.
 ///
 /// Raising NCOL cuts the redundant k̂/q̂ cache re-reads (every column-workgroup of a head reads the
-/// same row each token, ~1.07 GB/layer of L2 traffic at NCOL=1) and lets the NCOL reductions
+/// same row each token, ~1.07 GiB/layer of L2 traffic at NCOL=1) and lets the NCOL reductions
 /// pipeline — but it divides the wave count by NCOL, and this kernel is latency-bound, so the two
 /// effects fight and the curve has an interior optimum. Measured, Ornith-35B pp512, scan total over
 /// the 30 DeltaNet layers: NCOL=1 → 10.07ms (2048 waves), NCOL=2 → 8.29ms (1024), NCOL=4 → 9.42ms
@@ -243,8 +243,8 @@ fn native_id_sg_choice(
     // IQ2_S is deliberately NOT here. Its expert gate/up is the mirrored shape (in_f=2048,
     // out_f=512), and out_f=512 both falls under this band AND is where the SG route loses badly:
     // forced on (MINOUT=512), native_idm_iq2s went 49.8 → 117.2ms (NR=2) / 85.8ms (NR=4) / 86.8ms
-    // (NR=8), dragging tg128 136 → 121-127. A 32-lane workgroup has to stage the same 8 KB table
-    // with half the tree kernel's threads, and 8 KB of LDS on a single-wave workgroup collapses
+    // (NR=8), dragging tg128 136 → 121-127. A 32-lane workgroup has to stage the same 8 KiB table
+    // with half the tree kernel's threads, and 8 KiB of LDS on a single-wave workgroup collapses
     // occupancy — the staging amortization NR buys never pays that back. Eliminating the staging
     // (codebook in an L2-resident BUFFER instead of per-workgroup LDS) is the real fix for the
     // gate/up shape and is NOT what this tier does; ablating grid_init() outright measured
@@ -905,6 +905,10 @@ pub struct Recorder<'a> {
     /// — far beyond any fixed max_sets). The last entry is the active pool; `alloc_set` appends a
     /// fresh one on ERROR_OUT_OF_POOL_MEMORY.
     pools: std::cell::RefCell<Vec<vk::DescriptorPool>>,
+    /// Buffers referenced only by commands recorded in this recorder. Keeping an `Arc` here makes
+    /// temporary transfer sources survive until blocking finish, or move into `PendingSegment`
+    /// when the command buffer is submitted without waiting.
+    buffer_keepalive: std::cell::RefCell<Vec<std::sync::Arc<dyn Buffer>>>,
     /// Buffers written since the last barrier (for read-after-write / write-after-write detection).
     dirty_writes: RefCell<HashSet<vk::Buffer>>,
     /// Buffers read since the last barrier (for write-after-read detection).
@@ -930,6 +934,11 @@ pub struct Recorder<'a> {
     /// (`kind:mM:KxN`) instead of the bare kernel name. Read once at construction.
     op_shapes: bool,
     query_pool: vk::QueryPool,
+    /// Whole-command-buffer timestamps used only while the automatic submit cap is calibrating.
+    /// Unlike `query_pool`, this has exactly two queries and remains compatible with nowait
+    /// submission; ownership moves to `PendingSegment` until its fence is collected.
+    submit_query_pool: std::cell::Cell<vk::QueryPool>,
+    submit_timing_token: std::cell::Cell<Option<crate::SubmitTimingToken>>,
     ts_labels: RefCell<Vec<&'static str>>,
     /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
     ts_dropped: std::cell::Cell<usize>,
@@ -966,7 +975,7 @@ pub struct Recorder<'a> {
 /// not at graph-build time: `execute_static` re-walks `for op in &graph.ops` and re-records every
 /// dispatch on EVERY execute. A per-call `Box::leak` therefore leaked one small string per op per
 /// forward pass — on a ~400-op graph at 50 tok/s that is ~20k leaked strings a second, on the
-/// order of tens of MB per minute, growing without bound for as long as the profile runs. The
+/// order of tens of MiB per minute, growing without bound for as long as the profile runs. The
 /// `next_label.get().is_none()` guard did not help: it only skips labels that an explicit
 /// `label_next` already claimed, it is not a shape registry.
 ///
@@ -1102,11 +1111,32 @@ impl<'a> Recorder<'a> {
             vk::QueryPool::null()
         };
 
+        let (submit_query_pool, submit_timing_token) = if !persistent {
+            backend.shared.take_submit_timing_query().map_or(
+                (vk::QueryPool::null(), None),
+                |(pool, token)| {
+                    unsafe {
+                        device.cmd_reset_query_pool(cmd, pool, 0, 2);
+                        device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            pool,
+                            0,
+                        );
+                    }
+                    (pool, Some(token))
+                },
+            )
+        } else {
+            (vk::QueryPool::null(), None)
+        };
+
         Ok(Self {
             be: backend,
             cmd,
             owns_transient: std::cell::Cell::new(true),
             pools: std::cell::RefCell::new(vec![pool]),
+            buffer_keepalive: std::cell::RefCell::new(Vec::new()),
             dirty_writes: RefCell::new(HashSet::new()),
             dirty_reads: RefCell::new(HashSet::new()),
             dirty_transfer: std::cell::Cell::new(false),
@@ -1118,6 +1148,8 @@ impl<'a> Recorder<'a> {
             prof_ops,
             op_shapes,
             query_pool,
+            submit_query_pool: std::cell::Cell::new(submit_query_pool),
+            submit_timing_token: std::cell::Cell::new(submit_timing_token),
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
@@ -3189,7 +3221,7 @@ impl<'a> Recorder<'a> {
     /// range — bits shifted `<<16` into f32 registers, no f16 clamp and no upconverted weight
     /// copy). Shared-memory fma warptile (BM=64×BN=64×BK=32, 256 threads, TM=TN=4 register
     /// block — see `native_gemm_fma.comp` for the Intel Arc design constraints: no subgroup
-    /// ops, no f16 extensions, 16.5 KB LDS, modest registers). Selected by the adapter's
+    /// ops, no f16 extensions, 16.5 KiB LDS, modest registers). Selected by the adapter's
     /// non-coopmat tier (`nc_fma`, `!caps.f16_coopmat`); beats the per-row scalar GEMVs by
     /// amortizing each weight element across the 64-row tile, does NOT need to beat coopmat.
     /// `c` is `ceil(m/64)*64` rows (the usual padded-GEMM convention). Requires `n%64`, `k%32`.
@@ -3349,7 +3381,7 @@ impl<'a> Recorder<'a> {
     /// Multi-row native GEMV (`2 <= rows <= 8`): the GEMV's out_f-wide cooperative-over-K grid,
     /// each workgroup decoding a weight sub-block ONCE and dotting it against every row — the
     /// spec-decode verify / short-suffix-prefill shape, where the single-M-tile coopmat GEMM
-    /// underfills the GPU (measured 51-182 GB/s effective vs the GEMV's 292-651 on a 7900 XTX)
+    /// underfills the GPU (measured 47-170 GiB/s effective vs the GEMV's 272-606 on a 7900 XTX)
     /// and the plain GEMV re-streams the weight per row. Same push layout as the GEMV; `w_off`
     /// (fused-QKV slices) rides `w_base`. Caller gates on [`crate::gemm::native_mrow_kernel_name`].
     #[allow(clippy::too_many_arguments)]
@@ -4607,7 +4639,7 @@ impl<'a> Recorder<'a> {
         // single barrier vs the 64-thread WGSL shared-tree. ~2.6× faster as a kernel.
         //
         // DECODE (rows==1) takes the -DWIDE twin instead. The kernel is one-workgroup-per-row, so
-        // rows==1 is a SINGLE workgroup: at 256 threads that is 8 wave32s on one WGP with a ~21 KB
+        // rows==1 is a SINGLE workgroup: at 256 threads that is 8 wave32s on one WGP with a ~21 KiB
         // row, i.e. memory-LATENCY bound with barely any requests in flight. Profiled on
         // gemma-4-31B (dim 5376) it cost 10.5 us/dispatch — vs ~1.2 us for `add` over the SAME
         // vector, which fans out to dim/64 workgroups — and 301 dispatches/token made it 8.9% of
@@ -5334,13 +5366,13 @@ impl<'a> Recorder<'a> {
         //
         // The warp partial's shared scratch is bm*908 B (Ss+Ps+Os+mrow/lrow/corr, BN=64/HD=128).
         // Pick the largest tile the device's maxComputeSharedMemorySize allows: bm=64 → 58112 B (needs
-        // 64 KB, e.g. RADV); bm=32 → 29056 B (fits NVIDIA 48 KB / MoltenVK 32 KB). The transformer
+        // 64 KiB, e.g. RADV); bm=32 → 29056 B (fits NVIDIA 48 KiB / MoltenVK 32 KiB). The transformer
         // skips flash entirely when even bm=32 won't fit, so one of these always fits here.
         let shared_limit = self.be.max_shared_memory_bytes();
         let bm64_shared = 64 * crate::FLASH_SHARED_PER_ROW; // 58112 B
                                                             // `INFR_FLASH_BM=32` (`kernels.vulkan.flash_bm32` — compared to the LITERAL "32", §10.4)
-                                                            // forces the small (29056 B) tile even on a 64 KB device, so the bm=32 shaders get
-                                                            // numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
+                                                            // forces the small (29056 B) tile even on a 64 KiB device, so the bm=32 shaders get
+                                                            // numeric-parity coverage on any GPU (they otherwise only run on sub-64 KiB ones).
         let force_bm32 = self.vk().flash_bm32;
         // Partial tiles (rows < 64, the small-m deep-kv tier) take BM=32: half the padded-row
         // waste and half the shared scratch (2x resident workgroups). Measured @d16384 on a
@@ -5354,7 +5386,7 @@ impl<'a> Recorder<'a> {
         // Each workgroup covers `bm` query rows → mpad/bm×nh groups (mpad is 64-aligned → /32 exact).
         let tile_wg = (mpad / bm) * nh as u32;
         // INFR_NO_FLASH_WARP routes to the non-warp partial. Both warp and non-warp paths have a
-        // bm=32 build (29056 B) that fits sub-64 KB devices, so the knob is honored everywhere —
+        // bm=32 build (29056 B) that fits sub-64 KiB devices, so the knob is honored everywhere —
         // no longer forced back to warp on NVIDIA / MoltenVK.
         // Dequant-in-flash (Lever 2) now has a WARP build (attn_flash_warp_deq_*), so `Dequant` also
         // keeps the fast register-tiled warp path here — it no longer forfeits warp to the ~2x-slower
@@ -5488,7 +5520,7 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// hd=256 FlashAttention prefill for 32 KB-shared devices. A fixed BM=16 tile and four
+    /// hd=256 FlashAttention prefill for 32 KiB-shared devices. A fixed BM=16 tile and four
     /// subgroup column workers plus safe final-tile staging fit in 30,912 B shared memory.
     /// This is deliberately separate from [`Self::attention_prefill_flash`]: its hd=128 shader
     /// selection, split heuristic and combine SPIR-V remain untouched.
@@ -5667,8 +5699,8 @@ impl<'a> Recorder<'a> {
     ) {
         // mpad is 128-aligned → divisible by both BR tiles.
         let mpad = (n.div_ceil(128) * 128) as u32;
-        // Register-O shared = BR*FLASH_REG_SHARED_PER_ROW: BR=128 → 58880 B (needs 64 KB); BR=64 →
-        // 29440 B (NVIDIA 48 KB / MoltenVK 32 KB). Largest that fits; transformer skips reg if neither.
+        // Register-O shared = BR*FLASH_REG_SHARED_PER_ROW: BR=128 → 58880 B (needs 64 KiB); BR=64 →
+        // 29440 B (NVIDIA 48 KiB / MoltenVK 32 KiB). Largest that fits; transformer skips reg if neither.
         let br128_f16score = hd == 256
             && prefer_deep_splits
             && kv_addr.is_none()
@@ -7057,8 +7089,8 @@ impl<'a> Recorder<'a> {
         // Rows-BATCHED pass 1 (INFR_MROWS_ATTN=1 [+ INFR_MROWS_CHUNK=256], OFF by default): one
         // workgroup per (head, chunk) streams K/V ONCE for a 4-row group — one subgroupAdd(vec4)
         // per key, scores staged in LDS. The occupancy sweep on a 7900 XTX (pp4@d16384) was
-        // monotone in LDS — 22KB (RB=8) 188 t/s, 11KB (RB=4) 325, 7KB (RB=4 + c256) 456, vs the
-        // per-row grid's 548 — but even at 7KB the design beats per-row only in a NARROW band:
+        // monotone in LDS — 22 KiB (RB=8) 188 t/s, 11 KiB (RB=4) 325, 7 KiB (RB=4 + c256) 456, vs the
+        // per-row grid's 548 — but even at 7 KiB the design beats per-row only in a NARROW band:
         // rows >= ~12 AND deep kv (pp16@d16384 832 -> 925, pp32 963 -> 1123; pp4-8 lose or wash,
         // pp16@d4096 loses). On RDNA3 the per-row grid's rows-x extra workgroups fill the DRAM
         // queue better than the batched form's rows-/ bandwidth saving, so the spec-verify band
@@ -7087,7 +7119,7 @@ impl<'a> Recorder<'a> {
         // B7 slice 3a — DECODE-ONLY pass 1 (`attn_decode.comp`). Same grid, same chunk policy, same
         // pm/pl/pacc layout, same 60-byte BDA push, same 6 bindings, so this is a pure kernel swap;
         // pass 2 below is untouched. It is `attn_partial_bda`'s hd=128 f16 inner loop with every
-        // other arm deleted, which is worth 120 → 96 VGPRs and 4.75 → 2.75 KB LDS (occupancy 12 →
+        // other arm deleted, which is worth 120 → 96 VGPRs and 4.75 → 2.75 KiB LDS (occupancy 12 →
         // 16 waves/SIMD). The reduction is the same plain `subgroupAdd`, so the output is
         // BIT-identical — `tests/attn_decode_parity.rs` asserts that on raw bits.
         //
@@ -8247,6 +8279,13 @@ impl<'a> Recorder<'a> {
                 .device
                 .cmd_copy_buffer(self.cmd, src_h, dst_h, regions);
         }
+    }
+
+    /// Retain a temporary buffer used by recorded commands until their GPU execution completes.
+    /// Permanent graph/session buffers do not need this; staged pager uploads do because their
+    /// source allocation otherwise drops as soon as the copy command has merely been recorded.
+    pub(crate) fn retain_buffer(&self, buffer: std::sync::Arc<dyn Buffer>) {
+        self.buffer_keepalive.borrow_mut().push(buffer);
     }
 
     pub fn attention(
@@ -11295,7 +11334,34 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Free the recorder's transient Vulkan objects: the query pool (if any), command buffer and
+    fn close_submit_timing(&self) {
+        let pool = self.submit_query_pool.get();
+        if pool != vk::QueryPool::null() {
+            unsafe {
+                self.be.shared.device.cmd_write_timestamp(
+                    self.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    1,
+                );
+            }
+        }
+    }
+
+    fn resolve_submit_timing(&self, dispatches: usize) {
+        let pool = self.submit_query_pool.replace(vk::QueryPool::null());
+        let token = self.submit_timing_token.take();
+        match (pool != vk::QueryPool::null(), token) {
+            (true, Some(token)) => self
+                .be
+                .shared
+                .resolve_submit_timing_query(pool, token, dispatches),
+            (true, None) => self.be.shared.return_submit_timing_query(pool),
+            _ => {}
+        }
+    }
+
+    /// Free the recorder's transient Vulkan objects: query pools (if any), command buffer and
     /// every descriptor-pool tranche. Idempotence lets explicit finish/error paths clean up at the
     /// exact point they stop using the objects while [`Drop`] remains the backstop for any other
     /// recording-time `?` or unwind.
@@ -11310,6 +11376,9 @@ impl<'a> Recorder<'a> {
                 device.destroy_query_pool(self.query_pool, None);
             }
         }
+        let submit_pool = self.submit_query_pool.replace(vk::QueryPool::null());
+        self.submit_timing_token.set(None);
+        self.be.shared.return_submit_timing_query(submit_pool);
         self.be.shared.recorder_cmds.lock().unwrap().push(self.cmd);
         self.be
             .shared
@@ -11339,30 +11408,26 @@ impl<'a> Recorder<'a> {
                 );
             }
         }
-        let queue = self.be.shared.queue;
+        self.close_submit_timing();
         // Each fallible step frees the transient objects before propagating — see `free_transient`.
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
         let prof = pager_profile::active();
-        let submit_t0 = prof.then(std::time::Instant::now);
-        let submit = unsafe {
-            device.queue_submit(
-                queue,
-                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                vk::Fence::null(),
-            )
-        };
-        if let Some(t0) = submit_t0 {
-            pager_profile::record_queue_submit(dispatches, t0.elapsed());
-        }
+        let submits = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))];
+        let submit = self.be.shared.queue_submit_recovering(
+            &submits,
+            vk::Fence::null(),
+            Some(dispatches),
+            "forward queue_submit",
+        );
         if let Err(e) = submit {
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
         let wait_t0 = prof.then(std::time::Instant::now);
-        let wait = unsafe { device.queue_wait_idle(queue) };
+        let wait = self.be.shared.queue_wait_idle_serialized();
         if let Some(t0) = wait_t0 {
             pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
         }
@@ -11382,6 +11447,7 @@ impl<'a> Recorder<'a> {
         if self.prof_ops {
             self.report_timestamps();
         }
+        self.resolve_submit_timing(dispatches);
         self.free_transient();
         Ok(())
     }
@@ -11427,6 +11493,9 @@ impl<'a> Recorder<'a> {
                 fence: None,
                 cmd: vk::CommandBuffer::null(),
                 pools: Vec::new(),
+                buffer_keepalive: Vec::new(),
+                submit_query_pool: vk::QueryPool::null(),
+                submit_timing_token: None,
                 dispatches,
             });
         }
@@ -11434,6 +11503,7 @@ impl<'a> Recorder<'a> {
         // On SUCCESS the cmd buffer + pools are handed to the returned `PendingSegment` (freed in
         // its `wait`); on every ERROR exit we still own them and free them immediately. `Drop`
         // remains the backstop for any future early-return path.
+        self.close_submit_timing();
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
@@ -11455,18 +11525,13 @@ impl<'a> Recorder<'a> {
                 }
             },
         };
-        let prof = pager_profile::active();
-        let submit_t0 = prof.then(std::time::Instant::now);
-        let submit = unsafe {
-            device.queue_submit(
-                self.be.shared.queue,
-                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                fence,
-            )
-        };
-        if let Some(t0) = submit_t0 {
-            pager_profile::record_queue_submit(dispatches, t0.elapsed());
-        }
+        let submits = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))];
+        let submit = self.be.shared.queue_submit_recovering(
+            &submits,
+            fence,
+            Some(dispatches),
+            "pipelined queue_submit",
+        );
         if let Err(e) = submit {
             self.be.shared.recorder_fences.lock().unwrap().push(fence);
             self.free_transient();
@@ -11474,12 +11539,18 @@ impl<'a> Recorder<'a> {
         }
         let shared = std::sync::Arc::clone(&self.be.shared);
         let pools = self.pools.borrow().clone();
+        let buffer_keepalive = std::mem::take(&mut *self.buffer_keepalive.borrow_mut());
+        let submit_query_pool = self.submit_query_pool.replace(vk::QueryPool::null());
+        let submit_timing_token = self.submit_timing_token.take();
         self.owns_transient.set(false);
         Ok(PendingSegment {
             shared,
             fence: Some(fence),
             cmd: self.cmd,
             pools,
+            buffer_keepalive,
+            submit_query_pool,
+            submit_timing_token,
             dispatches,
         })
     }
@@ -11537,6 +11608,7 @@ impl<'a> Recorder<'a> {
             return Err(be(format!("end cmd: {e}")));
         }
         debug_assert_eq!(self.query_pool, vk::QueryPool::null());
+        debug_assert_eq!(self.submit_query_pool.get(), vk::QueryPool::null());
         let pools = self.pools.borrow().clone();
         self.owns_transient.set(false);
         Ok(RecordedSegment {
@@ -11692,10 +11764,7 @@ impl RecordedCmd {
     /// recording only exists on a splitting device whose decode already EXCEEDS the cap, so this
     /// returns 1 there — `replay_n` never packs copies of a split decode.
     pub fn max_chain(&self) -> usize {
-        let cap = self
-            .shared
-            .submit_dispatch_cap
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let cap = self.shared.replay_submit_dispatch_cap();
         if cap == 0 || self.dispatches == 0 {
             return usize::MAX;
         }
@@ -11718,23 +11787,18 @@ impl RecordedCmd {
             }
             return Ok(());
         };
-        let device = &self.shared.device;
         let cmds = vec![seg.cmd; n];
         let prof = pager_profile::active();
-        let submit_t0 = prof.then(std::time::Instant::now);
-        let submit = unsafe {
-            device.queue_submit(
-                self.shared.queue,
-                &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                vk::Fence::null(),
-            )
-        };
-        if let Some(t0) = submit_t0 {
-            pager_profile::record_queue_submit(seg.dispatches * n, t0.elapsed());
-        }
+        let submits = [vk::SubmitInfo::default().command_buffers(&cmds)];
+        let submit = self.shared.queue_submit_recovering(
+            &submits,
+            vk::Fence::null(),
+            Some(seg.dispatches * n),
+            "decode replay_n queue_submit",
+        );
         submit.map_err(|e| be(format!("replay_n submit: {e}")))?;
         let wait_t0 = prof.then(std::time::Instant::now);
-        let wait = unsafe { device.queue_wait_idle(self.shared.queue) };
+        let wait = self.shared.queue_wait_idle_serialized();
         if let Some(t0) = wait_t0 {
             pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
         }
@@ -11750,24 +11814,20 @@ impl RecordedCmd {
     /// submitted earlier on the same queue). A discrete GPU has exactly ONE segment, so this is a
     /// single submit + wait — byte-identical to the record-once fast path.
     pub fn replay(&self) -> Result<()> {
-        let device = &self.shared.device;
         let prof = pager_profile::active();
         for seg in &self.segments {
-            let submit_t0 = prof.then(std::time::Instant::now);
-            let submit = unsafe {
-                device.queue_submit(
-                    self.shared.queue,
-                    &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&seg.cmd))],
-                    vk::Fence::null(),
-                )
-            };
-            if let Some(t0) = submit_t0 {
-                pager_profile::record_queue_submit(seg.dispatches, t0.elapsed());
-            }
+            let submits =
+                [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&seg.cmd))];
+            let submit = self.shared.queue_submit_recovering(
+                &submits,
+                vk::Fence::null(),
+                Some(seg.dispatches),
+                "decode replay queue_submit",
+            );
             submit.map_err(|e| be(format!("replay submit: {e}")))?;
         }
         let wait_t0 = prof.then(std::time::Instant::now);
-        let wait = unsafe { device.queue_wait_idle(self.shared.queue) };
+        let wait = self.shared.queue_wait_idle_serialized();
         if let Some(t0) = wait_t0 {
             pager_profile::record_sync_wait(pager_profile::SyncKind::QueueIdle, t0.elapsed());
         }
@@ -11779,10 +11839,7 @@ impl RecordedCmd {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for RecordedCmd {
     fn drop(&mut self) {
-        let device = &self.shared.device;
-        unsafe {
-            let _ = device.queue_wait_idle(self.shared.queue);
-        }
+        let _ = self.shared.queue_wait_idle_serialized();
         for seg in &self.segments {
             self.shared.recorder_cmds.lock().unwrap().push(seg.cmd);
             self.shared
@@ -11804,8 +11861,13 @@ pub struct PendingSegment {
     fence: Option<vk::Fence>,
     cmd: vk::CommandBuffer,
     pools: Vec<vk::DescriptorPool>,
-    /// Dispatches this segment carried — the submit splitter sums them across a forward to feed
-    /// `VulkanBackend::observe_forward`.
+    /// Temporary transfer buffers referenced by `cmd`; released only after `fence` signals.
+    buffer_keepalive: Vec<std::sync::Arc<dyn Buffer>>,
+    /// Automatic submit calibration query state. Both are empty after calibration, on explicit
+    /// caps, and on the already-drained profiling compatibility path.
+    submit_query_pool: vk::QueryPool,
+    submit_timing_token: Option<crate::SubmitTimingToken>,
+    /// Dispatches this segment carried; consumed by the submit profiler and finite GPU tuner.
     dispatches: usize,
 }
 
@@ -11842,6 +11904,20 @@ impl PendingSegment {
         if let Some(elapsed) = pager_profile::elapsed(wait_t0) {
             pager_profile::record_sync_wait(pager_profile::SyncKind::Fence, elapsed);
         }
+        let submit_pool = std::mem::replace(&mut self.submit_query_pool, vk::QueryPool::null());
+        let submit_token = self.submit_timing_token.take();
+        if submit_pool != vk::QueryPool::null() {
+            if waited.is_ok() {
+                if let Some(token) = submit_token {
+                    self.shared
+                        .resolve_submit_timing_query(submit_pool, token, self.dispatches);
+                } else {
+                    self.shared.return_submit_timing_query(submit_pool);
+                }
+            } else {
+                self.shared.return_submit_timing_query(submit_pool);
+            }
+        }
         self.shared.recorder_fences.lock().unwrap().push(fence);
         self.shared.recorder_cmds.lock().unwrap().push(self.cmd);
         self.shared
@@ -11849,6 +11925,7 @@ impl PendingSegment {
             .lock()
             .unwrap()
             .extend(self.pools.drain(..));
+        self.buffer_keepalive.clear();
         waited.map_err(|e| be(format!("wait segment fence: {e}")))
     }
 }
@@ -12584,6 +12661,585 @@ mod tests {
         bytemuck::cast_slice(&bytes).to_vec()
     }
 
+    /// Qwen3.8 uses 32K physical KV segments and rewrites a non-block-aligned suffix when a chat
+    /// turn restores its recurrent checkpoint. Keep the real geometry here: a reduced segment
+    /// size would miss address-shift and boundary bugs that only appear at the production cut.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn qsa_segmented_32k_boundary_and_suffix_rewrite_match_flat() {
+        use infr_core::backend::SegmentedKvSpec;
+
+        const MIB: usize = 1024 * 1024;
+        const SEGMENT_ROWS: usize = 32 * 1024;
+        const HD: usize = 128;
+        const RATIO: usize = 4;
+        const HEADS: usize = 4;
+        const TOP: usize = 512;
+
+        let be = VulkanBackend::new().unwrap();
+        let _pool = be.init_unified_vram(224 * MIB).unwrap();
+        let kv_len = SEGMENT_ROWS + 6;
+        let blocks = kv_len / RATIO;
+        let raw_segment_elements = SEGMENT_ROWS * HD;
+        let block_segment_elements = (SEGMENT_ROWS / RATIO) * HD;
+        let raw_segment_bytes = raw_segment_elements * 2;
+        let block_segment_bytes = block_segment_elements * 4;
+
+        let raw_segmented = be
+            .alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 2 * raw_segment_bytes,
+                segment_bytes: raw_segment_bytes,
+                segment_elements: raw_segment_elements,
+                max_segments: 2,
+            })
+            .unwrap()
+            .unwrap();
+        let block_segmented = be
+            .alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 2 * block_segment_bytes,
+                segment_bytes: block_segment_bytes,
+                segment_elements: block_segment_elements,
+                max_segments: 2,
+            })
+            .unwrap()
+            .unwrap();
+        be.ensure_segmented_kv_batch(&[raw_segmented.as_ref(), block_segmented.as_ref()], 2)
+            .unwrap();
+        let raw_virtual = crate::as_segmented_kv(raw_segmented.as_ref()).unwrap();
+        let block_virtual = crate::as_segmented_kv(block_segmented.as_ref()).unwrap();
+        let segment_shifts = Some((
+            raw_segment_elements.trailing_zeros(),
+            block_segment_elements.trailing_zeros(),
+        ));
+
+        let mut raw_bits: Vec<u16> = (0..kv_len * HD)
+            .map(|i| half::f16::from_f32(((i * 53 + 7) % 127) as f32 / 96.0 - 0.65).to_bits())
+            .collect();
+        let raw_flat = be.alloc(raw_bits.len() * 2, BufferUsage::KvCache).unwrap();
+        let block_flat = be.alloc(blocks * HD * 4, BufferUsage::KvCache).unwrap();
+        let qv: Vec<f32> = (0..HEADS * HD)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 70.0 - 0.7)
+            .collect();
+        let norm: Vec<f32> = (0..HD).map(|i| 0.8 + (i % 13) as f32 * 0.01).collect();
+        let q = upf16(&be, &qv);
+        let nw = upf32(&be, &norm);
+        let scores_flat = be.alloc(blocks * 4, BufferUsage::Readback).unwrap();
+        let scores_segmented = be.alloc(blocks * 4, BufferUsage::Readback).unwrap();
+        let ids_flat = be.alloc(TOP * 4, BufferUsage::Readback).unwrap();
+        let ids_segmented = be.alloc(TOP * 4, BufferUsage::Readback).unwrap();
+        let work_flat = be
+            .alloc(QSA_TOPK_PARALLEL_WORK_BYTES, BufferUsage::Activations)
+            .unwrap();
+        let work_segmented = be
+            .alloc(QSA_TOPK_PARALLEL_WORK_BYTES, BufferUsage::Activations)
+            .unwrap();
+
+        let upload_raw = |bits: &[u16]| {
+            be.upload(raw_flat.as_ref(), bytemuck::cast_slice(bits))
+                .unwrap();
+            let segments = raw_virtual.segments.lock().unwrap();
+            for (index, src) in bytemuck::cast_slice(bits)
+                .chunks(raw_segment_bytes)
+                .enumerate()
+            {
+                be.upload(&segments[index], src).unwrap();
+            }
+        };
+
+        for phase in 0..2 {
+            let compress_from = if phase == 0 {
+                0
+            } else {
+                // Re-rendered chat history commonly resumes within a QSA block. Recompute that
+                // entire block, including its one retained prefix row and rewritten suffix rows.
+                let rewind = SEGMENT_ROWS - 3;
+                for (i, value) in raw_bits[rewind * HD..].iter_mut().enumerate() {
+                    *value =
+                        half::f16::from_f32(((i * 29 + 17) % 113) as f32 / 80.0 - 0.72).to_bits();
+                }
+                rewind / RATIO
+            };
+            upload_raw(&raw_bits);
+
+            let rec = be.recorder().unwrap();
+            rec.qsa_indexer(
+                q.as_ref(),
+                raw_flat.as_ref(),
+                block_flat.as_ref(),
+                nw.as_ref(),
+                scores_flat.as_ref(),
+                Some(work_flat.as_ref()),
+                ids_flat.as_ref(),
+                1,
+                kv_len as u32,
+                compress_from as u32,
+                HEADS as u32,
+                HD as u32,
+                TOP as u32,
+                RATIO as u32,
+                64,
+                10_000.0,
+                1e-6,
+                1.0 / (HD as f32).sqrt(),
+                None,
+            );
+            rec.qsa_indexer(
+                q.as_ref(),
+                raw_virtual.table_buffer(),
+                block_virtual.table_buffer(),
+                nw.as_ref(),
+                scores_segmented.as_ref(),
+                Some(work_segmented.as_ref()),
+                ids_segmented.as_ref(),
+                1,
+                kv_len as u32,
+                compress_from as u32,
+                HEADS as u32,
+                HD as u32,
+                TOP as u32,
+                RATIO as u32,
+                64,
+                10_000.0,
+                1e-6,
+                1.0 / (HD as f32).sqrt(),
+                segment_shifts,
+            );
+            rec.finish().unwrap();
+
+            let flat_scores = download_f32(&be, scores_flat.as_ref(), blocks);
+            let segmented_scores = download_f32(&be, scores_segmented.as_ref(), blocks);
+            let score_err = flat_scores
+                .iter()
+                .zip(&segmented_scores)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                score_err < 1e-5,
+                "phase {phase}: segmented QSA scores diverge at 32K: {score_err:e}"
+            );
+
+            let mut flat_id_bytes = vec![0u8; TOP * 4];
+            let mut segmented_id_bytes = vec![0u8; TOP * 4];
+            be.download(ids_flat.as_ref(), &mut flat_id_bytes).unwrap();
+            be.download(ids_segmented.as_ref(), &mut segmented_id_bytes)
+                .unwrap();
+            let flat_ids = bytemuck::cast_slice::<u8, u32>(&flat_id_bytes);
+            let segmented_ids = bytemuck::cast_slice::<u8, u32>(&segmented_id_bytes);
+            assert_eq!(
+                segmented_ids, flat_ids,
+                "phase {phase}: segmented QSA selected different blocks"
+            );
+            let mut expected: Vec<usize> = (0..blocks).collect();
+            expected.sort_unstable_by(|&a, &b| {
+                flat_scores[b]
+                    .total_cmp(&flat_scores[a])
+                    .then_with(|| a.cmp(&b))
+            });
+            expected.truncate(TOP);
+            expected.sort_unstable();
+            assert_eq!(
+                flat_ids,
+                expected.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                "phase {phase}: parallel QSA top-k differs from score ordering"
+            );
+
+            let flat_blocks = download_f32(&be, block_flat.as_ref(), blocks * HD);
+            let physical = block_virtual.segments.lock().unwrap();
+            let mut segmented_blocks = Vec::with_capacity(2 * block_segment_elements);
+            for segment in physical.iter() {
+                segmented_blocks.extend(download_f32(&be, segment, block_segment_elements));
+            }
+            let block_err = flat_blocks
+                .iter()
+                .zip(&segmented_blocks)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                block_err < 1e-5,
+                "phase {phase}: segmented QSA block cache diverges at 32K: {block_err:e}"
+            );
+        }
+
+        // The production default is planar Q8 K/V, whose scale plane is local to each physical
+        // segment. Exercise a single write that straddles the exact 32K cut, then read those rows
+        // through both QSA decode gather and batched-attention. Comparing with the flat-Q8 twin
+        // isolates segmented code/scale addressing from quantization error.
+        const ATTN_HD: usize = 256;
+        const N_HEAD: usize = 24;
+        const N_KV: usize = 2;
+        const ROW_ELEMS: usize = N_KV * ATTN_HD;
+        const CROSS_ROWS: usize = 8;
+        const SELECTED: usize = 2;
+        let kv_segment_elements = SEGMENT_ROWS * ROW_ELEMS;
+        let kv_segment_bytes = (kv_segment_elements / 32 * 34).next_multiple_of(4);
+        let kv_cap = 2 * kv_segment_elements;
+        let flat_q8_bytes = (kv_cap / 32 * 34).next_multiple_of(4);
+        let kv_shift = kv_segment_elements.trailing_zeros();
+        let cross_start_row = SEGMENT_ROWS - RATIO;
+        let cross_start = cross_start_row * ROW_ELEMS;
+
+        let alloc_segmented_q8 = || {
+            be.alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 2 * kv_segment_bytes,
+                segment_bytes: kv_segment_bytes,
+                segment_elements: kv_segment_elements,
+                max_segments: 2,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let k_segmented = alloc_segmented_q8();
+        let v_segmented = alloc_segmented_q8();
+        be.ensure_segmented_kv_batch(&[k_segmented.as_ref(), v_segmented.as_ref()], 2)
+            .unwrap();
+        let k_virtual = crate::as_segmented_kv(k_segmented.as_ref()).unwrap();
+        let v_virtual = crate::as_segmented_kv(v_segmented.as_ref()).unwrap();
+        let k_flat = be.alloc(flat_q8_bytes, BufferUsage::KvCache).unwrap();
+        let v_flat = be.alloc(flat_q8_bytes, BufferUsage::KvCache).unwrap();
+
+        let k_values: Vec<f32> = (0..CROSS_ROWS * ROW_ELEMS)
+            .map(|i| ((i * 43 + 5) % 109) as f32 / 85.0 - 0.65)
+            .collect();
+        let v_values: Vec<f32> = (0..CROSS_ROWS * ROW_ELEMS)
+            .map(|i| ((i * 31 + 23) % 103) as f32 / 80.0 - 0.6)
+            .collect();
+        let k_src = upf16(&be, &k_values);
+        let v_src = upf16(&be, &v_values);
+        let selected_ids = [
+            (SEGMENT_ROWS / RATIO - 1) as u32,
+            (SEGMENT_ROWS / RATIO) as u32,
+        ];
+        let ids = be.alloc(SELECTED * 4, BufferUsage::Activations).unwrap();
+        be.upload(ids.as_ref(), bytemuck::cast_slice(&selected_ids))
+            .unwrap();
+
+        let gathered_rows = SELECTED * RATIO;
+        let kd_flat = be
+            .alloc(gathered_rows * ROW_ELEMS * 2, BufferUsage::Readback)
+            .unwrap();
+        let vd_flat = be
+            .alloc(gathered_rows * ROW_ELEMS * 2, BufferUsage::Readback)
+            .unwrap();
+        let kd_segmented = be
+            .alloc(gathered_rows * ROW_ELEMS * 2, BufferUsage::Readback)
+            .unwrap();
+        let vd_segmented = be
+            .alloc(gathered_rows * ROW_ELEMS * 2, BufferUsage::Readback)
+            .unwrap();
+        let attn_qv: Vec<f32> = (0..N_HEAD * ATTN_HD)
+            .map(|i| ((i * 29 + 19) % 113) as f32 / 90.0 - 0.6)
+            .collect();
+        let attn_q = upf16(&be, &attn_qv);
+        let attn_flat = be
+            .alloc(N_HEAD * ATTN_HD * 4, BufferUsage::Readback)
+            .unwrap();
+        let attn_segmented = be
+            .alloc(N_HEAD * ATTN_HD * 4, BufferUsage::Readback)
+            .unwrap();
+
+        let rec = be.recorder().unwrap();
+        for (src, flat, segmented) in [
+            (k_src.as_ref(), k_flat.as_ref(), k_virtual.table_buffer()),
+            (v_src.as_ref(), v_flat.as_ref(), v_virtual.table_buffer()),
+        ] {
+            rec.store_q8(
+                src,
+                flat,
+                CROSS_ROWS * ROW_ELEMS,
+                cross_start,
+                kv_cap,
+                true,
+                0,
+            );
+            rec.store_q8_segmented(
+                src,
+                segmented,
+                CROSS_ROWS * ROW_ELEMS,
+                cross_start,
+                true,
+                0,
+                kv_shift,
+            );
+        }
+        rec.qsa_gather(
+            k_flat.as_ref(),
+            v_flat.as_ref(),
+            ids.as_ref(),
+            kd_flat.as_ref(),
+            vd_flat.as_ref(),
+            SELECTED as u32,
+            (SEGMENT_ROWS / RATIO + 1) as u32,
+            0,
+            RATIO as u32,
+            ROW_ELEMS as u32,
+            true,
+            true,
+            kv_cap as u32,
+            kv_cap as u32,
+            None,
+        );
+        rec.qsa_gather(
+            k_virtual.table_buffer(),
+            v_virtual.table_buffer(),
+            ids.as_ref(),
+            kd_segmented.as_ref(),
+            vd_segmented.as_ref(),
+            SELECTED as u32,
+            (SEGMENT_ROWS / RATIO + 1) as u32,
+            0,
+            RATIO as u32,
+            ROW_ELEMS as u32,
+            true,
+            true,
+            0,
+            0,
+            Some(kv_shift),
+        );
+        let qsa_kv_len = (SEGMENT_ROWS + RATIO) as u32;
+        rec.qsa_attention_batch(
+            attn_q.as_ref(),
+            k_flat.as_ref(),
+            v_flat.as_ref(),
+            ids.as_ref(),
+            attn_flat.as_ref(),
+            1,
+            qsa_kv_len,
+            N_HEAD as u32,
+            N_KV as u32,
+            ATTN_HD as u32,
+            SELECTED as u32,
+            RATIO as u32,
+            1.0 / (ATTN_HD as f32).sqrt(),
+            true,
+            true,
+            kv_cap as u32,
+            kv_cap as u32,
+            None,
+        );
+        rec.qsa_attention_batch(
+            attn_q.as_ref(),
+            k_virtual.table_buffer(),
+            v_virtual.table_buffer(),
+            ids.as_ref(),
+            attn_segmented.as_ref(),
+            1,
+            qsa_kv_len,
+            N_HEAD as u32,
+            N_KV as u32,
+            ATTN_HD as u32,
+            SELECTED as u32,
+            RATIO as u32,
+            1.0 / (ATTN_HD as f32).sqrt(),
+            true,
+            true,
+            0,
+            0,
+            Some(kv_shift),
+        );
+        rec.finish().unwrap();
+
+        for (name, flat, segmented, bytes) in [
+            (
+                "K",
+                kd_flat.as_ref(),
+                kd_segmented.as_ref(),
+                gathered_rows * ROW_ELEMS * 2,
+            ),
+            (
+                "V",
+                vd_flat.as_ref(),
+                vd_segmented.as_ref(),
+                gathered_rows * ROW_ELEMS * 2,
+            ),
+        ] {
+            let mut flat_bytes = vec![0u8; bytes];
+            let mut segmented_bytes = vec![0u8; bytes];
+            be.download(flat, &mut flat_bytes).unwrap();
+            be.download(segmented, &mut segmented_bytes).unwrap();
+            assert_eq!(
+                segmented_bytes, flat_bytes,
+                "segmented Q8 QSA {name} gather differs across 32K"
+            );
+        }
+        let flat_attention = download_f32(&be, attn_flat.as_ref(), N_HEAD * ATTN_HD);
+        let segmented_attention = download_f32(&be, attn_segmented.as_ref(), N_HEAD * ATTN_HD);
+        assert_eq!(
+            segmented_attention, flat_attention,
+            "segmented Q8 QSA attention differs across 32K"
+        );
+    }
+
+    /// A cached multi-token continuation must be causal: every row must match a scalar forward at
+    /// that exact visible length. This is the QSA counterpart of the GDN cached-chunk regression
+    /// test upstream added after multi-token continuation had silently discarded recurrent state.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn qsa_cached_suffix_matches_scalar_continuation() {
+        const PREFIX: usize = 4097;
+        const ROWS: usize = 9;
+        const HD: usize = 128;
+        const HEADS: usize = 4;
+        const RATIO: usize = 4;
+        const TOP: usize = 512;
+
+        let be = VulkanBackend::new().unwrap();
+        let kv_len = PREFIX + ROWS;
+        let blocks = kv_len / RATIO;
+
+        let raw_values: Vec<f32> = (0..kv_len * HD)
+            .map(|i| ((i * 53 + 7) % 127) as f32 / 96.0 - 0.65)
+            .collect();
+        let kv_values: Vec<f32> = (0..kv_len * HD)
+            .map(|i| ((i * 31 + 23) % 103) as f32 / 80.0 - 0.6)
+            .collect();
+        let query_values: Vec<f32> = (0..ROWS * HEADS * HD)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 70.0 - 0.7)
+            .collect();
+        let norm: Vec<f32> = (0..HD).map(|i| 0.8 + (i % 13) as f32 * 0.01).collect();
+
+        let raw = upf16(&be, &raw_values);
+        let kv = upf16(&be, &kv_values);
+        let queries = upf16(&be, &query_values);
+        let scalar_query = upf16(&be, &query_values[..HEADS * HD]);
+        let nw = upf32(&be, &norm);
+
+        let batch_blocks = be.alloc(blocks * HD * 4, BufferUsage::Activations).unwrap();
+        let scalar_blocks = be.alloc(blocks * HD * 4, BufferUsage::Activations).unwrap();
+        let batch_scores = be
+            .alloc(ROWS * blocks * 4, BufferUsage::Activations)
+            .unwrap();
+        let scalar_scores = be.alloc(blocks * 4, BufferUsage::Activations).unwrap();
+        let batch_ids = be.alloc(ROWS * TOP * 4, BufferUsage::Readback).unwrap();
+        let scalar_ids = be.alloc(TOP * 4, BufferUsage::Readback).unwrap();
+        let batch_out = be
+            .alloc(ROWS * HEADS * HD * 4, BufferUsage::Readback)
+            .unwrap();
+        let scalar_out = be.alloc(HEADS * HD * 4, BufferUsage::Readback).unwrap();
+
+        let rec = be.recorder().unwrap();
+        rec.qsa_indexer(
+            queries.as_ref(),
+            raw.as_ref(),
+            batch_blocks.as_ref(),
+            nw.as_ref(),
+            batch_scores.as_ref(),
+            None,
+            batch_ids.as_ref(),
+            ROWS as u32,
+            kv_len as u32,
+            0,
+            HEADS as u32,
+            HD as u32,
+            TOP as u32,
+            RATIO as u32,
+            64,
+            10_000.0,
+            1e-6,
+            1.0 / (HD as f32).sqrt(),
+            None,
+        );
+        rec.qsa_attention_batch(
+            queries.as_ref(),
+            kv.as_ref(),
+            kv.as_ref(),
+            batch_ids.as_ref(),
+            batch_out.as_ref(),
+            ROWS as u32,
+            kv_len as u32,
+            HEADS as u32,
+            1,
+            HD as u32,
+            TOP as u32,
+            RATIO as u32,
+            1.0 / (HD as f32).sqrt(),
+            false,
+            false,
+            0,
+            0,
+            None,
+        );
+        rec.finish().unwrap();
+
+        let mut batch_id_bytes = vec![0u8; ROWS * TOP * 4];
+        be.download(batch_ids.as_ref(), &mut batch_id_bytes)
+            .unwrap();
+        let batch = download_f32(&be, batch_out.as_ref(), ROWS * HEADS * HD);
+
+        for row in 0..ROWS {
+            let visible = PREFIX + row + 1;
+            let q_begin = row * HEADS * HD;
+            let scalar_query_bits: Vec<u16> = query_values[q_begin..q_begin + HEADS * HD]
+                .iter()
+                .map(|&x| half::f16::from_f32(x).to_bits())
+                .collect();
+            be.upload(
+                scalar_query.as_ref(),
+                bytemuck::cast_slice(&scalar_query_bits),
+            )
+            .unwrap();
+
+            let rec = be.recorder().unwrap();
+            rec.qsa_indexer(
+                scalar_query.as_ref(),
+                raw.as_ref(),
+                scalar_blocks.as_ref(),
+                nw.as_ref(),
+                scalar_scores.as_ref(),
+                None,
+                scalar_ids.as_ref(),
+                1,
+                visible as u32,
+                0,
+                HEADS as u32,
+                HD as u32,
+                TOP as u32,
+                RATIO as u32,
+                64,
+                10_000.0,
+                1e-6,
+                1.0 / (HD as f32).sqrt(),
+                None,
+            );
+            rec.qsa_attention_batch(
+                scalar_query.as_ref(),
+                kv.as_ref(),
+                kv.as_ref(),
+                scalar_ids.as_ref(),
+                scalar_out.as_ref(),
+                1,
+                visible as u32,
+                HEADS as u32,
+                1,
+                HD as u32,
+                TOP as u32,
+                RATIO as u32,
+                1.0 / (HD as f32).sqrt(),
+                false,
+                false,
+                0,
+                0,
+                None,
+            );
+            rec.finish().unwrap();
+
+            let mut scalar_id_bytes = vec![0u8; TOP * 4];
+            be.download(scalar_ids.as_ref(), &mut scalar_id_bytes)
+                .unwrap();
+            assert_eq!(
+                &batch_id_bytes[row * TOP * 4..(row + 1) * TOP * 4],
+                &scalar_id_bytes,
+                "cached QSA chunk row {row} selected different blocks than scalar continuation"
+            );
+
+            let scalar = download_f32(&be, scalar_out.as_ref(), HEADS * HD);
+            assert_eq!(
+                &batch[row * HEADS * HD..(row + 1) * HEADS * HD],
+                &scalar,
+                "cached QSA chunk row {row} differs from scalar continuation"
+            );
+        }
+    }
+
     fn run_deltanet_strided_parity(rows: usize, nv: usize, nk: usize, kd: usize, vd: usize) {
         let be = VulkanBackend::new().unwrap();
         let stride = 2 * nk * kd + nv * vd + 7;
@@ -12953,10 +13609,10 @@ mod tests {
         run_attn_prefill_flash(&split, 64, 2000, 16, 8, 128);
         run_attn_prefill_flash(&split, 128, 500, 2, 1, 128);
         run_attn_prefill_flash(&split, 64, 2000, 8, 2, 256);
-        // Force the bm=32 tile (otherwise only selected on sub-64 KB-shared devices like NVIDIA /
+        // Force the bm=32 tile (otherwise only selected on sub-64 KiB-shared devices like NVIDIA /
         // MoltenVK) so the small shaders get numeric-parity coverage on any GPU: the fused kernel
         // (hd=64), the warp split-K partial+combine (hd=128), and the non-warp partial
-        // (`flash_warp = false`). Without this, a 64 KB device only ever exercises the bm=64 build.
+        // (`flash_warp = false`). Without this, a 64 KiB device only ever exercises the bm=64 build.
         let bm32 = be_with(|v| v.flash_bm32 = true);
         run_attn_prefill_flash(&bm32, 80, 300, 9, 3, 64); // fused attn_flash_bm32
         run_attn_prefill_flash(&bm32, 128, 200, 4, 2, 128); // warp partial+combine (bm32)

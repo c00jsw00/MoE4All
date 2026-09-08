@@ -471,6 +471,8 @@ pub(crate) fn generate_dense_backend(
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
+    let state_trace = ec.debug.state_trace;
+    let state_was_cold = state.is_none();
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
     let caps = be.capabilities();
@@ -534,7 +536,7 @@ pub(crate) fn generate_dense_backend(
     // GPU embed gather (Op::EmbedGather, task #28): the host feeds token IDS (4 bytes each) and
     // the device gathers+dequantizes the embedding rows from the resident quantized table —
     // decode and prefill stop uploading f32 embedding rows entirely (a 512-token prefill chunk
-    // was 4*n_embd*512 = ~8 MB of host-embedded f32; now it's 2 KB of ids). Tied-lm_head models
+    // was 4*n_embd*512 = ~8 MiB of host-embedded f32; now it's 2 KiB of ids). Tied-lm_head models
     // reuse the already-uploaded lm_head buffer (same tensor); untied models upload token_embd
     // once more (extra VRAM = its on-disk size). INFR_NO_GPU_EMBED forces the host path (A/B).
     let untied_lm = g.tensors().iter().any(|t| t.name == "output.weight");
@@ -825,7 +827,7 @@ pub(crate) fn generate_dense_backend(
                 // A fused group (qkv, gate+up). Its components are handed over as VIEWS, not as a
                 // concatenated buffer: a binder that pages or streams the group registers their
                 // file ranges and never wants the bytes, and materializing here would build — and
-                // fault in — a multi-MB copy per group only to drop it. `WBytes::materialize` joins
+                // fault in — a multi-MiB copy per group only to drop it. `WBytes::materialize` joins
                 // them for the binders that do read bytes.
                 //
                 // A permuted component (qwen2 q/k) is a load-time REWRITE with no on-disk form, so
@@ -1502,8 +1504,16 @@ pub(crate) fn generate_dense_backend(
         };
         let ple_worker = super::ple::PleWorker::new(g, c)?.map(std::sync::Arc::new);
         let mut turn_recurrent_ckpt = None;
-        if turn_checkpoint.is_some() && (c.qwen35 || c.bailingmoe3) {
-            TurnRecurrentCkpt::begin(&mut turn_recurrent_ckpt, be, c, &kbufs[..], &vbufs[..], &[])?;
+        if turn_checkpoint.is_some() && (c.qwen35 || c.qwen4exp || c.bailingmoe3) {
+            TurnRecurrentCkpt::begin(
+                &mut turn_recurrent_ckpt,
+                be,
+                c,
+                &kbufs[..],
+                &vbufs[..],
+                ple_state_buf.as_deref(),
+                &[],
+            )?;
         }
         // Host DMA imports are optional aliases, but on WDDM they share finite driver allocation
         // capacity with real model buffers. Admit them only after the complete persistent session
@@ -1555,12 +1565,23 @@ pub(crate) fn generate_dense_backend(
     // A live append-only recurrent state wins when the new prompt extends it exactly. Otherwise
     // try the last stable conversation checkpoint before taking the unchanged zero-reset path.
     // Restoration is device-side work, so concurrent serve takes the same GPU baton as a forward.
-    let restored_turn_start = if denoise_req.is_none()
-        && (c.qwen35 || c.bailingmoe3)
-        && state
+    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3;
+    let cached_before_restore = state.as_ref().map_or(0, |kv| kv.cached.len());
+    let common_before_restore = state_trace.then(|| {
+        state
             .as_ref()
-            .is_some_and(|kv| recurrent_extension_start(&kv.cached, prompt).is_none())
-    {
+            .map_or(0, |kv| common_prefix_len(&kv.cached, prompt))
+    });
+    let live_turn_start = recurrent_model
+        .then(|| {
+            state
+                .as_ref()
+                .and_then(|kv| recurrent_extension_start(&kv.cached, prompt))
+        })
+        .flatten();
+    let checkpoint_attempted =
+        denoise_req.is_none() && recurrent_model && live_turn_start.is_none();
+    let restored_turn_start = if checkpoint_attempted {
         let _gp = req.and_then(|r| r.gate_pass());
         state
             .as_mut()
@@ -1662,15 +1683,15 @@ pub(crate) fn generate_dense_backend(
     // else (divergent prompt, identical resend, first-ever call) zero-resets every DeltaNet layer's
     // conv/S state and re-prefills from scratch. Dense/attention models keep the generic
     // longest-common-prefix diff.
-    let start = if denoise_req.is_some() {
+    let (start, state_path) = if denoise_req.is_some() {
         // No-op: a denoise call never touches `cached` (it isn't part of the prompt/generation
         // token stream) — `cached.truncate(start)` below is then a truncate-to-current-length.
-        cached.len()
-    } else if c.qwen35 || c.qwen4exp || c.bailingmoe3 {
-        if let Some(pfx) = recurrent_extension_start(cached, prompt) {
-            pfx
+        (cached.len(), "denoise")
+    } else if recurrent_model {
+        if let Some(pfx) = live_turn_start {
+            (pfx, "live")
         } else if let Some(pfx) = restored_turn_start {
-            pfx
+            (pfx, "checkpoint")
         } else {
             // Non-extending prompt (divergent / identical resend / first-ever call): the append-only
             // recurrent state can't rewind to an arbitrary prefix, so zero every DeltaNet layer's
@@ -1699,15 +1720,25 @@ pub(crate) fn generate_dense_backend(
                 be.upload(state.as_ref(), &zeros)
                     .map_err(|e| anyhow!("{e}"))?;
             }
+            // This cache is now being rebuilt for a different token stream. A checkpoint from
+            // the old stream contains only recurrent/PLE state; restoring it later beside the
+            // attention/QSA rows overwritten below would create a mixed, invalid model state.
+            if let Some(ck) = turn_recurrent_ckpt.as_mut() {
+                ck.invalidate();
+            }
             cached.clear();
-            0
+            (0, "reset")
         }
     } else {
         // `saturating_sub(1)` guards the empty-prompt underflow defensively; the early guard
         // above already rejects an empty non-denoise prompt, so for any real call this is the
         // plain `prompt.len() - 1` (leave ≥1 prompt token to sample the first logits from).
-        common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1))
+        (
+            common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1)),
+            "prefix",
+        )
     };
+    let start_before_ring = start;
     // Only a strict, newly processed prefix can become a checkpoint. If the hint is malformed,
     // tokenization did not preserve the rendered string prefix, or the state already lies past it,
     // leave the previous checkpoint intact and use the ordinary generation path.
@@ -1717,7 +1748,7 @@ pub(crate) fn generate_dense_backend(
             TurnCheckpoint::Boundary(boundary) => Some(boundary),
         })
         .filter(|&boundary| {
-            (c.qwen35 || c.bailingmoe3)
+            (c.qwen35 || c.qwen4exp || c.bailingmoe3)
                 && boundary > start
                 && boundary < prompt.len()
                 && boundary <= max_ctx
@@ -1729,6 +1760,7 @@ pub(crate) fn generate_dense_backend(
             c,
             &kbufs[..],
             &vbufs[..],
+            ple_state_buf.as_deref(),
             &prompt[..boundary],
         )?;
     }
@@ -1756,6 +1788,34 @@ pub(crate) fn generate_dense_backend(
     } else {
         start
     };
+    if state_trace {
+        let qsa_ratio = c
+            .qwen4exp
+            .then(|| c.compress_ratios.iter().copied().max().unwrap_or(4).max(1))
+            .unwrap_or(1);
+        tracing::warn!(
+            "[state trace] cold_slot={} recurrent={} prompt={} cached_before={} common={} live_start={:?} checkpoint_attempted={} checkpoint_start={:?} path={} start_before_ring={} start={} checkpoint_boundary={:?} kv_ring={} segmented_kv={} qsa_ratio={} start_mod_qsa={} prompt_mod_qsa={} start_mod_32k={} prompt_mod_32k={}",
+            state_was_cold,
+            recurrent_model,
+            prompt.len(),
+            cached_before_restore,
+            common_before_restore.unwrap_or(0),
+            live_turn_start,
+            checkpoint_attempted,
+            restored_turn_start,
+            state_path,
+            start_before_ring,
+            start,
+            turn_checkpoint_boundary,
+            kv_ring,
+            segmented_kv_enabled,
+            qsa_ratio,
+            start % qsa_ratio,
+            prompt.len() % qsa_ratio,
+            start % 32_768,
+            prompt.len() % 32_768,
+        );
+    }
     cached.truncate(start);
 
     // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.
@@ -5981,8 +6041,8 @@ pub(crate) fn generate_dense_backend(
             let t_embt0 = std::time::Instant::now();
             *sc_embt = Some(build_sc_embt(be, token_embd, ne, c.vocab)?);
             tracing::info!(
-                "[diffusion denoise] built the SC soft-embedding weight ({:.0} MB) in {:.2}s",
-                (ne * c.vocab * 2) as f64 / 1e6,
+                "[diffusion denoise] built the SC soft-embedding weight ({:.0} MiB) in {:.2}s",
+                (ne * c.vocab * 2) as f64 / (1u64 << 20) as f64,
                 t_embt0.elapsed().as_secs_f64()
             );
         }
@@ -6438,7 +6498,7 @@ pub(crate) fn generate_dense_backend(
     // `Op::MoeFfn` gate (its `mmq_ok`) both derive from — a mismatch either silently falls back to
     // per-token prefill or compiles a graph the adapter rejects; `moe_mmq_drift_test` (in
     // infr-vulkan, since only that crate links both dtype sets at test time) guards it. NOTE:
-    // accepting Q2_K/Q3_K here also flips paged models (Scout: 37GB Q2_K/Q3_K experts on a 24GB
+    // accepting Q2_K/Q3_K here also flips paged models (Scout: 37 GiB Q2_K/Q3_K experts on a 24 GiB
     // card) onto the batched-chunk `Op::MoeFfn` construction — the Vulkan adapter's paged-buffer
     // interception (`execute_static`, ahead of `lower_op`'s batched/small-m split) routes every
     // paged MoeFfn through `execute_paged_moe`, whose own batched arm runs the same
@@ -6559,6 +6619,20 @@ pub(crate) fn generate_dense_backend(
             chunks.len().max(1)
         };
         let mut live: Vec<Option<PfChunk>> = (0..chunks.len()).map(|_| None).collect();
+        // Keep Qwen3.8 PLE one chunk ahead. Chunk N+1's mmap/SSD gather runs while chunk N
+        // traverses the GPU, instead of making the GPU wait for random host I/O at every chunk
+        // boundary. Tickets are consumed before taking the shared GPU gate, so a slow PLE read
+        // never stalls another session that is ready to submit compute.
+        let mut ple_tickets = (0..chunks.len()).map(|_| None).collect::<Vec<_>>();
+        if c.qwen4exp {
+            let worker = ple_worker
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
+            if let Some(&(cstart, cend)) = chunks.first() {
+                ple_tickets[0] =
+                    Some(worker.submit_range(prompt, cstart, cend - cstart, c.ple_ngram_size)?);
+            }
+        }
         for group_start in (0..chunks.len()).step_by(group_chunks) {
             let group_end = (group_start + group_chunks).min(chunks.len());
             let preallocate_group = layer_major && c.qwen4exp;
@@ -6581,6 +6655,37 @@ pub(crate) fn generate_dense_backend(
                         if crate::sampling::abort_requested(req) {
                             anyhow::bail!("aborted: shutdown requested");
                         }
+                        let ple_rows = if c.qwen4exp && live[ci].is_none() {
+                            let worker = ple_worker
+                                .as_ref()
+                                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
+                            let ticket = match ple_tickets[ci].take() {
+                                Some(ticket) => ticket,
+                                None => worker.submit_range(
+                                    prompt,
+                                    cstart,
+                                    cend - cstart,
+                                    c.ple_ngram_size,
+                                )?,
+                            };
+
+                            // Queue only the immediate successor. The bounded worker channel keeps
+                            // random I/O shallow while the current chunk's GPU work supplies the
+                            // overlap window.
+                            if let Some(&(next_start, next_end)) = chunks.get(ci + 1) {
+                                if ple_tickets[ci + 1].is_none() {
+                                    ple_tickets[ci + 1] = Some(worker.submit_range(
+                                        prompt,
+                                        next_start,
+                                        next_end - next_start,
+                                        c.ple_ngram_size,
+                                    )?);
+                                }
+                            }
+                            Some(ticket.wait()?)
+                        } else {
+                            None
+                        };
                         // One dispatch = one turn on the GPU. Dropped at the end of the iteration, handing
                         // the baton to whichever sequence has been waiting longest.
                         let _gp = if materialize_only {
@@ -6667,11 +6772,9 @@ pub(crate) fn generate_dense_backend(
                                 None
                             };
                             let ple_embd = if c.qwen4exp {
-                                let rows = ple_worker
-                                    .as_ref()
-                                    .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?
-                                    .submit_range(prompt, cstart, pf_m, c.ple_ngram_size)?
-                                    .wait()?;
+                                let rows = ple_rows.ok_or_else(|| {
+                                    anyhow!("qwen4exp prefill chunk has no prefetched PLE rows")
+                                })?;
                                 let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
                                 let expected = pf_m * heads * c.ple_head_dim;
                                 if rows.len() != expected {
@@ -6787,8 +6890,17 @@ pub(crate) fn generate_dense_backend(
                             if let Some(ck) = turn_recurrent_ckpt.as_mut() {
                                 if layer_major {
                                     ck.snapshot_layer(be, &kbufs[..], &vbufs[..], span.start)?;
+                                    if c.qwen4exp && span.clone().any(|layer| c.is_ple_layer(layer))
+                                    {
+                                        ck.snapshot_ple(be, ple_state_buf.as_deref())?;
+                                    }
                                 } else {
-                                    ck.snapshot_all(be, &kbufs[..], &vbufs[..])?;
+                                    ck.snapshot_all(
+                                        be,
+                                        &kbufs[..],
+                                        &vbufs[..],
+                                        ple_state_buf.as_deref(),
+                                    )?;
                                 }
                             }
                         }
@@ -7349,7 +7461,7 @@ pub(crate) fn generate_dense_backend(
         last_written = Some(pos);
         if Some(pos + 1) == turn_checkpoint_boundary {
             if let Some(ck) = turn_recurrent_ckpt.as_mut() {
-                ck.snapshot_all(be, &kbufs[..], &vbufs[..])?;
+                ck.snapshot_all(be, &kbufs[..], &vbufs[..], ple_state_buf.as_deref())?;
             }
         }
         if prof_dec && pos + 1 >= prompt.len() {
