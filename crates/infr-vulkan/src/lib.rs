@@ -829,6 +829,30 @@ impl VulkanShared {
         queue.lock().unwrap().submit(self, batches).map(Some)
     }
 
+    fn wait_dedicated_transfer(&self, value: u64) -> Result<()> {
+        if value == 0 {
+            return Ok(());
+        }
+        let timeline = self
+            .dedicated_transfer
+            .as_ref()
+            .ok_or_else(|| be("transfer timeline wait requested without a dedicated queue"))?
+            .lock()
+            .unwrap()
+            .timeline();
+        let semaphores = [timeline];
+        let values = [value];
+        unsafe {
+            self.device.wait_semaphores(
+                &vk::SemaphoreWaitInfo::default()
+                    .semaphores(&semaphores)
+                    .values(&values),
+                u64::MAX,
+            )
+        }
+        .map_err(|error| be(format!("wait dedicated transfer timeline {value}: {error}")))
+    }
+
     fn queue_submit_commands_recovering(
         &self,
         commands: &[vk::CommandBuffer],
@@ -2285,6 +2309,14 @@ impl infr_core::backend::ProgressScope for WeightProgress {}
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
+    pub(crate) fn background_expert_transfer_ready(&self) -> bool {
+        self.shared.dedicated_transfer.is_some()
+    }
+
+    pub(crate) fn wait_background_transfer(&self, value: u64) -> Result<()> {
+        self.shared.wait_dedicated_transfer(value)
+    }
+
     /// `maxComputeSharedMemorySize` for the active device — the per-workgroup shared-memory budget
     /// the flash-attention tile height is sized against (cheap accessor; avoids cloning caps).
     pub fn max_shared_memory_bytes(&self) -> u32 {
@@ -2848,12 +2880,13 @@ impl VulkanBackend {
         // The external-semaphore all-reduce needs BOTH the fd extension and the timeline feature
         // (read here, after `feat2`'s last use, for the same borrow reason as `has_bda`).
         let has_ext_sem = has_ext_sem_fd && timeline_feat.timeline_semaphore != 0;
-        // A transfer-only queue is useful only for the imported-host route: otherwise the source
-        // first has to be staged through the main queue and there is no independent DMA stream.
-        let dedicated_transfer_family_index =
-            (cfg.paging.host_dma && has_ext_mem_host && timeline_feat.timeline_semaphore != 0)
-                .then_some(dedicated_transfer_family_index)
-                .flatten();
+        // The same transfer-only queue consumes either imported host RAM or a temporary
+        // host-visible staging buffer. It therefore remains useful on devices that cannot expose
+        // their expert arena through ReBAR or VK_EXT_external_memory_host (notably RDNA2).
+        let dedicated_transfer_family_index = (cfg.paging.host_dma
+            && timeline_feat.timeline_semaphore != 0)
+            .then_some(dedicated_transfer_family_index)
+            .flatten();
         let timeline_enabled = has_ext_sem || dedicated_transfer_family_index.is_some();
         // Hard requirement, not a fallback: the paged-MoE arena is addressed by a 64-bit device
         // pointer, so a device that cannot hand out one has no 64-bit address space for infr to

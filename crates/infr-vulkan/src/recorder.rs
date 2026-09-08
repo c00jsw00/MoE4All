@@ -8306,6 +8306,13 @@ impl<'a> Recorder<'a> {
         Ok(true)
     }
 
+    /// Delay this command buffer at the GPU dependency boundary without blocking its CPU
+    /// recording. Used when a background prefetch submitted the copy before this recorder existed.
+    pub(crate) fn wait_for_dedicated_transfer(&self, value: u64) {
+        self.dedicated_transfer_wait
+            .set(self.dedicated_transfer_wait.get().max(value));
+    }
+
     pub fn attention(
         &self,
         q: &dyn Buffer,

@@ -214,7 +214,7 @@ impl DedicatedTransferQueue {
 /// types or queue choices; a different executor can satisfy the same requests without changing
 /// pager policy.
 pub(crate) trait TransferExecutor: Sync {
-    fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize)>;
+    fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)>;
 
     fn complete_copies_now(
         &self,
@@ -283,14 +283,14 @@ impl SessionTransferPlan {
             }
             return Ok(());
         }
-        let (source, source_ptr) = executor.materialize_staging(src)?;
+        let (source, source_ptr, dedicated) = executor.materialize_staging(src)?;
         prepared.copies.push(PreparedCopy {
             source,
             source_offset: 0,
             source_ptr,
             target: target.clone(),
             len: src.len(),
-            dedicated: false,
+            dedicated: dedicated && target.dedicated_compatible,
         });
         Ok(())
     }
@@ -314,7 +314,7 @@ impl SessionTransferPlan {
                     .subtarget(advanced, range.len)
                     .expect("imported source range was validated against its device target"),
                 len: range.len,
-                dedicated: true,
+                dedicated: target.dedicated_compatible,
             });
             advanced += range.len;
         }
@@ -499,6 +499,56 @@ impl PreparedTransfer {
         Ok(())
     }
 
+    /// Start this batch on the transfer-only queue without attaching the resulting wait to the
+    /// current compute recorder. Decode prefetch carries the returned timeline value forward and
+    /// waits only when the predicted target layer actually consumes these slots.
+    pub(crate) fn submit_background(mut self, be_: &VulkanBackend) -> Result<Option<u64>> {
+        if self.copies.is_empty() {
+            return Ok(None);
+        }
+        if self.copies.iter().any(|copy| !copy.dedicated) {
+            self.complete_now(be_)?;
+            return Ok(None);
+        }
+
+        let mut groups: Vec<TransferCopyBatch> = Vec::new();
+        for copy in &self.copies {
+            let src_handle = as_vk_buf(copy.source.as_ref())?.buffer;
+            let dst_handle = as_vk_buf(copy.target.buffer())?.buffer;
+            let group = match groups.iter_mut().find(|group| {
+                as_vk_buf(group.src.as_ref()).is_ok_and(|buf| buf.buffer == src_handle)
+                    && as_vk_buf(group.dst.as_ref()).is_ok_and(|buf| buf.buffer == dst_handle)
+            }) {
+                Some(group) => group,
+                None => {
+                    groups.push(TransferCopyBatch {
+                        src: Arc::clone(&copy.source),
+                        dst: copy.target.buffer_arc(),
+                        regions: Vec::new(),
+                    });
+                    groups.last_mut().expect("group was just appended")
+                }
+            };
+            group.regions.push(
+                vk::BufferCopy::default()
+                    .src_offset(copy.source_offset as u64)
+                    .dst_offset(copy.target.buffer_offset() as u64)
+                    .size(copy.len as u64),
+            );
+        }
+        let value = be_
+            .shared
+            .submit_transfer_batches(&groups)?
+            .ok_or_else(|| be("background transfer requested without a transfer-only queue"))?;
+        if pager_profile::active() {
+            for copy in &self.copies {
+                pager_profile::record_gpu_copy(copy.len);
+            }
+        }
+        self.copies.clear();
+        Ok(Some(value))
+    }
+
     pub(crate) fn complete_now<E: TransferExecutor>(mut self, executor: &E) -> Result<()> {
         if self.copies.is_empty() {
             return Ok(());
@@ -555,6 +605,9 @@ pub(crate) struct DeviceTransferTarget {
     vk_offset: usize,
     mapped_ptr: Option<usize>,
     len: usize,
+    /// Arena buffers are created with concurrent sharing across the compute and transfer queue
+    /// families whenever a dedicated queue exists.
+    dedicated_compatible: bool,
 }
 
 impl DeviceTransferTarget {
@@ -582,6 +635,7 @@ impl DeviceTransferTarget {
             vk_offset,
             mapped_ptr,
             len,
+            dedicated_compatible: true,
         })
     }
 
@@ -628,6 +682,7 @@ impl DeviceTransferTarget {
                 .ok_or_else(|| be("device transfer sub-range Vulkan offset overflow"))?,
             mapped_ptr: self.mapped_ptr.map(|ptr| ptr + offset),
             len,
+            dedicated_compatible: self.dedicated_compatible,
         })
     }
 }
@@ -636,29 +691,41 @@ impl VulkanBackend {
     /// Allocate staging explicitly on the host-visible non-device-local heap when the device
     /// exposes one. This prevents a small RDNA2 ReBAR heap from being consumed by the fallback
     /// that exists precisely because the expert arena did not fit that heap.
-    fn make_host_transfer_buffer(&self, size: usize) -> Result<VkBuffer> {
+    fn make_host_transfer_buffer(&self, size: usize) -> Result<(VkBuffer, bool)> {
         let Some(memory_type) = self.shared.host_overflow_type else {
-            return self.make_buf(size, MemoryLocation::CpuToGpu, "host-transfer-staging");
+            return self
+                .make_buf(size, MemoryLocation::CpuToGpu, "host-transfer-staging")
+                .map(|buffer| (buffer, false));
         };
-        let info = vk::BufferCreateInfo::default()
+        let queue_families = self.shared.dedicated_transfer_families();
+        let mut info = vk::BufferCreateInfo::default()
             .size(crate::fill_span(size))
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST);
+        if let Some(families) = queue_families.as_ref() {
+            info = info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(families);
+        } else {
+            info = info.sharing_mode(vk::SharingMode::EXCLUSIVE);
+        }
         let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
             .map_err(|error| be(format!("create_buffer(host-transfer-staging): {error}")))?;
         let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
         if requirements.memory_type_bits & (1 << memory_type) == 0 {
             unsafe { self.shared.device.destroy_buffer(buffer, None) };
-            return self.make_buf(size, MemoryLocation::CpuToGpu, "host-transfer-staging");
+            return self
+                .make_buf(size, MemoryLocation::CpuToGpu, "host-transfer-staging")
+                .map(|buffer| (buffer, false));
         }
         self.alloc_vram_mapped(buffer, size, &requirements, memory_type, true, false, false)
             .inspect_err(|_| unsafe { self.shared.device.destroy_buffer(buffer, None) })
+            .map(|buffer| (buffer, queue_families.is_some()))
     }
 
     /// Materialize bytes in a temporary host-visible Vulkan buffer without submitting work. The
     /// returned owner must stay alive until every command that reads it has completed.
-    fn stage_host_bytes(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize)> {
-        let staging = self.make_host_transfer_buffer(src.len())?;
+    fn stage_host_bytes(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)> {
+        let (staging, dedicated_compatible) = self.make_host_transfer_buffer(src.len())?;
         let ptr = staging
             .mapped_ptr()
             .ok_or_else(|| be("host transfer staging allocation is not mapped"))?;
@@ -667,7 +734,7 @@ impl VulkanBackend {
         if let Some(t0) = started {
             pager_profile::record_memcpy(src.len(), t0.elapsed());
         }
-        Ok((Arc::new(staging), ptr as usize))
+        Ok((Arc::new(staging), ptr as usize, dedicated_compatible))
     }
 
     /// Fill one target range. The callback always receives writable host memory, either the final
@@ -684,7 +751,7 @@ impl VulkanBackend {
             return Ok(());
         }
 
-        let staging = self.make_host_transfer_buffer(target.len())?;
+        let (staging, _) = self.make_host_transfer_buffer(target.len())?;
         let staging_ptr = staging
             .mapped_ptr()
             .ok_or_else(|| be("host transfer staging allocation is not mapped"))?;
@@ -859,7 +926,7 @@ impl VulkanBackend {
 }
 
 impl TransferExecutor for VulkanBackend {
-    fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize)> {
+    fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)> {
         VulkanBackend::stage_host_bytes(self, src)
     }
 
