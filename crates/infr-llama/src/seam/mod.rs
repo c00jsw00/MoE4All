@@ -112,7 +112,7 @@ fn log_host_ram_request(
     what: &str,
     request: infr_core::hostmem::RamRequest,
     process_resident: Option<u64>,
-    planned_future_resident: u64,
+    reclaimable_load_source: u64,
     cache_bytes: u64,
 ) {
     match (request, process_resident) {
@@ -120,9 +120,9 @@ fn log_host_ram_request(
             tracing::info!(
                 total_process_ram_budget_bytes = total,
                 observed_process_resident_bytes = resident,
-                planned_future_resident_bytes = planned_future_resident,
+                reclaimable_load_source_bytes = reclaimable_load_source,
                 host_cache_budget_bytes = cache_bytes,
-                "{what} host tier: resolved total-process RAM budget"
+                "{what} host tier: resolved total-process RAM budget; fixed GGUF upload pages are reclaimable before cache preload"
             )
         }
         (infr_core::hostmem::RamRequest::TotalProcessBudget(total), None) => tracing::warn!(
@@ -2844,14 +2844,16 @@ fn moe_host_backing(
     ram_request: infr_core::hostmem::RamRequest,
     available: Option<u64>,
     process_resident: Option<u64>,
-    planned_future_resident: u64,
     payload_bytes: usize,
 ) -> MoeHostBacking {
+    // `process_resident` is sampled before fixed Vulkan weights are uploaded. Do not add their
+    // GGUF source footprint here: bounded host storage is allocated and populated only after the
+    // upload finalizer, when those clean file-backed pages are reclaimable.
     let budget = match ram_request {
         infr_core::hostmem::RamRequest::TotalProcessBudget(total) => {
             infr_core::hostmem::cache_bytes_for_total_budget(
                 total,
-                process_resident.map(|resident| resident.saturating_add(planned_future_resident)),
+                process_resident,
                 payload_bytes as u64,
             )
         }
@@ -2878,6 +2880,72 @@ fn moe_host_backing(
     } else {
         MoeHostBacking::Bounded { bytes: budget }
     }
+}
+
+/// Publish the per-expert file ranges only after the bounded host arena exists. During weight
+/// binding we retain one whole-bank descriptor per skipped tensor; splitting it here keeps the
+/// fixed-weight upload phase free of a large host allocation without changing runtime block ids.
+fn register_bounded_moe_host_blocks(
+    tier: &infr_core::hostpager::InclusiveHostTier,
+    registrations: &[PendingPagedExpert],
+) -> AResult<()> {
+    for registration in registrations {
+        let source = &registration.source;
+        let cache = tier.cache(source.stride_bytes).ok_or_else(|| {
+            anyhow!(
+                "MoE bounded Host tier has no {}-byte size class for a deferred expert bank",
+                source.stride_bytes
+            )
+        })?;
+        let file = source.file.as_ref().ok_or_else(|| {
+            anyhow!("MoE bounded Host tier received an expert bank without a file descriptor")
+        })?;
+        let [extent] = file.extents.as_slice() else {
+            return Err(anyhow!(
+                "MoE bounded Host tier expected one contiguous file extent for expert bank {}, got {}",
+                file.id,
+                file.extents.len()
+            ));
+        };
+        let expected = source
+            .stride_bytes
+            .checked_mul(registration.n_expert)
+            .ok_or_else(|| anyhow!("MoE bounded Host tier expert bank size overflow"))?;
+        if extent.len != expected {
+            return Err(anyhow!(
+                "MoE bounded Host tier expert bank {} is {} bytes, expected {} x {} = {}",
+                file.id,
+                extent.len,
+                registration.n_expert,
+                source.stride_bytes,
+                expected
+            ));
+        }
+        for expert in 0..registration.n_expert {
+            let expert_id = u32::try_from(expert)
+                .map_err(|_| anyhow!("MoE bounded Host tier expert id exceeds u32"))?;
+            let byte_offset = expert
+                .checked_mul(source.stride_bytes)
+                .ok_or_else(|| anyhow!("MoE bounded Host tier expert offset overflow"))?;
+            let id = file
+                .id
+                .checked_add(expert_id)
+                .ok_or_else(|| anyhow!("MoE bounded Host tier block id overflow"))?;
+            cache
+                .register(infr_core::blockio::BlockDesc {
+                    id,
+                    extents: vec![infr_core::blockio::BlockExtent {
+                        offset: extent
+                            .offset
+                            .checked_add(byte_offset as u64)
+                            .ok_or_else(|| anyhow!("MoE bounded Host tier file offset overflow"))?,
+                        len: source.stride_bytes,
+                    }],
+                })
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Decide this model's MoE expert placement and return its Vulkan weight binder plus an optional
@@ -2924,7 +2992,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     let mut pager_budget_bytes = 0u64;
     let mut pager_memory_plan = None;
     let mut dynamic_state_max_allocation_bytes = 0u64;
-    let mut planned_future_host_resident_bytes = 0u64;
+    let mut reclaimable_fixed_host_source_bytes = 0u64;
     let mut expert_payload_bytes = 0u64;
     let mut requested_cache_bytes = None;
     let pending_moe_registrations =
@@ -2950,7 +3018,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // pinned by `moe_expert_floor_covers_dense_set` in infr-vulkan's linear.rs tests.
         let fp = crate::weights::weight_footprint(g);
         expert_payload_bytes = fp.expert;
-        planned_future_host_resident_bytes = fp.dense;
+        // These are clean GGUF mapping pages used only as the source of fixed GPU uploads. The
+        // bounded Expert arena is populated after those uploads finish, so they are load-time
+        // working set, not a persistent owner of the process RAM budget.
+        reclaimable_fixed_host_source_bytes = fp.dense;
         let vram = vk.vram();
         let room = planned_vram_room(&vram, ec);
         // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a mostly-SWA
@@ -3163,7 +3234,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // before the adapter can inspect either one. Warm calls never bind and never receive a hook.
     let mut moe_host_offsets =
         std::collections::HashMap::<(usize, infr_vulkan::pager::Role), usize>::new();
-    let mut moe_host_tier = None::<std::sync::Arc<infr_core::hostpager::InclusiveHostTier>>;
+    let mut moe_bounded_host = false;
     if first_load && n_paged > 0 {
         use infr_vulkan::pager::Role;
         let moe = cfg.moe.as_ref().expect("n_paged > 0 implies MoE");
@@ -3310,7 +3381,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 ram_request,
                 host_available,
                 process_resident,
-                planned_future_host_resident_bytes,
                 host_bytes,
             );
             let (host_kind, host_resident_bytes) = match host_backing {
@@ -3334,33 +3404,24 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 "MoE",
                 ram_request,
                 process_resident,
-                planned_future_host_resident_bytes,
+                reclaimable_fixed_host_source_bytes,
                 host_resident_bytes as u64,
             );
+            let host_classes: Vec<(usize, usize)> = logical_pools
+                .iter()
+                .map(|&(slot_bytes, blocks, _)| (slot_bytes, blocks))
+                .collect();
             if let MoeHostBacking::Bounded {
                 bytes: host_cache_budget,
             } = host_backing
             {
-                let classes: Vec<(usize, usize)> = logical_pools
-                    .iter()
-                    .map(|&(slot_bytes, blocks, _)| (slot_bytes, blocks))
-                    .collect();
-                let io = std::sync::Arc::new(
-                    infr_core::blockio::FileBlockIo::open_shards(&g.shards())
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                let tier = std::sync::Arc::new(
-                    infr_core::hostpager::InclusiveHostTier::new(host_cache_budget, &classes, io)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
+                moe_bounded_host = true;
                 tracing::info!(
-                    "MoE host plan: bounded inclusive RAM cache {:.2} GiB / {:.2} GiB budget / {:.2} GiB expert payload across {} size class(es); GPU shadows share this budget and remaining Experts stream from SSD",
-                    tier.arena_bytes() as f64 / GIB_F64,
-                    tier.budget_bytes() as f64 / GIB_F64,
+                    "MoE host plan: bounded inclusive RAM/SSD tier {:.2} GiB / {:.2} GiB expert payload across {} size class(es); the RAM arena will be allocated after fixed GPU uploads",
+                    host_cache_budget as f64 / GIB_F64,
                     host_bytes as f64 / GIB_F64,
-                    tier.classes().len(),
+                    host_classes.len(),
                 );
-                moe_host_tier = Some(tier);
             } else {
                 // Keep the complete payload in one logical layer-major store, split only BETWEEN
                 // layers so each layer remains a contiguous Prefill source. Bounded-RAM mode does
@@ -3466,7 +3527,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // established all-layer target.
             let prefill_target_lanes = moe_prefill_target_lanes(cfg, n_paged);
             let pending = pending_moe_registrations.clone();
-            let host_tier = moe_host_tier.clone();
             finish_fixed_allocations = Some(Box::new(move || {
                 // Staging is part of the load, not the steady-state layout. Free it before the
                 // live budget query so its ring cannot reduce the expert filler permanently.
@@ -3623,6 +3683,36 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     planned_pager_budget as f64 / GIB_F64,
                     elastic_reserve as f64 / GIB_F64,
                 );
+                let host_tier = if let MoeHostBacking::Bounded {
+                    bytes: host_cache_budget,
+                } = host_backing
+                {
+                    let io = std::sync::Arc::new(
+                        infr_core::blockio::FileBlockIo::open_shards(&g.shards())
+                            .map_err(|e| anyhow!("{e}"))?,
+                    );
+                    let tier = std::sync::Arc::new(
+                        infr_core::hostpager::InclusiveHostTier::new(
+                            host_cache_budget,
+                            &host_classes,
+                            io,
+                        )
+                        .map_err(|e| anyhow!("{e}"))?,
+                    );
+                    tracing::info!(
+                        "MoE host arena allocated after fixed uploads: {:.2} GiB / {:.2} GiB budget across {} size class(es); GPU shadows share this budget and remaining Experts stream from SSD",
+                        tier.arena_bytes() as f64 / GIB_F64,
+                        tier.budget_bytes() as f64 / GIB_F64,
+                        tier.classes().len(),
+                    );
+                    Some(tier)
+                } else {
+                    None
+                };
+                let registrations = std::mem::take(&mut *pending.lock().unwrap());
+                if let Some(tier) = &host_tier {
+                    register_bounded_moe_host_blocks(tier, &registrations)?;
+                }
                 vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
                     load_reserve_bytes: 0,
                     n_blocks,
@@ -3644,7 +3734,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 })
                 .map_err(|e| anyhow!("{e}"))?;
 
-                let registrations = std::mem::take(&mut *pending.lock().unwrap());
                 for registration in registrations {
                     vk.register_paged_expert(
                         registration.role,
@@ -4143,10 +4232,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let host_offset = *moe_host_offsets.get(&(l, role)).ok_or_else(|| {
                     anyhow!("MoE permanent host-store plan has no offset for {name}")
                 })?;
-                let file = if let Some(host) = moe_host_tier
-                    .as_ref()
-                    .and_then(|tier| tier.cache(stride_bytes))
-                {
+                let file = if moe_bounded_host {
                     let (base, len) = bytes.file_range();
                     if len != stride_bytes * n_expert {
                         return Err(anyhow!(
@@ -4160,16 +4246,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         infr_vulkan::pager::Role::Down => 2,
                     };
                     let block_base = (role_idx * n_paged * n_expert + l * n_expert) as u32;
-                    for expert in 0..n_expert {
-                        host.register(infr_core::blockio::BlockDesc {
-                            id: block_base + expert as u32,
-                            extents: vec![infr_core::blockio::BlockExtent {
-                                offset: base + (expert * stride_bytes) as u64,
-                                len: stride_bytes,
-                            }],
-                        })
-                        .map_err(|e| anyhow!("{e}"))?;
-                    }
                     Some(infr_core::blockio::BlockDesc {
                         id: block_base,
                         extents: vec![infr_core::blockio::BlockExtent { offset: base, len }],
@@ -5426,7 +5502,6 @@ mod seam_helper_tests {
                 RamRequest::LegacyCacheBudget(payload as u64),
                 None,
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Full,
@@ -5438,7 +5513,6 @@ mod seam_helper_tests {
                 RamRequest::LegacyCacheBudget((40 * GIB) as u64),
                 None,
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Full,
@@ -5450,7 +5524,6 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((64 * GIB) as u64),
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Full,
@@ -5469,7 +5542,6 @@ mod seam_helper_tests {
                 RamRequest::LegacyCacheBudget((23 * GIB) as u64),
                 None,
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 23 * GIB }
@@ -5480,7 +5552,6 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((25 * GIB) as u64),
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes } if bytes < payload
@@ -5491,7 +5562,6 @@ mod seam_helper_tests {
                 RamRequest::TotalProcessBudget(0),
                 Some((64 * GIB) as u64),
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 }
@@ -5502,7 +5572,6 @@ mod seam_helper_tests {
                 RamRequest::Bypass,
                 Some((64 * GIB) as u64),
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 }
@@ -5521,7 +5590,6 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((payload + 4 * GIB) as u64),
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Full,
@@ -5533,7 +5601,6 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((payload + 4 * GIB - 1) as u64),
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes } if bytes < payload
@@ -5544,7 +5611,6 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((payload + 4 * GIB) as u64),
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes } if bytes < payload
@@ -5557,7 +5623,6 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((40 * GIB) as u64),
                 Some(0),
-                0,
                 large_payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 32 * GIB },
@@ -5576,7 +5641,6 @@ mod seam_helper_tests {
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((48 * GIB) as u64),
                 Some((2 * GIB) as u64),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded {
@@ -5590,13 +5654,12 @@ mod seam_helper_tests {
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((48 * GIB) as u64),
                 Some((2 * GIB) as u64),
-                (5 * GIB) as u64,
                 payload,
             ),
             super::MoeHostBacking::Bounded {
-                bytes: 43 * GIB - (512 << 20),
+                bytes: 48 * GIB - (512 << 20),
             },
-            "known fixed weights that have not been touched yet still count toward the process total"
+            "fixed GGUF upload pages must not permanently reduce the post-upload expert arena"
         );
         assert_eq!(
             super::moe_host_backing(
@@ -5604,12 +5667,53 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 None,
                 Some(0),
-                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 },
             "auto sizing without a probe must not assume the whole payload fits RAM"
         );
+    }
+
+    #[test]
+    fn bounded_host_blocks_are_registered_only_from_deferred_bank_descriptors() {
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
+        use infr_core::hostpager::InclusiveHostTier;
+        use infr_vulkan::pager::{ExpertSource, Role};
+        use std::sync::Arc;
+
+        struct NoopIo;
+        impl BlockIo for NoopIo {
+            fn read_block(&self, _: &BlockDesc, _: &mut [u8]) -> infr_core::Result<()> {
+                unreachable!("descriptor registration performs no reads")
+            }
+        }
+
+        let tier = InclusiveHostTier::new(16, &[(4, 4)], Arc::new(NoopIo)).expect("host tier");
+        let registrations = [super::PendingPagedExpert {
+            role: Role::Gate,
+            buf_id: 1,
+            source: ExpertSource {
+                bank: Arc::new(vec![0u8; 16]),
+                stride_bytes: 4,
+                layer_base: 0,
+                host_offset: 0,
+                file: Some(BlockDesc {
+                    id: 12,
+                    extents: vec![BlockExtent {
+                        offset: 4096,
+                        len: 16,
+                    }],
+                }),
+            },
+            n_expert: 4,
+        }];
+
+        super::register_bounded_moe_host_blocks(&tier, &registrations)
+            .expect("deferred registration");
+        let cache = tier.cache(4).expect("size class");
+        for id in 12..16 {
+            assert_eq!(cache.block_bytes(id), Some(4));
+        }
     }
 
     /// Arithmetic tests that predate capability-aware hd256 flash use the conservative device:

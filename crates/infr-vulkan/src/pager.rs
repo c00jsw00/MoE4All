@@ -1458,8 +1458,9 @@ fn stats_suffix(s: &PagerStats) -> String {
 }
 
 /// Load-time description of one paged layer's per-role expert bank. In full-RAM mode `register`
-/// copies it once into the session's CPU-only layer-major store. In bounded-RAM mode the
-/// individual block descriptors have already been registered with the inclusive host cache.
+/// copies it once into the session's CPU-only layer-major store. In bounded-RAM mode the seam
+/// registers the individual block descriptors after fixed GPU uploads and before calling
+/// `register` here.
 pub struct ExpertSource {
     pub bank: Arc<dyn AsRef<[u8]> + Send + Sync>,
     pub stride_bytes: usize,
