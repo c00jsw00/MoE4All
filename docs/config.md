@@ -272,23 +272,34 @@ all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 gates `/v1/chat/completions`, `/v1/embeddings`, and `/v1/models`, never `/health`),
 `max_tokens_cap`, `request_timeout_secs` (per-request wall-clock deadline in
 seconds; `0`, the default, means no deadline — a deadline truncates a legitimate
-slow reply, so it is opt-in), and `stats_interval_secs` (`INFR_SERVE_STATS_SECS`
-— how often the server logs its throughput line, default `5`; `0` switches the
-line off). `shutdown_file` (`INFR_SHUTDOWN_FILE`) is an optional supervisor IPC
+slow reply, so it is opt-in), and `stats_interval_secs` (`INFR_SERVE_STATS_SECS`,
+which controls how often the server logs aggregate throughput and per-request progress,
+default `5`; `0` switches periodic lines off). `shutdown_file`
+(`INFR_SHUTDOWN_FILE`) is an optional supervisor IPC
 path: creating that file requests the same graceful drain as SIGTERM, including
 during model loading. `embedding_runner` (`INFR_EMBEDDING_RUNNER`) optionally
 selects the managed llama-server executable; otherwise INFR discovers a compatible
 runner from its own directory, `PATH`, or LM Studio. Per-request sampling is not
 here — it stays on the request.
 
-The throughput line is **activity-only**: an interval in which nothing happened
-emits nothing, so an idle server leaves a clean log and there is no heartbeat to
-mistake for load. Its `prefill_tps`/`decode_tps` are the whole server's tokens
-divided by the WALL time of that one interval — not cumulative, and not the same
-number as the per-request `prefill_tps`/`decode_tps` on the `request done` line,
-which are that one request's own speeds (`prompt_tokens / TTFT` and
-`gen_tokens / (total - TTFT)`). Request logging carries **counts only, never
-prompt text**.
+The aggregate `serve stats` line is **activity-only**: an interval in which
+nothing happened emits nothing, so an idle server leaves a clean log and there
+is no heartbeat to mistake for load. Its `prefill_tps`/`decode_tps` are the whole
+server's model tokens divided by the WALL time of that interval, not
+cumulative. Each active request also emits a throttled `request progress` line
+at completed Prefill chunks and during Decode. It reports the exact model-token
+`context_tokens/context_limit`, uncached Prefill progress, cached prefix,
+generated tokens (including reasoning), and request-local rates. Phase changes
+and `request done` are still logged when periodic lines are disabled. Request
+logging carries **counts only, never prompt text**.
+
+Successful non-streaming responses, and the terminal finish frame of streaming
+responses, include authoritative `usage` plus a llama.cpp-compatible `timings`
+object. `timings.context_n` is the full prompt plus completion depth,
+`context_limit` is the KV slot capacity, and `cached_n` separates reused prompt
+tokens from `prompt_n` tokens actually evaluated. Streaming metrics are emitted
+unconditionally so clients that do not send `stream_options.include_usage` do
+not silently record zero tokens.
 
 **`[hub]`** — model acquisition (`infr pull`, and the auto-pull `infr run` /
 `infr serve` do when a model is missing). `endpoint` (`INFR_HF_ENDPOINT`) selects the

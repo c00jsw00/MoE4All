@@ -86,9 +86,11 @@ and fixed (`n_past+1`→`n_past`), with the acceptance-rate test passing.
   open) + `max_tokens` clamp; `tools` passed as a borrowed `&Value` (no
   round-trip) and a malformed forced `tool_choice` now 400s instead of silently
   downgrading to auto. Trait `ChatGenerator::chat` signature updated with its
-  two infr-cli impls. _Deferred:_ streaming `usage` chunk (needs
-  `stream_options.include_usage` parsing) and the e2e disconnect→slot-release
-  path (integration-only; the latch logic is unit-tested).
+  two infr-cli impls. Streaming completion frames now carry authoritative
+  `usage` and phase `timings` unconditionally, including cached and total
+  context counts, so clients that omit `stream_options.include_usage` do not
+  record zero tokens. _Deferred:_ the e2e disconnect→slot-release path
+  (integration-only; the latch logic is unit-tested).
 - **`infr-cli` (all 6 findings)** — TDD, +7 tests; dead-code `#![allow]`
   removed. `--dev` beats an inherited device setting via a pure
   `resolve_backend` + one unified `selected_backend()` reader. (As landed this

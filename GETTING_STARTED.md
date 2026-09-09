@@ -335,6 +335,16 @@ Invoke-RestMethod `
     -Body $body
 ```
 
+服务运行时会输出 `request progress`：长 Prefill 每完成一个 Ubatch 更新一次实际
+token 进度、当前/最大上下文和速度；进入 Decode 后继续统计全部生成 token，思考
+内容也包含在内。默认每 5 秒最多打印一次，可用
+`--set serve.stats_interval_secs=10` 调整，设为 `0` 可关闭周期日志。
+
+非流式响应和流式响应的最后一个完成帧都会返回真实 `usage` 与 `timings`。
+`timings.context_n` 是本轮结束时的总上下文，`context_limit` 是当前 KV slot 上限，
+`prompt_n`/`cached_n` 分别表示实际计算和复用的 prompt token。DeepSeek Harness 等
+未发送 `stream_options.include_usage` 的客户端也能获得这些统计。
+
 不设置 API key 时默认无鉴权，只适合回环地址或受信网络。
 
 ## 9. Benchmark 示例
