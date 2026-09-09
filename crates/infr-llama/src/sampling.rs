@@ -139,6 +139,9 @@ pub struct RequestCtx {
     abort: std::sync::atomic::AtomicBool,
     /// This sequence's turn-taking baton on the GPU (`None` = sole user, e.g. `infr run`).
     gate: Option<std::sync::Arc<StepGate>>,
+    /// Optional frontend observer for exact token/context progress. Server requests install one;
+    /// run/bench/tests leave it absent and pay only the branch in [`Self::report_progress`].
+    progress: Option<infr_core::GenerationProgressCallback>,
 }
 
 impl RequestCtx {
@@ -148,6 +151,7 @@ impl RequestCtx {
             sampling,
             abort: std::sync::atomic::AtomicBool::new(false),
             gate: None,
+            progress: None,
         }
     }
 
@@ -158,7 +162,17 @@ impl RequestCtx {
             sampling,
             abort: std::sync::atomic::AtomicBool::new(false),
             gate: Some(gate),
+            progress: None,
         }
+    }
+
+    /// Attach live generation telemetry before this request enters the runner.
+    pub fn with_progress(
+        mut self,
+        progress: Option<infr_core::GenerationProgressCallback>,
+    ) -> Self {
+        self.progress = progress;
+        self
     }
 
     pub fn sampling(&self) -> &RequestSampling {
@@ -189,6 +203,14 @@ impl RequestCtx {
     /// chunks so decodes aren't starved, a sole one wants big chunks for prefill throughput.
     pub(crate) fn shares_gpu(&self) -> bool {
         self.gate.is_some()
+    }
+
+    /// Publish one cumulative progress snapshot. The callback itself owns presentation throttling;
+    /// the runner calls this only at natural work boundaries.
+    pub(crate) fn report_progress(&self, progress: infr_core::GenerationProgress) {
+        if let Some(observer) = &self.progress {
+            observer(progress);
+        }
     }
 }
 

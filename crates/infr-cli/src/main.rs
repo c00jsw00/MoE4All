@@ -2269,9 +2269,19 @@ impl infr_server::ChatGenerator for SeamGenerator {
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
         cancel: &std::sync::atomic::AtomicBool,
+        progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<infr_server::ChatOutcome> {
-        run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
+        run_chat(
+            self,
+            messages,
+            tools,
+            tool_choice,
+            params,
+            cancel,
+            progress,
+            on_delta,
+        )
     }
 }
 
@@ -2283,9 +2293,19 @@ impl infr_server::ChatGenerator for ParallelGenerator {
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
         cancel: &std::sync::atomic::AtomicBool,
+        progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<infr_server::ChatOutcome> {
-        run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
+        run_chat(
+            self,
+            messages,
+            tools,
+            tool_choice,
+            params,
+            cancel,
+            progress,
+            on_delta,
+        )
     }
 }
 
@@ -2314,6 +2334,7 @@ fn run_chat(
     tool_choice: Option<&str>,
     params: &infr_server::GenParams,
     cancel: &std::sync::atomic::AtomicBool,
+    progress: Option<infr_core::GenerationProgressCallback>,
     on_delta: &mut dyn FnMut(infr_engine::Delta),
 ) -> anyhow::Result<infr_server::ChatOutcome> {
     {
@@ -2333,7 +2354,9 @@ fn run_chat(
         // THIS sequence's own sampling (temperature/top_p/top_k/seed/penalties) + abort latch + GPU
         // turn. Owned by this call — not installed anywhere ambient — so it cannot be observed by,
         // or leak into, any other in-flight request.
-        let req = be.request_ctx(request_sampling(params));
+        let req = be
+            .request_ctx(request_sampling(params))
+            .with_progress(progress);
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
         // seam decode). Prime the assistant turn with the <tool_call> opener and parse the

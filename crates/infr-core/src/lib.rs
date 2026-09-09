@@ -48,6 +48,46 @@ pub use pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
 pub use resource::{MemoryTier, ResourceKind, ResourceLease, ResourceSnapshot, ResourceTracker};
 pub use tensor::{DType, Shape, TensorDesc, TensorId};
 
+/// Which part of an autoregressive request is currently making progress.
+///
+/// This deliberately describes model work rather than rendered text. A reasoning token and an
+/// ordinary answer token are both [`Decode`](Self::Decode), even when a protocol adapter buffers
+/// or routes their decoded text differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationPhase {
+    Prefill,
+    Decode,
+}
+
+/// Cumulative, backend-independent progress for one generation request.
+///
+/// Counts are token counts reported by the model runner, never estimates derived from UTF-8 text
+/// pieces. Callbacks receive a snapshot after each natural work unit (a Prefill chunk or generated
+/// token), so consumers can throttle presentation without losing accounting accuracy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationProgress {
+    pub phase: GenerationPhase,
+    /// The complete rendered prompt, including the part served from an existing KV prefix.
+    pub prompt_tokens: u64,
+    /// Prompt tokens served from an existing KV prefix this turn.
+    pub cached_prompt_tokens: u64,
+    /// Prompt tokens actually evaluated so far this turn.
+    pub prefill_tokens: u64,
+    /// Tokens generated so far, including reasoning tokens.
+    pub completion_tokens: u64,
+    /// Logical context reached so far: cached + evaluated prompt during Prefill, then the complete
+    /// prompt + generated tokens during Decode.
+    pub context_tokens: u64,
+    /// Capacity of this request's KV/session slot.
+    pub context_limit: u64,
+}
+
+/// Optional observer installed only by frontends that need live request telemetry. Keeping the
+/// callback behind an `Option` in the runner leaves run/bench with one predictable branch and no
+/// allocation, atomic update, or formatting on each token.
+pub type GenerationProgressCallback =
+    std::sync::Arc<dyn Fn(GenerationProgress) + Send + Sync + 'static>;
+
 /// A parsed human size/count value: an absolute amount, or a percentage the CALLER resolves
 /// against the knob-appropriate base (device-local VRAM for GPU budgets; total physical RAM for
 /// the process-wide `device.ram_budget`; available system RAM for automatic host-cache policy).

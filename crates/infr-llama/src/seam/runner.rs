@@ -6560,6 +6560,33 @@ pub(crate) fn generate_dense_backend(
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
+    let prompt_work = prompt.len().saturating_sub(start);
+    let report_progress =
+        |phase: infr_core::GenerationPhase, prefill_tokens: usize, completion_tokens: usize| {
+            if let Some(req) = req {
+                let context_tokens = match phase {
+                    infr_core::GenerationPhase::Prefill => {
+                        start.saturating_add(prefill_tokens).min(prompt.len())
+                    }
+                    infr_core::GenerationPhase::Decode => {
+                        prompt.len().saturating_add(completion_tokens)
+                    }
+                };
+                req.report_progress(infr_core::GenerationProgress {
+                    phase,
+                    prompt_tokens: prompt.len() as u64,
+                    cached_prompt_tokens: start as u64,
+                    prefill_tokens: prefill_tokens.min(prompt_work) as u64,
+                    completion_tokens: completion_tokens as u64,
+                    context_tokens: context_tokens as u64,
+                    context_limit: max_ctx as u64,
+                });
+            }
+        };
+    // The first exact token count becomes available only after tokenization, slot selection and
+    // prefix reconciliation. Publish it before the first forward so a long Prefill is visible even
+    // while no text delta exists yet.
+    report_progress(infr_core::GenerationPhase::Prefill, 0, 0);
     // `prof.stages` (INFR_PROF_STAGES): split decode per-token wall time into host setup (build
     // graph + compile + bind) vs execute (record + submit + GPU + wait) to guide the
     // record-once-replay decision. Hoisted here, ABOVE the loop — the old read was a `getenv` on
@@ -7014,6 +7041,11 @@ pub(crate) fn generate_dense_backend(
                         );
                         }
                         prompt_t += pf_t0.elapsed();
+                        report_progress(
+                            infr_core::GenerationPhase::Prefill,
+                            cend.saturating_sub(start),
+                            decode_n,
+                        );
                         // Last span for this chunk: its uploads and its residual stream are dead.
                         if si + 1 == spans.len() {
                             live[ci] = None;
@@ -7291,6 +7323,7 @@ pub(crate) fn generate_dense_backend(
                     if fed > 0 {
                         last_written = Some(pos + fed - 1);
                     }
+                    report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
                     if stop {
                         break;
                     }
@@ -7605,6 +7638,7 @@ pub(crate) fn generate_dense_backend(
                     cur.push(t);
                     decode_n += 1;
                 }
+                report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
                 if done || out.len() >= max_new || crate::sampling::abort_requested(req) {
                     break;
                 }
@@ -7629,6 +7663,7 @@ pub(crate) fn generate_dense_backend(
                 out.push(next);
                 decode_t += step_t0.elapsed();
                 decode_n += 1;
+                report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
                 if !is_eos {
                     on_token(next); // stream the token (EOS is not emitted)
                 }
@@ -7645,6 +7680,11 @@ pub(crate) fn generate_dense_backend(
             decode_t += step_t0.elapsed();
         } else {
             prompt_t += step_t0.elapsed();
+            report_progress(
+                infr_core::GenerationPhase::Prefill,
+                pos.saturating_add(1).saturating_sub(start),
+                decode_n,
+            );
         }
         pos += 1;
     }
