@@ -11,6 +11,7 @@
 //!
 //! Run:
 //! `cargo test -p infr-vulkan --release --test vulkan_overlap_matrix -- --ignored --nocapture`
+//! Set `INFR_VULKAN_TEST_DEVICE=7900 XTX` when more than one discrete GPU is installed.
 
 #![cfg(target_os = "windows")]
 
@@ -1150,17 +1151,29 @@ fn windows_vulkan_overlap_matrix() {
                 None,
             )
             .expect("create Vulkan instance");
+        let device_selector = std::env::var("INFR_VULKAN_TEST_DEVICE").ok();
         let physical = instance
             .enumerate_physical_devices()
             .expect("enumerate Vulkan devices")
             .into_iter()
             .find(|&candidate| {
-                instance
-                    .get_physical_device_properties(candidate)
-                    .device_type
-                    == vk::PhysicalDeviceType::DISCRETE_GPU
+                let properties = instance.get_physical_device_properties(candidate);
+                if properties.device_type != vk::PhysicalDeviceType::DISCRETE_GPU {
+                    return false;
+                }
+                device_selector.as_ref().is_none_or(|selector| {
+                    CStr::from_ptr(properties.device_name.as_ptr())
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains(&selector.to_ascii_lowercase())
+                })
             })
-            .expect("find discrete Vulkan GPU");
+            .unwrap_or_else(|| {
+                panic!(
+                    "find discrete Vulkan GPU matching {:?}",
+                    device_selector.as_deref()
+                )
+            });
         let props = instance.get_physical_device_properties(physical);
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy();
         let queue_props = instance.get_physical_device_queue_family_properties(physical);
