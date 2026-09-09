@@ -374,6 +374,16 @@ pub struct InclusiveHostStats {
     pub bytes_promoted: u64,
 }
 
+/// Non-blocking residency view used by speculative upper-tier scheduling. `Absent` means the
+/// descriptor is known but no RAM slot currently owns it; callers that need the bytes normally
+/// still use [`InclusiveHostCache::promote`] and retain its existing wait/fallback semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InclusiveBlockState {
+    Absent,
+    Loading,
+    Ready,
+}
+
 struct InclusiveInner {
     pager: Option<Pager>,
     state: HashMap<BlockId, SlotState>,
@@ -578,6 +588,105 @@ impl InclusiveHostCache {
             .descs
             .get(&id)
             .map(BlockDesc::nbytes)
+    }
+
+    /// Inspect one registered block without touching its RAM LRU position.
+    pub fn block_state(&self, id: BlockId) -> Result<InclusiveBlockState> {
+        let inner = self.inner.lock().unwrap();
+        if !inner.descs.contains_key(&id) {
+            return Err(Error::backend(format!(
+                "inclusive host cache: block {id} was never registered"
+            )));
+        }
+        Ok(match inner.state.get(&id) {
+            Some(SlotState::Loading) => InclusiveBlockState::Loading,
+            Some(SlotState::Ready) => InclusiveBlockState::Ready,
+            None => InclusiveBlockState::Absent,
+        })
+    }
+
+    /// Best-effort SSD-to-RAM prefetch inserted at the cold end of the host LRU.
+    ///
+    /// The slot is reserved and pinned under `inner`, but disk I/O runs after releasing the lock.
+    /// Real demand for this same block joins through the existing `Loading` wait, while unrelated
+    /// RAM hits and misses remain free to proceed. A full cache whose every slot is a GPU shadow
+    /// simply declines the speculative admission.
+    pub fn prefetch_cold(&self, id: BlockId) -> Result<bool> {
+        let prof = pager_profile::active();
+        let (slot, desc, host_evicted) = {
+            let mut inner = self.inner.lock().unwrap();
+            let desc = inner.descs.get(&id).cloned().ok_or_else(|| {
+                Error::backend(format!(
+                    "inclusive host cache: block {id} was never registered"
+                ))
+            })?;
+            if inner.state.contains_key(&id) {
+                return Ok(false);
+            }
+            let Some(pager) = inner.pager.as_mut() else {
+                return Ok(false);
+            };
+            match pager.resolve_and_pin(id, Insert::Cold) {
+                Some(Resolution::Miss { slot, evicted }) => {
+                    if let Some(old) = evicted {
+                        let removed = inner.state.remove(&old);
+                        debug_assert_eq!(removed, Some(SlotState::Ready));
+                        self.ram_evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                    inner.state.insert(id, SlotState::Loading);
+                    (slot, desc, evicted.is_some())
+                }
+                Some(Resolution::Hit { .. }) => {
+                    return Err(Error::backend(format!(
+                        "inclusive host cache: block {id} became resident without slot state"
+                    )));
+                }
+                None => return Ok(false),
+            }
+        };
+
+        let len = desc.nbytes();
+        // SAFETY: this call reserved `slot` as Loading and pinned `id` before dropping `inner`.
+        // The ordinary demand path uses the same ownership proof in `HostPager::pin`.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, len), len) };
+        let read_t0 = prof.then(std::time::Instant::now);
+        let read = self.io.read_block(&desc, dst);
+        let read_elapsed = read_t0.map(|started| started.elapsed());
+        let mut inner = self.inner.lock().unwrap();
+        match read {
+            Ok(()) => {
+                inner.state.insert(id, SlotState::Ready);
+                inner
+                    .pager
+                    .as_mut()
+                    .expect("a prefetched block owns a host pager slot")
+                    .unpin(id);
+                self.ssd_reads.fetch_add(1, Ordering::Relaxed);
+                self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
+                if prof {
+                    pager_profile::record_host_miss(len, host_evicted);
+                    if let Some(elapsed) = read_elapsed {
+                        pager_profile::record_host_read(len, elapsed, false);
+                    }
+                }
+                drop(inner);
+                self.ready.notify_all();
+                Ok(true)
+            }
+            Err(error) => {
+                inner.state.remove(&id);
+                let pager = inner
+                    .pager
+                    .as_mut()
+                    .expect("a prefetched block owns a host pager slot");
+                pager.unpin(id);
+                let removed = pager.evict(id);
+                debug_assert_eq!(removed, Some(slot));
+                drop(inner);
+                self.ready.notify_all();
+                Err(error)
+            }
+        }
     }
 
     pub fn arena_bytes(&self) -> usize {
@@ -1967,6 +2076,20 @@ mod tests {
         }
     }
 
+    struct GatedIo {
+        entered: std::sync::Barrier,
+        release: std::sync::Barrier,
+    }
+
+    impl BlockIo for GatedIo {
+        fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+            self.entered.wait();
+            self.release.wait();
+            dst[..desc.nbytes()].fill(desc.id as u8);
+            Ok(())
+        }
+    }
+
     fn desc(id: BlockId, len: usize) -> BlockDesc {
         BlockDesc {
             id,
@@ -2012,6 +2135,77 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.ssd_reads, 2);
         assert_eq!(stats.shadow_resident, 2);
+    }
+
+    #[test]
+    fn inclusive_cold_prefetch_releases_the_cache_lock_during_io() {
+        let io = Arc::new(GatedIo {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        });
+        let cache = Arc::new(InclusiveHostCache::new(2, 16, io.clone()).expect("cache"));
+        cache.register(desc(1, 16)).expect("register 1");
+        cache.register(desc(2, 16)).expect("register 2");
+
+        let worker_cache = Arc::clone(&cache);
+        let worker = std::thread::spawn(move || worker_cache.prefetch_cold(1));
+        io.entered.wait();
+
+        let query_cache = Arc::clone(&cache);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let query = std::thread::spawn(move || {
+            tx.send(query_cache.block_state(2)).expect("send state");
+        });
+        let state = rx.recv_timeout(std::time::Duration::from_secs(1));
+        io.release.wait();
+
+        assert_eq!(
+            state
+                .expect("an unrelated RAM query was blocked behind SSD I/O")
+                .expect("query state"),
+            InclusiveBlockState::Absent
+        );
+        assert!(worker.join().expect("prefetch thread").expect("prefetch"));
+        query.join().expect("query thread");
+        assert_eq!(
+            cache.block_state(1).expect("prefetched state"),
+            InclusiveBlockState::Ready
+        );
+    }
+
+    #[test]
+    fn inclusive_cold_prefetch_is_cold_and_rolls_back_failed_io() {
+        let io = Arc::new(FakeIo::new());
+        let cache = InclusiveHostCache::new(2, 16, io).expect("cache");
+        for id in 1..=4 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+        cache.preload(&[1, 2]).expect("preload");
+        assert!(cache.prefetch_cold(3).expect("prefetch 3"));
+        assert_eq!(
+            cache.block_state(3).expect("state 3"),
+            InclusiveBlockState::Ready
+        );
+
+        cache.promote(4, None, |_| Ok(())).expect("promote 4");
+        assert_eq!(
+            cache.block_state(3).expect("state 3 after demand"),
+            InclusiveBlockState::Absent,
+            "the speculative cold insert should be the next ordinary victim"
+        );
+
+        let failing_io = Arc::new(FakeIo {
+            reads: AtomicUsize::new(0),
+            fail_on: Some(9),
+            delay: None,
+        });
+        let failing = InclusiveHostCache::new(1, 16, failing_io).expect("failing cache");
+        failing.register(desc(9, 16)).expect("register 9");
+        assert!(failing.prefetch_cold(9).is_err());
+        assert_eq!(
+            failing.block_state(9).expect("rolled-back state"),
+            InclusiveBlockState::Absent
+        );
     }
 
     #[test]

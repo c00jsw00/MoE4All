@@ -6155,9 +6155,99 @@ fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
     }
 }
 
+const PREFETCH_QSA_BUCKET_TOKENS: u32 = 32 * 1024;
+const PREFETCH_CALIBRATION_SAMPLES: usize = 2;
+const PREFETCH_WINDOW_NUMERATOR: u64 = 4;
+const PREFETCH_WINDOW_DENOMINATOR: u64 = 5;
+const PREFETCH_TRANSFER_GUARD_NS: u64 = 40_000;
+const PREFETCH_INITIAL_NS_PER_MIB: u64 = 60_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DecodePrefetchWindowKey {
+    qsa: bool,
+    context_bucket: u32,
+}
+
+impl DecodePrefetchWindowKey {
+    fn new(qsa: bool, context_tokens: u32) -> Self {
+        Self {
+            qsa,
+            context_bucket: if qsa {
+                context_tokens / PREFETCH_QSA_BUCKET_TOKENS
+            } else {
+                0
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct DecodePrefetchWindow {
+    clean_ns: [u64; PREFETCH_CALIBRATION_SAMPLES],
+    clean_samples: usize,
+    budget_ns: Option<u64>,
+}
+
+#[derive(Default)]
+struct DecodePrefetchTiming {
+    windows: HashMap<DecodePrefetchWindowKey, DecodePrefetchWindow>,
+}
+
+impl DecodePrefetchTiming {
+    fn begin(&mut self, key: DecodePrefetchWindowKey) -> Option<u64> {
+        self.windows.entry(key).or_default().budget_ns
+    }
+
+    fn observe(
+        &mut self,
+        key: DecodePrefetchWindowKey,
+        offered_budget_ns: Option<u64>,
+        elapsed: std::time::Duration,
+        overrun: bool,
+    ) {
+        let window = self.windows.entry(key).or_default();
+        if offered_budget_ns.is_none() {
+            if window.clean_samples >= PREFETCH_CALIBRATION_SAMPLES {
+                return;
+            }
+            window.clean_ns[window.clean_samples] = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+            window.clean_samples += 1;
+            if window.clean_samples == PREFETCH_CALIBRATION_SAMPLES {
+                let clean_ns = *window
+                    .clean_ns
+                    .iter()
+                    .min()
+                    .expect("two calibration samples");
+                let budget_ns = clean_ns.saturating_mul(PREFETCH_WINDOW_NUMERATOR)
+                    / PREFETCH_WINDOW_DENOMINATOR;
+                window.budget_ns = Some(budget_ns);
+                tracing::info!(
+                    mixer = if key.qsa { "qsa" } else { "gdn" },
+                    context_bucket = key.context_bucket,
+                    clean_window_us = clean_ns / 1_000,
+                    transfer_budget_us = budget_ns / 1_000,
+                    "[infr] calibrated next-layer expert prefetch window"
+                );
+            }
+        } else if overrun {
+            // Active samples may be stretched by DMA contention, so they never increase the
+            // budget. A transfer still live at the real router is direct evidence that the old
+            // budget was too optimistic and may safely tighten it.
+            if let Some(budget_ns) = window.budget_ns.as_mut() {
+                *budget_ns = budget_ns.saturating_mul(7) / 8;
+            }
+        }
+    }
+}
+
 struct DecodePrefetchControl {
     target_layer: u32,
+    window_key: DecodePrefetchWindowKey,
+    started: std::time::Instant,
+    budget_ns: Option<u64>,
     cancel: AtomicBool,
+    worker_done: AtomicBool,
+    transfer_inflight: AtomicBool,
     latest_transfer: AtomicU64,
     error: Mutex<Option<String>>,
 }
@@ -6168,14 +6258,21 @@ struct DecodePrefetchJob {
     predicted_ids: Vec<u32>,
 }
 
+struct DecodeSsdPrefetchJob {
+    plan: crate::pager::PreparedHostPrefetch,
+}
+
 /// One persistent worker per paged Vulkan backend. Persistence matters for Qwen3.8: layer 0 and
 /// layers 1..end are separate graph executions around the CPU PLE hand-off, while a layer-0
 /// prediction should remain live across that boundary.
 pub(crate) struct DecodePrefetchScheduler {
     tx: Option<mpsc::Sender<Option<DecodePrefetchJob>>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    ssd_tx: Option<mpsc::Sender<Option<DecodeSsdPrefetchJob>>>,
+    ssd_thread: Option<std::thread::JoinHandle<()>>,
     active: Option<Arc<DecodePrefetchControl>>,
     handed_off_transfer: u64,
+    timing: DecodePrefetchTiming,
     pager: Arc<crate::pager::MoePagerCell>,
     executor: crate::transfer::BackgroundTransferExecutor,
 }
@@ -6185,17 +6282,46 @@ impl DecodePrefetchScheduler {
         pager: Arc<crate::pager::MoePagerCell>,
         executor: crate::transfer::BackgroundTransferExecutor,
     ) -> std::io::Result<Self> {
+        let (ssd_tx, ssd_rx) = mpsc::channel();
+        let ssd_busy = Arc::new(AtomicBool::new(false));
+        let ssd_thread_busy = Arc::clone(&ssd_busy);
+        let ssd_thread = std::thread::Builder::new()
+            .name("infr-moe-ssd-prefetch".to_owned())
+            .spawn(move || run_decode_ssd_prefetch_worker(ssd_rx, ssd_thread_busy))?;
         let (tx, rx) = mpsc::channel();
         let worker_pager = Arc::clone(&pager);
         let worker_executor = executor.clone();
-        let thread = std::thread::Builder::new()
+        let worker_ssd_tx = ssd_tx.clone();
+        let worker_ssd_busy = Arc::clone(&ssd_busy);
+        let ram_ns_per_mib = Arc::new(AtomicU64::new(PREFETCH_INITIAL_NS_PER_MIB));
+        let worker_ram_ns_per_mib = Arc::clone(&ram_ns_per_mib);
+        let thread = match std::thread::Builder::new()
             .name("infr-moe-decode-prefetch".to_owned())
-            .spawn(move || run_decode_prefetch_worker(worker_pager, worker_executor, rx))?;
+            .spawn(move || {
+                run_decode_prefetch_worker(
+                    worker_pager,
+                    worker_executor,
+                    rx,
+                    worker_ssd_tx,
+                    worker_ssd_busy,
+                    worker_ram_ns_per_mib,
+                )
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                let _ = ssd_tx.send(None);
+                let _ = ssd_thread.join();
+                return Err(error);
+            }
+        };
         Ok(Self {
             tx: Some(tx),
             thread: Some(thread),
+            ssd_tx: Some(ssd_tx),
+            ssd_thread: Some(ssd_thread),
             active: None,
             handed_off_transfer: 0,
+            timing: DecodePrefetchTiming::default(),
             pager,
             executor,
         })
@@ -6208,6 +6334,8 @@ impl DecodePrefetchScheduler {
     fn issue(
         &mut self,
         target_layer: u32,
+        target_qsa: bool,
+        context_tokens: u32,
         role_buf_ids: Vec<usize>,
         predicted_ids: Vec<u32>,
     ) -> Result<()> {
@@ -6217,9 +6345,19 @@ impl DecodePrefetchScheduler {
                 active.target_layer
             )));
         }
+        let window_key = DecodePrefetchWindowKey::new(target_qsa, context_tokens);
+        let budget_ns = self.timing.begin(window_key);
+        if budget_ns.is_none() && infr_core::pager_profile::active() {
+            infr_core::pager_profile::record_decode_prefetch_calibration();
+        }
         let control = Arc::new(DecodePrefetchControl {
             target_layer,
+            window_key,
+            started: std::time::Instant::now(),
+            budget_ns,
             cancel: AtomicBool::new(false),
+            worker_done: AtomicBool::new(false),
+            transfer_inflight: AtomicBool::new(false),
             latest_transfer: AtomicU64::new(0),
             error: Mutex::new(None),
         });
@@ -6244,6 +6382,12 @@ impl DecodePrefetchScheduler {
             return Ok(0);
         };
         let matched = control.target_layer == layer;
+        let elapsed = control.started.elapsed();
+        let overrun = !control.worker_done.load(Ordering::Acquire)
+            && control.transfer_inflight.load(Ordering::Acquire);
+        if overrun && infr_core::pager_profile::active() {
+            infr_core::pager_profile::record_decode_prefetch_overrun();
+        }
         let value = self.quiesce(&control, !matched)?;
         if !matched {
             tracing::debug!(
@@ -6253,6 +6397,8 @@ impl DecodePrefetchScheduler {
             );
             return Ok(0);
         }
+        self.timing
+            .observe(control.window_key, control.budget_ns, elapsed, overrun);
         self.handed_off_transfer = self.handed_off_transfer.max(value);
         Ok(value)
     }
@@ -6315,6 +6461,41 @@ impl Drop for DecodePrefetchScheduler {
                 tracing::warn!("[infr] decode expert prefetch worker panicked during shutdown");
             }
         }
+        if let Some(tx) = self.ssd_tx.take() {
+            let _ = tx.send(None);
+        }
+        if let Some(thread) = self.ssd_thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!("[infr] SSD expert prefetch worker panicked during shutdown");
+            }
+        }
+    }
+}
+
+fn estimate_ram_prefetch_ns(bytes: usize, ns_per_mib: &AtomicU64) -> u64 {
+    let scaled = (bytes as u128)
+        .saturating_mul(ns_per_mib.load(Ordering::Relaxed) as u128)
+        .div_ceil(1u128 << 20)
+        .min(u64::MAX as u128) as u64;
+    scaled.saturating_add(PREFETCH_TRANSFER_GUARD_NS)
+}
+
+fn observe_ram_prefetch(bytes: usize, elapsed: std::time::Duration, ns_per_mib: &AtomicU64) {
+    if bytes == 0 {
+        return;
+    }
+    let sample = elapsed
+        .as_nanos()
+        .saturating_mul(1u128 << 20)
+        .div_ceil(bytes as u128)
+        .min(u64::MAX as u128) as u64;
+    let mut old = ns_per_mib.load(Ordering::Relaxed);
+    loop {
+        let next = old.saturating_mul(3).saturating_add(sample) / 4;
+        match ns_per_mib.compare_exchange_weak(old, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => old = actual,
+        }
     }
 }
 
@@ -6322,38 +6503,180 @@ fn run_decode_prefetch_worker(
     pager: Arc<crate::pager::MoePagerCell>,
     executor: crate::transfer::BackgroundTransferExecutor,
     rx: mpsc::Receiver<Option<DecodePrefetchJob>>,
+    ssd_tx: mpsc::Sender<Option<DecodeSsdPrefetchJob>>,
+    ssd_busy: Arc<AtomicBool>,
+    ram_ns_per_mib: Arc<AtomicU64>,
 ) {
     while let Ok(Some(job)) = rx.recv() {
+        let Some(budget_ns) = job.control.budget_ns else {
+            job.control.worker_done.store(true, Ordering::Release);
+            continue;
+        };
+        let deadline = job.control.started + std::time::Duration::from_nanos(budget_ns);
+        let mut pending_ssd = None;
+        let profile = infr_core::pager_profile::active();
         for expert in job.predicted_ids {
             if job.control.cancel.load(Ordering::Acquire) {
                 break;
             }
-            let mut guard = pager.lock().unwrap();
-            if job.control.cancel.load(Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                if profile {
+                    infr_core::pager_profile::record_decode_prefetch_deadline_stop();
+                }
                 break;
             }
-            let result = guard
-                .as_mut()
-                .ok_or_else(|| be("decode expert prefetch has no pager session"))
-                .and_then(|session| {
-                    session.prefetch_roles_cpu(&executor, &job.role_buf_ids, expert)
-                })
-                .and_then(|push| push.submit_background(&executor));
-            match result {
-                Ok(Some(value)) => {
-                    job.control
-                        .latest_transfer
-                        .fetch_max(value, Ordering::Release);
-                }
-                Ok(None) => {}
+            if profile {
+                infr_core::pager_profile::record_decode_prefetch_candidate();
+            }
+            let source = {
+                let guard = pager.lock().unwrap();
+                guard
+                    .as_ref()
+                    .ok_or_else(|| be("decode expert prefetch has no pager session"))
+                    .and_then(|session| session.expert_prefetch_source(&job.role_buf_ids, expert))
+            };
+            let source = match source {
+                Ok(source) => source,
                 Err(error) => {
                     *job.control.error.lock().unwrap() = Some(error.to_string());
                     job.control.cancel.store(true, Ordering::Release);
                     break;
                 }
+            };
+            match source {
+                crate::pager::ExpertPrefetchSource::Resident => {
+                    if profile {
+                        infr_core::pager_profile::record_decode_prefetch_vram_resident();
+                    }
+                    continue;
+                }
+                crate::pager::ExpertPrefetchSource::Loading => {
+                    if profile {
+                        infr_core::pager_profile::record_decode_prefetch_host_loading();
+                    }
+                    continue;
+                }
+                crate::pager::ExpertPrefetchSource::Ssd(plan) => {
+                    if pending_ssd.is_none() {
+                        pending_ssd = Some(plan);
+                    }
+                    continue;
+                }
+                crate::pager::ExpertPrefetchSource::Ram { bytes } => {
+                    let estimate = estimate_ram_prefetch_ns(bytes, &ram_ns_per_mib);
+                    let Some(finish) = std::time::Instant::now()
+                        .checked_add(std::time::Duration::from_nanos(estimate))
+                    else {
+                        break;
+                    };
+                    if finish > deadline {
+                        if profile {
+                            infr_core::pager_profile::record_decode_prefetch_deadline_stop();
+                        }
+                        break;
+                    }
+
+                    let started = std::time::Instant::now();
+                    job.control.transfer_inflight.store(true, Ordering::Release);
+                    let result = {
+                        let mut guard = pager.lock().unwrap();
+                        if job.control.cancel.load(Ordering::Acquire) {
+                            job.control
+                                .transfer_inflight
+                                .store(false, Ordering::Release);
+                            break;
+                        }
+                        guard
+                            .as_mut()
+                            .ok_or_else(|| be("decode expert prefetch has no pager session"))
+                            .and_then(|session| {
+                                session.prefetch_roles_cpu(&executor, &job.role_buf_ids, expert)
+                            })
+                            .and_then(|push| {
+                                let moved = push.bytes();
+                                push.submit_background(&executor)
+                                    .map(|value| (value, moved))
+                            })
+                            .map(|(value, moved)| {
+                                if let Some(value) = value {
+                                    job.control
+                                        .latest_transfer
+                                        .fetch_max(value, Ordering::Release);
+                                }
+                                (value, moved)
+                            })
+                    };
+                    let (value, moved) = match result {
+                        Ok(value) => value,
+                        Err(error) => {
+                            job.control
+                                .transfer_inflight
+                                .store(false, Ordering::Release);
+                            *job.control.error.lock().unwrap() = Some(error.to_string());
+                            job.control.cancel.store(true, Ordering::Release);
+                            break;
+                        }
+                    };
+                    if let Some(value) = value {
+                        if let Err(error) = executor.wait(value) {
+                            job.control
+                                .transfer_inflight
+                                .store(false, Ordering::Release);
+                            *job.control.error.lock().unwrap() = Some(error.to_string());
+                            job.control.cancel.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                    job.control
+                        .transfer_inflight
+                        .store(false, Ordering::Release);
+                    observe_ram_prefetch(moved, started.elapsed(), &ram_ns_per_mib);
+                    if profile && moved != 0 {
+                        infr_core::pager_profile::record_decode_prefetch_ram(moved);
+                    }
+                }
             }
         }
+        // Let ranked RAM candidates become pinned GPU shadows first, so this cold RAM insertion
+        // cannot evict a source the H2D worker was about to consume. SSD prefetch is allowed to
+        // finish after the transfer deadline: it only warms RAM, and real demand for the same
+        // block joins its Loading state instead of issuing a duplicate read.
+        if let Some(plan) = pending_ssd {
+            if !job.control.cancel.load(Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+                && ssd_busy
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                && ssd_tx.send(Some(DecodeSsdPrefetchJob { plan })).is_err()
+            {
+                ssd_busy.store(false, Ordering::Release);
+                *job.control.error.lock().unwrap() =
+                    Some("SSD expert prefetch worker is closed".to_owned());
+                job.control.cancel.store(true, Ordering::Release);
+            }
+        }
+        job.control.worker_done.store(true, Ordering::Release);
     }
+}
+
+fn run_decode_ssd_prefetch_worker(
+    rx: mpsc::Receiver<Option<DecodeSsdPrefetchJob>>,
+    busy: Arc<AtomicBool>,
+) {
+    while let Ok(Some(job)) = rx.recv() {
+        match job.plan.execute() {
+            Ok(blocks) => {
+                if infr_core::pager_profile::active() {
+                    infr_core::pager_profile::record_decode_prefetch_ssd(blocks);
+                }
+            }
+            Err(error) => {
+                tracing::warn!("[infr] speculative SSD expert prefetch failed: {error}");
+            }
+        }
+        busy.store(false, Ordering::Release);
+    }
+    busy.store(false, Ordering::Release);
 }
 
 fn decode_prefetch_active_target(be_: &VulkanBackend) -> Option<u32> {
@@ -6379,6 +6702,8 @@ fn finish_decode_prefetch_target(be_: &VulkanBackend, layer: u32) -> Result<u64>
 fn issue_decode_prefetch(
     be_: &VulkanBackend,
     target_layer: u32,
+    target_qsa: bool,
+    context_tokens: u32,
     role_buf_ids: Vec<usize>,
     predicted_ids: Vec<u32>,
 ) -> Result<()> {
@@ -6387,7 +6712,13 @@ fn issue_decode_prefetch(
         .unwrap()
         .as_mut()
         .map_or(Ok(()), |scheduler| {
-            scheduler.issue(target_layer, role_buf_ids, predicted_ids)
+            scheduler.issue(
+                target_layer,
+                target_qsa,
+                context_tokens,
+                role_buf_ids,
+                predicted_ids,
+            )
         })
 }
 
@@ -8065,11 +8396,7 @@ fn execute_paged_moe<'a>(
         let mut id_bytes = vec![0u8; predicted * 4];
         be_.download(pool[&ids_key].as_ref(), &mut id_bytes)
             .map_err(|e| be(e.to_string()))?;
-        Some((
-            hint.target_layer,
-            role_buf_ids,
-            bytemuck::cast_slice(&id_bytes).to_vec(),
-        ))
+        Some((hint, role_buf_ids, bytemuck::cast_slice(&id_bytes).to_vec()))
     } else {
         None
     };
@@ -8434,8 +8761,15 @@ fn execute_paged_moe<'a>(
     // `_xpg` kernel builds (`infr_core::tensor::MOE_MMQ_PAGED_DTYPES` — the FULL
     // `MOE_MMQ_DTYPES` set, mirror checked by `moe_mmq_drift_test`) + activation + dp4a
     // support; anything else stays on the id-GEMV arm below, which is shape-general.
-    if let Some((target_layer, role_buf_ids, predicted_ids)) = pending_prefetch {
-        issue_decode_prefetch(be_, target_layer, role_buf_ids, predicted_ids)?;
+    if let Some((hint, role_buf_ids, predicted_ids)) = pending_prefetch {
+        issue_decode_prefetch(
+            be_,
+            hint.target_layer,
+            hint.target_qsa,
+            hint.context_tokens,
+            role_buf_ids,
+            predicted_ids,
+        )?;
     }
 
     if let PagedMoeScratch::Mmq(scratch) = &moe_scratch {
@@ -8853,6 +9187,59 @@ mod tests {
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;
     use infr_core::DType;
+
+    #[test]
+    fn decode_prefetch_window_calibrates_only_from_clean_samples() {
+        let key = DecodePrefetchWindowKey::new(false, 250_000);
+        let mut timing = DecodePrefetchTiming::default();
+        assert_eq!(timing.begin(key), None);
+        timing.observe(key, None, std::time::Duration::from_micros(1_000), false);
+        assert_eq!(timing.begin(key), None);
+        timing.observe(key, None, std::time::Duration::from_micros(800), false);
+        assert_eq!(timing.begin(key), Some(640_000));
+
+        timing.observe(
+            key,
+            Some(640_000),
+            std::time::Duration::from_micros(2_000),
+            false,
+        );
+        assert_eq!(
+            timing.begin(key),
+            Some(640_000),
+            "a DMA-stretched active sample must not increase the window"
+        );
+        timing.observe(
+            key,
+            Some(640_000),
+            std::time::Duration::from_micros(2_000),
+            true,
+        );
+        assert_eq!(timing.begin(key), Some(560_000));
+    }
+
+    #[test]
+    fn decode_prefetch_window_buckets_qsa_but_not_gdn_depth() {
+        assert_eq!(
+            DecodePrefetchWindowKey::new(false, 0),
+            DecodePrefetchWindowKey::new(false, 250_000)
+        );
+        assert_ne!(
+            DecodePrefetchWindowKey::new(true, 32_767),
+            DecodePrefetchWindowKey::new(true, 32_768)
+        );
+    }
+
+    #[test]
+    fn ram_prefetch_estimate_tracks_observed_bytes() {
+        let estimate = AtomicU64::new(PREFETCH_INITIAL_NS_PER_MIB);
+        assert_eq!(
+            estimate_ram_prefetch_ns(2 << 20, &estimate),
+            2 * PREFETCH_INITIAL_NS_PER_MIB + PREFETCH_TRANSFER_GUARD_NS
+        );
+        observe_ram_prefetch(1 << 20, std::time::Duration::from_micros(100), &estimate);
+        assert_eq!(estimate.load(Ordering::Relaxed), 70_000);
+    }
 
     struct TestBuffer(usize);
 

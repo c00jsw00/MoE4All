@@ -47,6 +47,16 @@ struct Counters {
     prefetch_windows: AtomicU64,
     prefetch_compute_live_at_start: AtomicU64,
     prefetch_compute_live_after_enqueue: AtomicU64,
+    decode_prefetch_calibrations: AtomicU64,
+    decode_prefetch_candidates: AtomicU64,
+    decode_prefetch_vram_resident: AtomicU64,
+    decode_prefetch_host_loading: AtomicU64,
+    decode_prefetch_ram_experts: AtomicU64,
+    decode_prefetch_ram_bytes: AtomicU64,
+    decode_prefetch_ssd_jobs: AtomicU64,
+    decode_prefetch_ssd_blocks: AtomicU64,
+    decode_prefetch_deadline_stops: AtomicU64,
+    decode_prefetch_overruns: AtomicU64,
 
     gpu_copies: AtomicU64,
     gpu_copy_bytes: AtomicU64,
@@ -120,6 +130,16 @@ impl Counters {
             prefetch_windows: AtomicU64::new(0),
             prefetch_compute_live_at_start: AtomicU64::new(0),
             prefetch_compute_live_after_enqueue: AtomicU64::new(0),
+            decode_prefetch_calibrations: AtomicU64::new(0),
+            decode_prefetch_candidates: AtomicU64::new(0),
+            decode_prefetch_vram_resident: AtomicU64::new(0),
+            decode_prefetch_host_loading: AtomicU64::new(0),
+            decode_prefetch_ram_experts: AtomicU64::new(0),
+            decode_prefetch_ram_bytes: AtomicU64::new(0),
+            decode_prefetch_ssd_jobs: AtomicU64::new(0),
+            decode_prefetch_ssd_blocks: AtomicU64::new(0),
+            decode_prefetch_deadline_stops: AtomicU64::new(0),
+            decode_prefetch_overruns: AtomicU64::new(0),
 
             gpu_copies: AtomicU64::new(0),
             gpu_copy_bytes: AtomicU64::new(0),
@@ -239,6 +259,16 @@ pub struct Snapshot {
     pub prefetch_windows: u64,
     pub prefetch_compute_live_at_start: u64,
     pub prefetch_compute_live_after_enqueue: u64,
+    pub decode_prefetch_calibrations: u64,
+    pub decode_prefetch_candidates: u64,
+    pub decode_prefetch_vram_resident: u64,
+    pub decode_prefetch_host_loading: u64,
+    pub decode_prefetch_ram_experts: u64,
+    pub decode_prefetch_ram_bytes: u64,
+    pub decode_prefetch_ssd_jobs: u64,
+    pub decode_prefetch_ssd_blocks: u64,
+    pub decode_prefetch_deadline_stops: u64,
+    pub decode_prefetch_overruns: u64,
 
     pub gpu_copies: u64,
     pub gpu_copy_bytes: u64,
@@ -465,6 +495,68 @@ pub fn record_prefetch_window(compute_live_at_start: bool, compute_live_after_en
 }
 
 #[inline]
+pub fn record_decode_prefetch_calibration() {
+    COUNTERS
+        .decode_prefetch_calibrations
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_candidate() {
+    COUNTERS
+        .decode_prefetch_candidates
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_vram_resident() {
+    COUNTERS
+        .decode_prefetch_vram_resident
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_host_loading() {
+    COUNTERS
+        .decode_prefetch_host_loading
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_ram(bytes: usize) {
+    COUNTERS
+        .decode_prefetch_ram_experts
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .decode_prefetch_ram_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_ssd(blocks: usize) {
+    COUNTERS
+        .decode_prefetch_ssd_jobs
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .decode_prefetch_ssd_blocks
+        .fetch_add(blocks as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_deadline_stop() {
+    COUNTERS
+        .decode_prefetch_deadline_stops
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_overrun() {
+    COUNTERS
+        .decode_prefetch_overruns
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
 pub fn record_gpu_copy(bytes: usize) {
     COUNTERS.gpu_copies.fetch_add(1, Ordering::Relaxed);
     COUNTERS
@@ -607,6 +699,16 @@ pub fn snapshot() -> Snapshot {
         prefetch_windows: load(&COUNTERS.prefetch_windows),
         prefetch_compute_live_at_start: load(&COUNTERS.prefetch_compute_live_at_start),
         prefetch_compute_live_after_enqueue: load(&COUNTERS.prefetch_compute_live_after_enqueue),
+        decode_prefetch_calibrations: load(&COUNTERS.decode_prefetch_calibrations),
+        decode_prefetch_candidates: load(&COUNTERS.decode_prefetch_candidates),
+        decode_prefetch_vram_resident: load(&COUNTERS.decode_prefetch_vram_resident),
+        decode_prefetch_host_loading: load(&COUNTERS.decode_prefetch_host_loading),
+        decode_prefetch_ram_experts: load(&COUNTERS.decode_prefetch_ram_experts),
+        decode_prefetch_ram_bytes: load(&COUNTERS.decode_prefetch_ram_bytes),
+        decode_prefetch_ssd_jobs: load(&COUNTERS.decode_prefetch_ssd_jobs),
+        decode_prefetch_ssd_blocks: load(&COUNTERS.decode_prefetch_ssd_blocks),
+        decode_prefetch_deadline_stops: load(&COUNTERS.decode_prefetch_deadline_stops),
+        decode_prefetch_overruns: load(&COUNTERS.decode_prefetch_overruns),
 
         gpu_copies: load(&COUNTERS.gpu_copies),
         gpu_copy_bytes: load(&COUNTERS.gpu_copy_bytes),
@@ -719,6 +821,20 @@ pub fn print_summary_if_enabled() {
         } else {
             100.0 * s.prefetch_compute_live_after_enqueue as f64 / s.prefetch_windows as f64
         },
+    );
+    let _ = writeln!(
+        out,
+        "decode expert prefetch: calibrations={} candidates={} vram_resident={} host_loading={} ram_experts={} ram_bytes={} ssd_jobs={} ssd_blocks={} deadline_stops={} overruns={}",
+        s.decode_prefetch_calibrations,
+        s.decode_prefetch_candidates,
+        s.decode_prefetch_vram_resident,
+        s.decode_prefetch_host_loading,
+        s.decode_prefetch_ram_experts,
+        fmt_bytes(s.decode_prefetch_ram_bytes),
+        s.decode_prefetch_ssd_jobs,
+        s.decode_prefetch_ssd_blocks,
+        s.decode_prefetch_deadline_stops,
+        s.decode_prefetch_overruns,
     );
     let _ = writeln!(
         out,

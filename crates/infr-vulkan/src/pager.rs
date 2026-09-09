@@ -44,7 +44,9 @@ use indicatif::ProgressBar;
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::blockio::BlockDesc;
 use infr_core::error::Result;
-use infr_core::hostpager::{AlignedHostBuffer, HostPager, InclusiveHostCache, InclusiveHostTier};
+use infr_core::hostpager::{
+    AlignedHostBuffer, HostPager, InclusiveBlockState, InclusiveHostCache, InclusiveHostTier,
+};
 use infr_core::pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
 use infr_core::pager_profile;
 use infr_core::Backend;
@@ -1521,6 +1523,7 @@ impl HostStoreChunk {
 #[must_use = "pager promotions must be recorded or explicitly completed"]
 pub struct PreparedHostPush {
     requested: usize,
+    bytes: usize,
     transfer: PreparedTransfer,
 }
 
@@ -1543,6 +1546,42 @@ impl PreparedHostPush {
         executor: &BackgroundTransferExecutor,
     ) -> Result<Option<u64>> {
         self.transfer.submit_background(executor)
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// Source tier for one complete predicted logical expert after filtering role blocks already in
+/// VRAM. Classification is read-only; only the `Ram` arm may proceed to GPU admission.
+pub(crate) enum ExpertPrefetchSource {
+    Resident,
+    Ram { bytes: usize },
+    Loading,
+    Ssd(PreparedHostPrefetch),
+}
+
+/// One best-effort SSD-to-RAM job. A job may contain Gate/Up/Down blocks from different size
+/// classes, but represents only one predicted logical expert.
+pub(crate) struct PreparedHostPrefetch {
+    blocks: Vec<(Arc<InclusiveHostCache>, BlockId)>,
+}
+
+impl PreparedHostPrefetch {
+    pub(crate) fn execute(self) -> Result<usize> {
+        use rayon::prelude::*;
+
+        let outcomes: Vec<Result<bool>> = self
+            .blocks
+            .into_par_iter()
+            .map(|(cache, id)| cache.prefetch_cold(id))
+            .collect();
+        let mut loaded = 0usize;
+        for outcome in outcomes {
+            loaded += usize::from(outcome?);
+        }
+        Ok(loaded)
     }
 }
 
@@ -3012,6 +3051,64 @@ impl MoePagerSession {
         Ok(mask)
     }
 
+    /// Classify one predicted logical expert without changing either cache's replacement order.
+    /// Role blocks already present in VRAM are filtered out. A bounded host tier reports `Ram`
+    /// only when every remaining role is immediately readable; SSD work is returned as an owned
+    /// plan so the caller can perform it after releasing the GPU pager lock.
+    pub(crate) fn expert_prefetch_source(
+        &self,
+        role_buf_ids: &[usize],
+        local_id: u32,
+    ) -> Result<ExpertPrefetchSource> {
+        let mut seen = HashSet::with_capacity(role_buf_ids.len());
+        let mut bytes = 0usize;
+        let mut loading = false;
+        let mut ssd = Vec::new();
+        for &buf_id in role_buf_ids {
+            if !seen.insert(buf_id) {
+                continue;
+            }
+            let (_, pool_idx, src) = self
+                .sources
+                .get(&buf_id)
+                .ok_or_else(|| be("moe pager: prefetch named an unregistered expert bank"))?;
+            if src.stride_bytes == 0 || !src.bank_bytes.is_multiple_of(src.stride_bytes) {
+                return Err(be("moe pager: invalid prefetched expert bank geometry"));
+            }
+            let n_expert = src.bank_bytes / src.stride_bytes;
+            if local_id as usize >= n_expert {
+                return Err(be(format!(
+                    "moe pager: prefetched expert {local_id} exceeds a {n_expert}-expert bank"
+                )));
+            }
+            let pool = &self.pools[*pool_idx];
+            let id = src.block_base + local_id;
+            if pool.pager.is_resident(id) {
+                continue;
+            }
+            bytes = bytes.saturating_add(src.stride_bytes);
+            let Some(host) = pool.host.as_ref() else {
+                continue;
+            };
+            match host.block_state(id)? {
+                InclusiveBlockState::Ready => {}
+                InclusiveBlockState::Loading => loading = true,
+                InclusiveBlockState::Absent => ssd.push((Arc::clone(host), id)),
+            }
+        }
+        if bytes == 0 {
+            Ok(ExpertPrefetchSource::Resident)
+        } else if !ssd.is_empty() {
+            Ok(ExpertPrefetchSource::Ssd(PreparedHostPrefetch {
+                blocks: ssd,
+            }))
+        } else if loading {
+            Ok(ExpertPrefetchSource::Loading)
+        } else {
+            Ok(ExpertPrefetchSource::Ram { bytes })
+        }
+    }
+
     /// LRU maintenance for an inline-recorded (no-readback) layer: mark all `n_expert` blocks
     /// MRU. Callers gate on [`Self::all_resident`], so every touch is a hit — no uploads, no LUT
     /// mutation (the property that makes inline recording safe while earlier segments are still
@@ -3109,6 +3206,7 @@ impl MoePagerSession {
         if roles.is_empty() {
             return Ok(PreparedHostPush {
                 requested: 0,
+                bytes: 0,
                 transfer: PreparedTransfer::default(),
             });
         }
@@ -3155,6 +3253,7 @@ impl MoePagerSession {
         let transfer_plan = Arc::clone(transfer_plan);
         let pool = &mut pools[pool_idx];
         let mut transfer = PreparedTransfer::default();
+        let mut transfer_bytes = 0usize;
         if let Some(host) = pool.host.as_ref().cloned() {
             // Resolve in the original order first: this preserves exact GPU-LRU victim selection
             // and LUT contents. Only the resulting independent byte moves run in parallel.
@@ -3189,6 +3288,7 @@ impl MoePagerSession {
                     let Some(plan) = plan else {
                         continue;
                     };
+                    transfer_bytes = transfer_bytes.saturating_add(stride);
                     let target = targets.len();
                     targets.push(plan.target);
                     promotions.push((id, plan.evicted, target));
@@ -3231,6 +3331,7 @@ impl MoePagerSession {
                         });
                     }
                     if let Some(plan) = plan {
+                        transfer_bytes = transfer_bytes.saturating_add(stride);
                         let bytes = host_store[host_chunk]
                             .range(src, stride)
                             .ok_or_else(|| be("moe pager: expert CPU-store range out of bounds"))?;
@@ -3246,6 +3347,7 @@ impl MoePagerSession {
         }
         Ok(PreparedHostPush {
             requested,
+            bytes: transfer_bytes,
             transfer,
         })
     }
@@ -3300,6 +3402,7 @@ impl MoePagerSession {
         } = self;
         let transfer_plan = Arc::clone(transfer_plan);
         let mut transfer = PreparedTransfer::default();
+        let mut transfer_bytes = 0usize;
         for (pool_idx, entries) in by_pool {
             let pool = &mut pools[pool_idx];
             if let Some(host) = pool.host.as_ref().cloned() {
@@ -3315,6 +3418,7 @@ impl MoePagerSession {
                     else {
                         continue;
                     };
+                    transfer_bytes = transfer_bytes.saturating_add(plan.target.len());
                     let target = targets.len();
                     targets.push(plan.target);
                     promotions.push((id, plan.evicted, target));
@@ -3332,6 +3436,7 @@ impl MoePagerSession {
                     let Some(plan) = pool.pager.plan_prefetch_cpu_push(id)? else {
                         continue;
                     };
+                    transfer_bytes = transfer_bytes.saturating_add(stride);
                     let chunk = host_chunk.ok_or_else(|| {
                         be("moe pager: prefetched Host Store source has no chunk")
                     })?;
@@ -3346,6 +3451,7 @@ impl MoePagerSession {
         }
         Ok(PreparedHostPush {
             requested,
+            bytes: transfer_bytes,
             transfer,
         })
     }

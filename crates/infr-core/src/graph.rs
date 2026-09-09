@@ -1632,14 +1632,10 @@ impl Op {
     }
 }
 
-/// Maximum ordered next-layer expert candidates carried by a decode prefetch hint. Smaller
-/// working sets are prefixes of this one router result, so the backend can stop admission when
-/// the transfer window closes without running several top-k kernels.
-// The offline Qwen3.8 FATE trace shows a steep precision drop after rank 1: the first candidate
-// appears in the real top-10 on 87% of layer transitions, while deeper ranks rapidly turn into
-// cache pollution and extra PCIe traffic. Runtime cancellation still bounds the transfer window;
-// this cap bounds speculative breadth inside that window.
-pub const EXPERT_PREFETCH_CANDIDATES: usize = 1;
+/// Maximum ordered next-layer expert candidates carried by a decode prefetch hint. The backend
+/// filters already-resident experts and admits only complete candidates that fit its calibrated
+/// transfer window, so this is an upper bound on ranking information rather than transfer depth.
+pub const EXPERT_PREFETCH_CANDIDATES: usize = 32;
 
 /// Optional scheduling metadata attached to one [`Op::MoeFfn`]. It names the next layer's router
 /// and expert banks without turning prediction into model math: backends that cannot overlap
@@ -1655,6 +1651,9 @@ pub struct MoePrefetchHint {
     pub target_down_exps: TensorId,
     pub target_fused_gate_up: bool,
     pub target_n_expert: u32,
+    /// QSA's useful overlap window grows with context depth; GDN's recurrent body does not.
+    pub target_qsa: bool,
+    pub context_tokens: u32,
 }
 
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].

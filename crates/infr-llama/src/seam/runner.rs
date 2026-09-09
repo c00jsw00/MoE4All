@@ -5293,6 +5293,9 @@ pub(crate) fn generate_dense_backend(
                             target_down_exps: *target_down_exps,
                             target_fused_gate_up: *target_fused_gate_up,
                             target_n_expert: mc.n_expert as u32,
+                            target_qsa: c.is_qwen_hybrid_attn_layer(l + 1),
+                            context_tokens: start_pos.saturating_add(batch).min(u32::MAX as usize)
+                                as u32,
                         });
                     }
                     if let Some(MoeSharedW {
