@@ -2110,6 +2110,7 @@ fn run_verify(
         None,
         None,
         None,
+        None,
     )?;
     if ids.is_empty() {
         // Host fallback: the runner downloaded the m×vocab logits instead (see this fn's doc).
@@ -2173,6 +2174,7 @@ fn run_verify_full(
         None,
         None,
         None,
+        None,
     )?;
     Ok((logits, h))
 }
@@ -2231,6 +2233,7 @@ fn run_prime_last(
         None,
         want_logits.then_some(&mut logits),
         Some(&mut h),
+        None,
         None,
         None,
         None,

@@ -622,6 +622,49 @@ impl TurnRecurrentCkpt {
         src_ple: Option<&dyn Buffer>,
         tokens: &[u32],
     ) -> AResult<()> {
+        Self::begin_sized(
+            slot,
+            be,
+            cfg,
+            |layer| Some(src_k[layer].len_bytes()),
+            |layer| Some(src_v[layer].len_bytes()),
+            src_ple.map(Buffer::len_bytes),
+            tokens,
+        )
+    }
+
+    /// Cold-load variant used while segmented KV planes are intentionally still unbound. Every
+    /// recurrent layer is already a concrete fixed allocation; dynamic planes remain `None` and
+    /// are never inspected because they are not checkpoint state.
+    pub(super) fn begin_before_dynamic_kv(
+        slot: &mut Option<Self>,
+        be: &dyn Backend,
+        cfg: &Config,
+        src_k: &[Option<Box<dyn Buffer>>],
+        src_v: &[Option<Box<dyn Buffer>>],
+        src_ple: Option<&dyn Buffer>,
+        tokens: &[u32],
+    ) -> AResult<()> {
+        Self::begin_sized(
+            slot,
+            be,
+            cfg,
+            |layer| src_k[layer].as_ref().map(|buffer| buffer.len_bytes()),
+            |layer| src_v[layer].as_ref().map(|buffer| buffer.len_bytes()),
+            src_ple.map(Buffer::len_bytes),
+            tokens,
+        )
+    }
+
+    fn begin_sized(
+        slot: &mut Option<Self>,
+        be: &dyn Backend,
+        cfg: &Config,
+        mut k_len: impl FnMut(usize) -> Option<usize>,
+        mut v_len: impl FnMut(usize) -> Option<usize>,
+        ple_len: Option<usize>,
+        tokens: &[u32],
+    ) -> AResult<()> {
         if slot.is_none() {
             let layers: Vec<usize> = (0..cfg.n_layer)
                 .filter(|&l| cfg.is_recurrent_layer(l))
@@ -632,18 +675,24 @@ impl TurnRecurrentCkpt {
             let mut kbufs = Vec::with_capacity(layers.len());
             let mut vbufs = Vec::with_capacity(layers.len());
             for &l in &layers {
+                let kb = k_len(l).ok_or_else(|| {
+                    anyhow!("recurrent checkpoint layer {l} has no fixed K/state allocation")
+                })?;
+                let vb = v_len(l).ok_or_else(|| {
+                    anyhow!("recurrent checkpoint layer {l} has no fixed V/state allocation")
+                })?;
                 kbufs.push(
-                    be.alloc(src_k[l].len_bytes().max(1), BufferUsage::KvCache)
+                    be.alloc(kb.max(1), BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 vbufs.push(
-                    be.alloc(src_v[l].len_bytes().max(1), BufferUsage::KvCache)
+                    be.alloc(vb.max(1), BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
             }
-            let ple_state = src_ple
-                .map(|src| {
-                    be.alloc(src.len_bytes().max(1), BufferUsage::KvCache)
+            let ple_state = ple_len
+                .map(|bytes| {
+                    be.alloc(bytes.max(1), BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))
                 })
                 .transpose()?;
@@ -660,7 +709,7 @@ impl TurnRecurrentCkpt {
             });
         }
         let ck = slot.as_mut().expect("checkpoint was just allocated");
-        if ck.ple_state.is_some() != src_ple.is_some() {
+        if ck.ple_state.is_some() != ple_len.is_some() {
             return Err(anyhow!(
                 "stable recurrent checkpoint PLE shape changed within one session"
             ));
@@ -668,7 +717,7 @@ impl TurnRecurrentCkpt {
         ck.tokens.clear();
         ck.tokens.extend_from_slice(tokens);
         ck.copied.fill(false);
-        ck.ple_copied = src_ple.is_none();
+        ck.ple_copied = ple_len.is_none();
         ck.valid = false;
         Ok(())
     }

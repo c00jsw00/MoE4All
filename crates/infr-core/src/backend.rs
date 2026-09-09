@@ -667,10 +667,10 @@ pub trait Backend: Send + Sync {
         false
     }
 
-    /// Notify the backend that a cold session has finished allocating resident weights and is
-    /// about to size/allocate KV and recurrent state. Backends may use this boundary to release a
-    /// runtime reservation that protected those bytes from weight-arena packing tails. Default
-    /// no-op.
+    /// Notify the backend that a cold session has finished its resident/fixed allocation phase.
+    /// Backends may use this boundary to release load-only reservations or preload lower tiers.
+    /// A backend whose elastic arena is finalized from measured room may receive it after fixed
+    /// recurrent state; other paths retain the traditional post-weight boundary. Default no-op.
     fn finish_weight_load(&self) -> Result<()> {
         Ok(())
     }

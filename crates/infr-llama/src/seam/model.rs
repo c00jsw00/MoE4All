@@ -2066,6 +2066,7 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None,
         )?;
         Ok(())
     }
@@ -2116,6 +2117,7 @@ impl DiffusionGemmaCpuSession {
             }),
             None,
             None,
+            None,
         )?;
         Ok(out_logits)
     }
@@ -2130,7 +2132,7 @@ impl DiffusionGemmaVulkanSession {
     /// into per-byte-size pools (see `infr_vulkan::pager`'s MoE-session doc).
     pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
-        let bind = crate::seam::vulkan_moe_binder(
+        let (bind, finish_fixed_allocations) = crate::seam::vulkan_moe_binder(
             &self.be,
             &model.gguf,
             &model.cfg,
@@ -2159,6 +2161,7 @@ impl DiffusionGemmaVulkanSession {
             None,
             None,
             None,
+            finish_fixed_allocations.as_deref(),
         )?;
         // Once per prefill (a denoise step would print per step — far too noisy).
         self.be.print_moe_pager_stats();
@@ -2191,7 +2194,7 @@ impl DiffusionGemmaVulkanSession {
         // The shared placement-aware binder (see `prefill`): only ever CALLED when this denoise
         // is the session's first load (no prior `prefill` — a direct-denoise test), where it must
         // make the same placement decision prefill would have.
-        let bind = crate::seam::vulkan_moe_binder(
+        let (bind, finish_fixed_allocations) = crate::seam::vulkan_moe_binder(
             &self.be,
             &model.gguf,
             &model.cfg,
@@ -2228,6 +2231,7 @@ impl DiffusionGemmaVulkanSession {
             }),
             None,
             None,
+            finish_fixed_allocations.as_deref(),
         )?;
         Ok(match reduced {
             Some(r) => crate::seam::DenoiseOutcome::Reduced(r),
@@ -2262,6 +2266,7 @@ impl DiffusionGemmaMetalSession {
             |_| {},
             &mut self.state,
             self.max_ctx,
+            None,
             None,
             None,
             None,
@@ -2311,6 +2316,8 @@ impl DiffusionGemmaMetalSession {
                 sample_temp_inv: 0.0,
                 reduced: &mut reduced,
             }),
+            None,
+            None,
             None,
         )?;
         Ok(out_logits)

@@ -1884,12 +1884,10 @@ pub struct MoeHostChunkSpec {
     pub bytes: usize,
 }
 
-/// Fixed layout for [`MoePagerSession::new`] — sizes every arena/LUT UP FRONT, before any tensor
-/// is registered. This split (layout now, registration per tensor later) matters for sequencing:
-/// the session must exist and answer `is_paged`/`Backend::moe_paged` truthy BEFORE the seam's
-/// weight-load closure runs (so a paged tensor's placeholder buffer is recognized the very first
-/// time the adapter executes a graph, not just after the whole model is loaded) — see
-/// `infr-llama`'s `generate_dense_vulkan_session` for the call order this enables.
+/// Fixed layout for [`MoePagerSession::new`]. The seam creates it after resident/fixed allocations,
+/// then registers every weight placeholder before graph construction. Thus arena sizing uses the
+/// measured steady-state remainder while `Backend::moe_paged` and the source directory are still
+/// complete before the adapter can execute anything.
 pub struct MoePagerLayout {
     /// Runtime workspace to hold physically until cold session initialization has completed. The
     /// separate weight-packing margin must remain free for the real BDA block tails to consume.
@@ -2218,8 +2216,8 @@ impl MoePagerSession {
         Ok((total_blocks, total_bytes))
     }
 
-    /// Register one paged layer's `role` tensor — called from the seam's weight-load closure
-    /// (once per paged `_exps` tensor) instead of uploading it. `buf_id` is the placeholder
+    /// Register one paged layer's `role` tensor — called from the seam's post-fixed-allocation
+    /// finalizer (once per skipped `_exps` tensor). `buf_id` is the placeholder
     /// buffer's identity (see [`buffer_identity`]); `source` is where its bytes actually live.
     /// The pool is picked by `source.stride_bytes` — errors if the layout has no matching pool (a
     /// seam sizing bug: layout enumeration and registration must derive the same expert size).

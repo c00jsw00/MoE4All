@@ -4257,10 +4257,9 @@ impl VulkanBackend {
     }
 
     /// Install this model's paged-MoE session (see `pager::MoePagerSession`), sized but with no
-    /// tensors registered yet — called BEFORE the seam's weight-load closure runs (see
-    /// `pager::MoePagerLayout`'s doc for why the ordering matters: `Backend::moe_paged` must
-    /// already read true by the time that closure's placeholder buffers are bound). Replaces any
-    /// previous session (there is only ever one loaded model per process today).
+    /// tensors registered yet. The seam calls this after fixed allocations and immediately
+    /// registers every queued placeholder before graph construction. Replaces any previous
+    /// session (there is only ever one loaded model per process today).
     pub fn init_moe_pager(&self, layout: crate::pager::MoePagerLayout) -> Result<()> {
         // Stop a prior model's producer before replacing the pager state it owns.
         *self.decode_prefetch.lock().unwrap() = None;
@@ -4286,6 +4285,12 @@ impl VulkanBackend {
             }
         }
         Ok(())
+    }
+
+    /// Finish and release the temporary weight-upload ring before a caller measures live device
+    /// room for a steady-state arena. Idempotent: the weight-progress guard may call it again.
+    pub fn finish_resident_uploads(&self) {
+        self.shared.drain_staging_ring();
     }
 
     /// Allocate device-local dedicated buffers used only as a physical load-time reservation.
@@ -4328,7 +4333,7 @@ impl VulkanBackend {
     }
 
     /// Register one paged layer's role tensor with the session `init_moe_pager` already installed
-    /// — called from the seam's weight-load closure instead of uploading the tensor's full bytes.
+    /// — called by the seam's cold-load finalizer for tensors skipped during weight upload.
     /// Panics if no session is installed (a caller bug: `init_moe_pager` must run first); errors
     /// if the layout has no pool matching the tensor's (role, per-expert bytes).
     pub fn register_paged_expert(

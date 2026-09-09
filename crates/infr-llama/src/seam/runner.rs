@@ -462,8 +462,7 @@ pub(crate) fn generate_dense_backend(
     // The in-flight SEQUENCE's own state (`infr serve`): its sampling overrides, its stop-sequence
     // abort latch, and its turn on the GPU baton.
     //
-    // Explicitly per-SEQUENCE, and deliberately LAST so that adding it could not silently reshuffle
-    // the `Option`-heavy tail above (a misplaced bare `None` would still typecheck). This used to be
+    // Explicitly per-SEQUENCE. This used to be
     // a `thread_local!`, which was only sound while one generation owned one thread; N concurrent
     // sequences make that wrong by construction — see `crate::sampling::RequestCtx`.
     //
@@ -471,6 +470,9 @@ pub(crate) fn generate_dense_backend(
     // resolves purely from the env, no abort latch is polled, and no gate is taken — byte-for-byte
     // the pre-existing behavior.
     req: Option<&crate::sampling::RequestCtx>,
+    // Vulkan paged-MoE cold loads defer their elastic arena until fixed allocations are resident.
+    // Every other backend/path passes None; the hook is invoked exactly once before dynamic state.
+    finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let state_trace = ec.debug.state_trace;
@@ -1316,12 +1318,15 @@ pub(crate) fn generate_dense_backend(
         // escrow their predicted runtime workspace while those allocations land; release it before
         // the measured-room context clamp and exact KV/state allocations below. Other backends keep
         // the default no-op.
-        be.finish_weight_load().map_err(|e| anyhow!("{e}"))?;
+        let pager_deferred = finish_fixed_allocations.is_some();
+        if !pager_deferred {
+            be.finish_weight_load().map_err(|e| anyhow!("{e}"))?;
+        }
         // A paged Qwen session reserves its maximum per-token state inside the unified elastic
         // arena. Its buffers therefore keep the requested logical extent and commit physical 32K
         // segments on demand; applying the flat-buffer live-room clamp would price those bytes a
         // second time. Every other session retains the existing measured clamp unchanged.
-        let segmented_available = be.segmented_kv_available();
+        let segmented_available = be.segmented_kv_available() || pager_deferred;
         let segmented_kv =
             crate::seam::segmented_kv_wanted(c, ec, kv_ring, k_fmt, v_fmt) && segmented_available;
         if ec.kv.dynamic
@@ -1337,7 +1342,7 @@ pub(crate) fn generate_dense_backend(
                 "dynamic KV currently requires Q8_0/Q8_0; using flat KV"
             );
         }
-        let want_ctx = if segmented_kv {
+        let want_ctx = if segmented_kv || pager_deferred {
             want_ctx
         } else {
             crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)
@@ -1355,8 +1360,8 @@ pub(crate) fn generate_dense_backend(
         // regardless of the session's chosen KV dtype (see `MixerW::DeltaNet` / the `build` closure).
         // DeepSeek2 MLA layers have ONE k_cache (key_length = kv_lora_rank + qk_rope_dim wide) per
         // token; V is an aliased prefix view — no separate v_cache.
-        let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
-        let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut kbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+        let mut vbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         let mut qsa_kbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         let mut qsa_cbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         for l in 0..c.n_layer {
@@ -1386,51 +1391,114 @@ pub(crate) fn generate_dense_backend(
                 k_fmt,
                 v_fmt,
             );
-            kbufs.push(
-                if let Some(layout) = segmented_layout
-                    .as_ref()
-                    .filter(|layout| layout.plane(l, PlaneKind::K).is_some())
-                {
-                    alloc_segmented_plane(be, layout, l, PlaneKind::K)?
-                } else {
+            let k_segmented = segmented_layout
+                .as_ref()
+                .is_some_and(|layout| layout.plane(l, PlaneKind::K).is_some());
+            kbufs.push(if k_segmented {
+                None
+            } else {
+                Some(
                     be.alloc(k_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?
-                },
-            );
-            vbufs.push(
-                if let Some(layout) = segmented_layout
-                    .as_ref()
-                    .filter(|layout| layout.plane(l, PlaneKind::V).is_some())
-                {
-                    alloc_segmented_plane(be, layout, l, PlaneKind::V)?
-                } else {
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            });
+            let v_segmented = segmented_layout
+                .as_ref()
+                .is_some_and(|layout| layout.plane(l, PlaneKind::V).is_some());
+            vbufs.push(if v_segmented {
+                None
+            } else {
+                Some(
                     be.alloc(v_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?
-                },
-            );
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            });
             let qsa_bytes = crate::seam::qsa_raw_cache_bytes(c, l, want_ctx);
-            qsa_kbufs.push(if qsa_bytes > 0 {
-                Some(if let Some(layout) = segmented_layout.as_ref() {
-                    alloc_segmented_plane(be, layout, l, PlaneKind::QsaRaw)?
-                } else {
+            qsa_kbufs.push(if qsa_bytes > 0 && segmented_layout.is_none() {
+                Some(
                     be.alloc(qsa_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?
-                })
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
             } else {
                 None
             });
             let qsa_comp_bytes = crate::seam::qsa_block_cache_bytes(c, l, want_ctx);
-            qsa_cbufs.push(if qsa_comp_bytes > 0 {
-                Some(if let Some(layout) = segmented_layout.as_ref() {
-                    alloc_segmented_plane(be, layout, l, PlaneKind::QsaBlock)?
-                } else {
+            qsa_cbufs.push(if qsa_comp_bytes > 0 && segmented_layout.is_none() {
+                Some(
                     be.alloc(qsa_comp_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?
-                })
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
             } else {
                 None
             });
         }
+
+        // Fixed recurrent state is a real owner, unlike the Expert filler. Place Qwen3.8's PLE
+        // history and the rolling conversation checkpoint before the deferred Vulkan arena too.
+        let ple_state_buf = if c.qwen4exp {
+            let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
+            let b = be
+                .alloc(hist * c.hc_mult * ne * 4, BufferUsage::KvCache)
+                .map_err(|e| anyhow!("{e}"))?;
+            let zeros = vec![0u8; b.len_bytes()];
+            be.upload(b.as_ref(), &zeros).map_err(|e| anyhow!("{e}"))?;
+            Some(b)
+        } else {
+            None
+        };
+        let mut turn_recurrent_ckpt = None;
+        if turn_checkpoint.is_some() && (c.qwen35 || c.qwen4exp || c.bailingmoe3) {
+            TurnRecurrentCkpt::begin_before_dynamic_kv(
+                &mut turn_recurrent_ckpt,
+                be,
+                c,
+                &kbufs,
+                &vbufs,
+                ple_state_buf.as_deref(),
+                &[],
+            )?;
+        }
+
+        if let Some(finish) = finish_fixed_allocations {
+            finish()?;
+            // The pager now exists and all deferred expert sources are registered, so the
+            // established host-tier preload can run unchanged.
+            be.finish_weight_load().map_err(|e| anyhow!("{e}"))?;
+        }
+
+        // Dynamic planes allocate only lightweight address-table handles here. Their 32K physical
+        // segments are claimed lazily from the newly measured unified arena at context growth.
+        if let Some(layout) = segmented_layout.as_ref() {
+            for l in 0..c.n_layer {
+                if kbufs[l].is_none() && layout.plane(l, PlaneKind::K).is_some() {
+                    kbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::K)?);
+                }
+                if vbufs[l].is_none() && layout.plane(l, PlaneKind::V).is_some() {
+                    vbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::V)?);
+                }
+                if crate::seam::qsa_raw_cache_bytes(c, l, want_ctx) > 0 {
+                    qsa_kbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::QsaRaw)?);
+                }
+                if crate::seam::qsa_block_cache_bytes(c, l, want_ctx) > 0 {
+                    qsa_cbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::QsaBlock)?);
+                }
+            }
+        }
+        let kbufs: Vec<Box<dyn Buffer>> = kbufs
+            .into_iter()
+            .enumerate()
+            .map(|(layer, buffer)| {
+                buffer.ok_or_else(|| anyhow!("layer {layer} K/state buffer was not allocated"))
+            })
+            .collect::<AResult<_>>()?;
+        let vbufs: Vec<Box<dyn Buffer>> = vbufs
+            .into_iter()
+            .enumerate()
+            .map(|(layer, buffer)| {
+                buffer.ok_or_else(|| anyhow!("layer {layer} V/state buffer was not allocated"))
+            })
+            .collect::<AResult<_>>()?;
+
         // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
         // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
         be.kv_overflow_report();
@@ -1494,30 +1562,7 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
-        let ple_state_buf = if c.qwen4exp {
-            let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
-            let b = be
-                .alloc(hist * c.hc_mult * ne * 4, BufferUsage::KvCache)
-                .map_err(|e| anyhow!("{e}"))?;
-            let zeros = vec![0u8; b.len_bytes()];
-            be.upload(b.as_ref(), &zeros).map_err(|e| anyhow!("{e}"))?;
-            Some(b)
-        } else {
-            None
-        };
         let ple_worker = super::ple::PleWorker::new(g, c)?.map(std::sync::Arc::new);
-        let mut turn_recurrent_ckpt = None;
-        if turn_checkpoint.is_some() && (c.qwen35 || c.qwen4exp || c.bailingmoe3) {
-            TurnRecurrentCkpt::begin(
-                &mut turn_recurrent_ckpt,
-                be,
-                c,
-                &kbufs[..],
-                &vbufs[..],
-                ple_state_buf.as_deref(),
-                &[],
-            )?;
-        }
         // Host DMA imports are optional aliases, but on WDDM they share finite driver allocation
         // capacity with real model buffers. Admit them only after the complete persistent session
         // shape exists; backends without such a lower tier keep the default no-op.

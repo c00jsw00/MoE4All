@@ -552,6 +552,7 @@ pub(crate) fn generate_dense_cpu_mode(
         None, // denoise_req
         None, // turn checkpoint boundary
         req,
+        None, // deferred fixed-allocation hook
     );
     if let Some(store) = store.filter(|_| ec.paging.stats) {
         report_host_paging(&store);
@@ -657,8 +658,8 @@ pub(crate) fn generate_dense_vulkan_session(
     // ever breaks.
     let warm_binder: Box<BindWeight<'_>> =
         Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")));
-    let bind = if state.is_some() {
-        warm_binder
+    let (bind, finish_fixed_allocations) = if state.is_some() {
+        (warm_binder, None)
     } else {
         let _gp = req.and_then(|r| r.gate_pass());
         match vulkan_moe_binder(vk, g, cfg, ec, true, want_ctx) {
@@ -690,6 +691,7 @@ pub(crate) fn generate_dense_vulkan_session(
         None,
         turn_checkpoint,
         req,
+        finish_fixed_allocations.as_deref(),
     );
     if out.is_err() {
         // A failed forward may already have committed several prefill chunks to KV/QSA and
@@ -2460,8 +2462,11 @@ const AUTO_MOE_ARENA_MAX_ATTEMPTS: usize = 16;
 /// the exact deficit and skips directly past it. Explicit cache budgets never call this helper.
 fn next_auto_moe_arena_budget(current: u64, minimum: u64, shortfall: u64) -> Option<u64> {
     const STEP_ALIGN: u64 = 64 * 1024 * 1024;
-    let measured = shortfall.div_ceil(STEP_ALIGN).saturating_mul(STEP_ALIGN);
-    let step = (current / 20).max(AUTO_MOE_ARENA_SHRINK_MIN).max(measured);
+    let step = if shortfall == 0 {
+        (current / 20).max(AUTO_MOE_ARENA_SHRINK_MIN)
+    } else {
+        shortfall.div_ceil(STEP_ALIGN).saturating_mul(STEP_ALIGN)
+    };
     let next = current.saturating_sub(step);
     (next >= minimum && next < current).then_some(next)
 }
@@ -2473,6 +2478,21 @@ fn moe_pool_capacity_bytes(pools: &[(usize, usize, [usize; 3])], slots: &[usize]
         .fold(0u64, |total, (&(slot_bytes, ..), &n_slots)| {
             total.saturating_add((slot_bytes as u64).saturating_mul(n_slots as u64))
         })
+}
+
+/// Arena bytes available after fixed allocations are physically resident. Dynamic state and
+/// runtime live inside this arena, so only the post-load device reserve is subtracted. An explicit
+/// cache setting caps the Expert share while retaining the same elastic corridors.
+fn moe_arena_budget_after_fixed(
+    live_alloc_room: u64,
+    post_load_reserve: u64,
+    explicit_expert_bytes: Option<u64>,
+    elastic_reserve: u64,
+) -> u64 {
+    let measured = live_alloc_room.saturating_sub(post_load_reserve);
+    explicit_expert_bytes
+        .map(|bytes| bytes.saturating_add(elastic_reserve).min(measured))
+        .unwrap_or(measured)
 }
 
 /// Hard ceiling on [`kv_fit_ctx_for`]'s search. Reached only by a model whose KV bytes AND
@@ -2860,8 +2880,9 @@ fn moe_host_backing(
     }
 }
 
-/// Decide this model's MoE expert placement, install the pager session when the decision pages
-/// (FIRST load only), and return the Vulkan weight binder that implements it. Shared by every
+/// Decide this model's MoE expert placement and return its Vulkan weight binder plus an optional
+/// one-shot pager finalizer (FIRST load only). The binder queues paged expert registrations; the
+/// finalizer installs the measured-size arena after fixed allocations. Shared by every
 /// Vulkan weight-uploading session — [`generate_dense_vulkan_session`] and the DiffusionGemma
 /// session (`model.rs`), which drives `generate_dense_backend` directly and would otherwise
 /// silently skip placement (observed: `INFR_CACHE` was a no-op on DG).
@@ -2877,7 +2898,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     ec: &EngineConfig,
     first_load: bool,
     want_ctx: usize,
-) -> AResult<Box<BindWeight<'a>>> {
+) -> AResult<(Box<BindWeight<'a>>, Option<Box<FinishFixedAllocations<'a>>>)> {
     // ── MoE expert placement ─────────────────────────────────────────────────────────────────
     // The pager (`infr_vulkan::pager`) is the ONLY MoE offload mechanism — the legacy
     // host-visible (HostWeights/GTT) split and its INFR_NCMOE knob are gone. Tiers, in
@@ -2904,6 +2925,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
     let mut pager_memory_plan = None;
     let mut dynamic_state_max_allocation_bytes = 0u64;
     let mut planned_future_host_resident_bytes = 0u64;
+    let mut expert_payload_bytes = 0u64;
+    let mut requested_cache_bytes = None;
+    let pending_moe_registrations =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::<PendingPagedExpert>::new()));
+    let mut finish_fixed_allocations = None::<Box<FinishFixedAllocations<'a>>>;
     // Placement is decided ONCE, on the session's FIRST load — the only call where `bind_weight`
     // runs (see the `state.is_none()` init block in `generate_dense_backend`) and the only moment
     // the tier-3 budget math is consistent: `vram.available` is LIVE (heapBudget − heapUsage), so
@@ -2923,6 +2949,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // `infr_vulkan::linear::moe_expert_dtype_ok` is true for all of them; the invariant is
         // pinned by `moe_expert_floor_covers_dense_set` in infr-vulkan's linear.rs tests.
         let fp = crate::weights::weight_footprint(g);
+        expert_payload_bytes = fp.expert;
         planned_future_host_resident_bytes = fp.dense;
         let vram = vk.vram();
         let room = planned_vram_room(&vram, ec);
@@ -2988,6 +3015,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             ));
         };
         let requested_cache = cache_override.map(|spec| spec.resolve(vram.available));
+        requested_cache_bytes = requested_cache;
         let paged_target_at = |candidate: ModelMemoryPlan| match requested_cache {
             Some(requested) => Some(requested.min(candidate.expert_cache_bytes)),
             None if candidate.expert_cache_bytes < fp.expert => Some(candidate.expert_cache_bytes),
@@ -3129,19 +3157,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
             None
         }
     };
-    // The session must exist (and answer `Backend::moe_paged` truthy) BEFORE `generate_dense_backend`
-    // below uploads a single weight: the FIRST paged tensor the `bind_weight` closure sees still
-    // has to bind a placeholder the adapter recognizes as paged the very first time a graph
-    // executes — sizing (and installing) it AFTER the call, once every weight was already bound
-    // to a 4-byte placeholder nobody registered, would leave `execute_static` reading that
-    // placeholder as if it were the full bank (see `pager::MoePagerLayout`'s doc). Only on the
-    // FIRST load of a session (`bind_weight` isn't called again once `state` already holds
-    // uploaded weights, so a second `init_moe_pager` would wipe an already-warm cache for nothing;
-    // `n_paged > 0` already implies `first_load` — the placement calc above is first_load-gated —
-    // but keep the guard explicit).
-    // The MoE twin, keyed by the `(role, per-expert bytes)` pair that identifies an expert pool —
-    // the binder receives a tensor, not a pool index, and re-derives that key the same way
-    // `MoePagerSession::register` does.
+    // Paged tensors bind their final 4-byte placeholders now, but registration is queued until
+    // every fixed allocation has landed. The runner executes the returned one-shot hook before
+    // graph construction, so `Backend::moe_paged` and every placeholder identity are published
+    // before the adapter can inspect either one. Warm calls never bind and never receive a hook.
     let mut moe_host_offsets =
         std::collections::HashMap::<(usize, infr_vulkan::pager::Role), usize>::new();
     let mut moe_host_tier = None::<std::sync::Arc<infr_core::hostpager::InclusiveHostTier>>;
@@ -3254,12 +3273,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 None if auto_size_bias_layout => (2.0, "auto"),
                 None => (0.0, "off"),
             };
-            // Commit the device arena before allocating host caches or loading weights, then ask
-            // the driver how much room is ACTUALLY left. `VK_EXT_memory_budget` accounting for a
-            // large arena is card/driver/backing dependent: WDDM can charge more than the logical
-            // VkDeviceMemory size, so a plan that fits arithmetically on one GPU can leave too
-            // little room for the same fixed weights on another. Automatic placement shrinks and
-            // retries while the arena is still empty; an explicit `paging.cache` remains exact.
+            // Keep topology and policy planning here, but postpone the physical arena. The
+            // resident weights and fixed recurrent/session state land first; the one-shot hook
+            // below then sizes the elastic arena from the driver's measured remainder.
             let plan = pager_memory_plan.expect("n_paged > 0 carries its selected memory plan");
             let physical_pool_floors = moe_pool_slot_floors(&logical_pools, n_expert);
             let physical_pool_floor = moe_pool_physical_floor_bytes(&logical_pools, n_expert)
@@ -3268,119 +3284,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let planned_pager_budget = pager_budget_bytes;
             let elastic_reserve = plan.elastic_reserve_bytes();
             let minimum_pager_budget = elastic_reserve.saturating_add(physical_pool_floor);
-            let required_after_arena = plan
-                .minimum_required_bytes()
-                .saturating_sub(elastic_reserve);
             let adaptive_arena = cache_override.is_none();
-            let mut candidate_budget = pager_budget_bytes;
-            let mut attempts = 0usize;
-            let slot_counts = loop {
-                attempts += 1;
-                let Some(candidate_slots) = moe_pool_slot_counts(
-                    &logical_pools,
-                    candidate_budget,
-                    n_expert,
-                    size_cache_bias,
-                ) else {
-                    return Err(anyhow!(
-                        "MoE expert arena budget ({:.2} MiB) cannot hold one complete Prefill \
-                         layer plus runtime workspace; increase the VRAM budget or reduce context",
-                        candidate_budget as f64 / 2f64.powi(20),
-                    ));
-                };
-                let physical_bytes = moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
-                if physical_bytes.saturating_sub(elastic_reserve) < physical_pool_floor {
-                    return Err(anyhow!(
-                        "MoE device arena cannot retain one complete Prefill layer after its \
-                         runtime reserve plus the tiered-cache exchange slots (arena {:.2} MiB, \
-                         runtime {:.2} MiB, physical floor {:.2} MiB)",
-                        physical_bytes as f64 / 2f64.powi(20),
-                        elastic_reserve as f64 / 2f64.powi(20),
-                        physical_pool_floor as f64 / 2f64.powi(20),
-                    ));
-                }
-                let specs: Vec<(usize, usize, usize)> = logical_pools
-                    .iter()
-                    .zip(&candidate_slots)
-                    .zip(&physical_pool_floors)
-                    .map(|((&(slot_bytes, ..), &n_slots), &floor_slots)| {
-                        (slot_bytes, n_slots, floor_slots)
-                    })
-                    .collect();
-
-                let failure = match vk.prepare_moe_unified_vram(
-                    &specs,
-                    plan.dynamic_state_reserve_bytes,
-                    dynamic_state_max_allocation_bytes,
-                    prefill_min_lane_bytes,
-                    plan.runtime_reserve_bytes,
-                ) {
-                    Ok(committed) => {
-                        debug_assert_eq!(committed as u64, physical_bytes);
-                        let live_room = vk.alloc_room();
-                        if live_room >= required_after_arena {
-                            pager_budget_bytes = physical_bytes;
-                            expert_cache_target_bytes = expert_cache_target_bytes
-                                .min(physical_bytes.saturating_sub(elastic_reserve));
-                            if attempts > 1 {
-                                tracing::warn!(
-                                    planned_bytes = planned_pager_budget,
-                                    actual_bytes = pager_budget_bytes,
-                                    attempts,
-                                    "automatic MoE arena reduced after live Vulkan allocation \
-                                     feedback; fixed weights, KV and runtime reserves remain intact"
-                                );
-                            }
-                            break candidate_slots;
-                        }
-                        let shortfall = required_after_arena - live_room;
-                        vk.discard_empty_moe_unified_vram()
-                            .map_err(|e| anyhow!("discarding MoE allocation probe: {e}"))?;
-                        (
-                            shortfall,
-                            format!(
-                                "the mapped arena left {:.2} MiB live, {:.2} MiB short of fixed \
-                                 weights/KV/reserves",
-                                live_room as f64 / 2f64.powi(20),
-                                shortfall as f64 / 2f64.powi(20),
-                            ),
-                        )
-                    }
-                    Err(error) => (0, error.to_string()),
-                };
-
-                if !adaptive_arena {
-                    return Err(anyhow!(
-                        "explicit MoE expert arena {:.2} MiB did not fit this device: {}",
-                        physical_bytes as f64 / 2f64.powi(20),
-                        failure.1,
-                    ));
-                }
-                let next = (attempts < AUTO_MOE_ARENA_MAX_ATTEMPTS)
-                    .then(|| {
-                        next_auto_moe_arena_budget(
-                            candidate_budget,
-                            minimum_pager_budget,
-                            failure.0,
-                        )
-                    })
-                    .flatten()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "automatic MoE arena could not find a device-safe size after \
-                             {attempts} attempt(s): {}",
-                            failure.1,
-                        )
-                    })?;
-                tracing::warn!(
-                    attempt = attempts,
-                    old_bytes = candidate_budget,
-                    new_bytes = next,
-                    reason = %failure.1,
-                    "automatic MoE arena allocation retry"
-                );
-                candidate_budget = next;
-            };
+            let slot_counts = moe_pool_slot_counts(
+                &logical_pools,
+                planned_pager_budget,
+                n_expert,
+                size_cache_bias,
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "planned MoE arena ({:.2} MiB) is below its required physical floor",
+                    planned_pager_budget as f64 / MIB_F64,
+                )
+            })?;
             // The Host tier has two honest modes. If the configured/automatic RAM budget covers
             // the whole expert payload, retain the existing layer-contiguous store (fastest
             // Prefill and Decode source). Otherwise allocate bounded per-size-class victim
@@ -3534,8 +3450,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 })
                 .collect();
             tracing::info!(
-                "MoE pager: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
-             {:.2} GiB device arena budget; Decode size bias {size_cache_bias:+.2} \
+                "MoE pager plan: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
+             {:.2} GiB estimated device arena; Decode size bias {size_cache_bias:+.2} \
              ({size_cache_bias_source}); host={} {:.2} GiB in {host_chunk_count} chunks; \
              ctx={want_ctx})",
                 cfg.n_layer,
@@ -3549,22 +3465,197 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // reserve priced for the selected Prefill chunk. Pure Attention models retain their
             // established all-layer target.
             let prefill_target_lanes = moe_prefill_target_lanes(cfg, n_paged);
-            vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
-                // The runtime reserve is part of `pager_budget_bytes` and therefore physically
-                // escrowed by the unified arena itself. No second load-only allocation.
-                load_reserve_bytes: 0,
-                n_blocks,
-                pools,
-                host_tier: moe_host_tier.clone(),
-                dynamic_state_reserve_bytes: plan.dynamic_state_reserve_bytes,
-                dynamic_state_max_allocation_bytes,
-                prefill_min_lane_bytes,
-                runtime_reserve_bytes: plan.runtime_reserve_bytes,
-                host_chunks,
-                prefill_target_lanes,
-                prefill_cache_bytes: expert_cache_target_bytes,
-            })
-            .map_err(|e| anyhow!("{e}"))?;
+            let pending = pending_moe_registrations.clone();
+            let host_tier = moe_host_tier.clone();
+            finish_fixed_allocations = Some(Box::new(move || {
+                // Staging is part of the load, not the steady-state layout. Free it before the
+                // live budget query so its ring cannot reduce the expert filler permanently.
+                vk.finish_resident_uploads();
+
+                let mut candidate_budget = moe_arena_budget_after_fixed(
+                    vk.alloc_room(),
+                    POST_KV_DEVICE_RESERVE,
+                    requested_cache_bytes,
+                    elastic_reserve,
+                );
+                if candidate_budget < minimum_pager_budget {
+                    return Err(anyhow!(
+                        "after fixed allocations, {:.2} MiB remains for the MoE arena, but \
+                         runtime/dynamic state plus one complete Prefill layer require {:.2} MiB",
+                        candidate_budget as f64 / MIB_F64,
+                        minimum_pager_budget as f64 / MIB_F64,
+                    ));
+                }
+
+                let mut attempts = 0usize;
+                let (slot_counts, physical_bytes) = loop {
+                    attempts += 1;
+                    let Some(candidate_slots) = moe_pool_slot_counts(
+                        &logical_pools,
+                        candidate_budget,
+                        n_expert,
+                        size_cache_bias,
+                    ) else {
+                        return Err(anyhow!(
+                            "MoE arena budget ({:.2} MiB) cannot hold one complete Prefill layer \
+                             plus runtime/dynamic state",
+                            candidate_budget as f64 / MIB_F64,
+                        ));
+                    };
+                    let physical_bytes = moe_pool_capacity_bytes(&logical_pools, &candidate_slots);
+                    if physical_bytes.saturating_sub(elastic_reserve) < physical_pool_floor {
+                        return Err(anyhow!(
+                            "MoE device arena cannot retain one complete Prefill layer after its \
+                             runtime/dynamic reserve (arena {:.2} MiB, elastic {:.2} MiB, expert \
+                             floor {:.2} MiB)",
+                            physical_bytes as f64 / MIB_F64,
+                            elastic_reserve as f64 / MIB_F64,
+                            physical_pool_floor as f64 / MIB_F64,
+                        ));
+                    }
+                    let specs: Vec<(usize, usize, usize)> = logical_pools
+                        .iter()
+                        .zip(&candidate_slots)
+                        .zip(&physical_pool_floors)
+                        .map(|((&(slot_bytes, ..), &n_slots), &floor_slots)| {
+                            (slot_bytes, n_slots, floor_slots)
+                        })
+                        .collect();
+
+                    let failure = match vk.prepare_moe_unified_vram(
+                        &specs,
+                        plan.dynamic_state_reserve_bytes,
+                        dynamic_state_max_allocation_bytes,
+                        prefill_min_lane_bytes,
+                        plan.runtime_reserve_bytes,
+                    ) {
+                        Ok(committed) => {
+                            debug_assert_eq!(committed as u64, physical_bytes);
+                            let live_room = vk.alloc_room();
+                            if live_room >= POST_KV_DEVICE_RESERVE {
+                                break (candidate_slots, physical_bytes);
+                            }
+                            let shortfall = POST_KV_DEVICE_RESERVE - live_room;
+                            vk.discard_empty_moe_unified_vram()
+                                .map_err(|e| anyhow!("discarding MoE allocation probe: {e}"))?;
+                            (
+                                shortfall,
+                                format!(
+                                    "the arena left {:.2} MiB live, {:.2} MiB short of the \
+                                     post-load reserve",
+                                    live_room as f64 / MIB_F64,
+                                    shortfall as f64 / MIB_F64,
+                                ),
+                            )
+                        }
+                        Err(error) => (0, error.to_string()),
+                    };
+
+                    if !adaptive_arena {
+                        return Err(anyhow!(
+                            "explicit MoE expert arena {:.2} MiB did not fit this device: {}",
+                            physical_bytes as f64 / MIB_F64,
+                            failure.1,
+                        ));
+                    }
+                    let next = (attempts < AUTO_MOE_ARENA_MAX_ATTEMPTS)
+                        .then(|| {
+                            next_auto_moe_arena_budget(
+                                candidate_budget,
+                                minimum_pager_budget,
+                                failure.0,
+                            )
+                        })
+                        .flatten()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "automatic MoE arena could not find a device-safe size after \
+                                 {attempts} attempt(s): {}",
+                                failure.1,
+                            )
+                        })?;
+                    tracing::warn!(
+                        attempt = attempts,
+                        old_bytes = candidate_budget,
+                        new_bytes = next,
+                        reason = %failure.1,
+                        "automatic MoE arena allocation retry"
+                    );
+                    candidate_budget = next;
+                };
+
+                let expert_cache_bytes = physical_bytes
+                    .saturating_sub(elastic_reserve)
+                    .min(expert_payload_bytes);
+                let pool_floors = moe_pool_batch_slot_floors(&logical_pools, n_expert);
+                let pools: Vec<infr_vulkan::pager::MoePoolSpec> = logical_pools
+                    .iter()
+                    .zip(slot_counts)
+                    .zip(pool_floors)
+                    .map(
+                        |((&(slot_bytes, _n_blocks, _role_blocks), n_slots), min_enabled_slots)| {
+                            infr_vulkan::pager::MoePoolSpec {
+                                slot_bytes,
+                                n_slots,
+                                min_enabled_slots,
+                            }
+                        },
+                    )
+                    .collect();
+                let cached: usize = pools.iter().map(|pool| pool.n_slots).sum();
+                let pool_desc: Vec<String> = logical_pools
+                    .iter()
+                    .zip(&pools)
+                    .map(|(&(slot_bytes, n_blocks, _), pool)| {
+                        format!(
+                            "shared[{:.1} MiB] {}/{}",
+                            slot_bytes as f64 / MIB_F64,
+                            pool.n_slots,
+                            n_blocks
+                        )
+                    })
+                    .collect();
+                tracing::info!(
+                    "MoE measured arena: {cached} expert blocks cached ({}); {:.2} GiB actual vs \
+                     {:.2} GiB planned; {:.2} GiB retained for dynamic/runtime claims",
+                    pool_desc.join(", "),
+                    physical_bytes as f64 / GIB_F64,
+                    planned_pager_budget as f64 / GIB_F64,
+                    elastic_reserve as f64 / GIB_F64,
+                );
+                vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
+                    load_reserve_bytes: 0,
+                    n_blocks,
+                    pools,
+                    host_tier: host_tier.clone(),
+                    dynamic_state_reserve_bytes: plan.dynamic_state_reserve_bytes,
+                    dynamic_state_max_allocation_bytes,
+                    prefill_min_lane_bytes,
+                    runtime_reserve_bytes: plan.runtime_reserve_bytes,
+                    host_chunks: host_chunks
+                        .iter()
+                        .map(|chunk| infr_vulkan::pager::MoeHostChunkSpec {
+                            base_offset: chunk.base_offset,
+                            bytes: chunk.bytes,
+                        })
+                        .collect(),
+                    prefill_target_lanes,
+                    prefill_cache_bytes: expert_cache_bytes,
+                })
+                .map_err(|e| anyhow!("{e}"))?;
+
+                let registrations = std::mem::take(&mut *pending.lock().unwrap());
+                for registration in registrations {
+                    vk.register_paged_expert(
+                        registration.role,
+                        registration.buf_id,
+                        registration.source,
+                        registration.n_expert,
+                    )
+                    .map_err(|e| anyhow!("{e}"))?;
+                }
+                Ok(())
+            }));
         }
     }
 
@@ -3956,18 +4047,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
     }
 
-    Ok(Box::new(move |name, tb, dt, numel| {
+    let pending_moe_registrations_for_bind = pending_moe_registrations.clone();
+    let bind: Box<BindWeight<'a>> = Box::new(move |name, tb, dt, numel| {
         // Raw upload for EVERY dtype — the file's bytes go straight to VRAM (u32-padded) and the
         // kernel reads/dequants the native dtype in-shader. F16 → f16 coopmat GEMM / f16 GEMV;
         // F32 stays native (rmsnorm/qk_norm_rope read f32); bf16 → in-shader expand (bf16 is the
         // top 16 bits of an f32, EXACT; the warp GEMM narrows to f16 for the matrix cores like
         // every other format); quant weights → raw blocks. No host dtype conversion on any path.
         //
-        // Paged: register this layer's mmap bytes with the pager and bind a tiny
-        // placeholder instead of uploading the full bank — the Vulkan adapter recognizes the
-        // placeholder's identity (see `infr_vulkan::pager`'s module doc) and diverts to the
-        // paged executor split at execute time. `down_scale`/router/every other tensor of a
-        // paged layer is unaffected — only the `_exps` weight banks divert here.
+        // Paged: bind a tiny placeholder instead of uploading the full bank and queue its mmap
+        // source for the cold-load finalizer. The finalizer registers every placeholder before
+        // graph construction, so the Vulkan adapter still sees a complete immutable pager.
         // Dense layer streaming: bind a tiny placeholder and register the group's ZERO-COPY mmap
         // segments with the dense session instead of uploading (the adapter recognizes the
         // placeholder's identity at execute time and dispatches against the pool arena — see
@@ -4094,8 +4184,15 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     host_offset,
                     file,
                 };
-                vk.register_paged_expert(role, buf_id, source, n_expert)
-                    .map_err(|e| anyhow!("{e}"))?;
+                pending_moe_registrations_for_bind
+                    .lock()
+                    .unwrap()
+                    .push(PendingPagedExpert {
+                        role,
+                        buf_id,
+                        source,
+                        n_expert,
+                    });
                 return Ok((placeholder, dt));
             }
         }
@@ -4138,7 +4235,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
         vk.upload(buf.as_ref(), &padded)
             .map_err(|e| anyhow!("{e}"))?;
         Ok((buf, dt))
-    }))
+    });
+    Ok((bind, finish_fixed_allocations))
 }
 
 /// Open one Vulkan backend per physical device index (the shared front of every multi-GPU
@@ -4224,6 +4322,7 @@ fn run_dense_oneshot(
         None, // denoise_req
         None, // turn checkpoint boundary
         None, // req
+        None, // deferred fixed-allocation hook
     )
 }
 
@@ -4799,6 +4898,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         None,
         req,
+        None,
     )
 }
 
@@ -4837,6 +4937,7 @@ pub(crate) fn verify_dense_metal2(
         want_ctx,
         None,
         Some(&mut logits),
+        None,
         None,
         None,
         None,
@@ -4884,6 +4985,7 @@ pub(crate) fn verify_dense_cpu(
         None,
         None,
         None,
+        None,
     )?;
     Ok(logits)
 }
@@ -4923,6 +5025,7 @@ pub(crate) fn verify_dense_cpu_with_h(
         None,
         Some(&mut logits),
         Some(&mut h),
+        None,
         None,
         None,
         None,
@@ -4970,6 +5073,7 @@ pub(crate) fn verify_rows_cpu_with_h(
         None,
         None,
         None,
+        None,
     )?;
     Ok((logits, h))
 }
@@ -5014,6 +5118,7 @@ pub(crate) fn verify_dense_vulkan(
         None,
         None,
         Some(&mut logits),
+        None,
         None,
         None,
         None,
@@ -5090,6 +5195,18 @@ impl WBytes {
 /// tensor NAME lets a binder place specific tensors differently (the Vulkan binder puts
 /// auto-fit-offloaded MoE expert banks in host-visible memory instead of VRAM).
 type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
+
+/// One-shot cold-load boundary used by paged Vulkan sessions. Expert weights are represented by
+/// placeholders while fixed allocations land; this hook then sizes the elastic arena from the
+/// backend's measured remainder and publishes the deferred registrations before any graph runs.
+type FinishFixedAllocations<'a> = dyn Fn() -> AResult<()> + 'a;
+
+struct PendingPagedExpert {
+    role: infr_vulkan::pager::Role,
+    buf_id: usize,
+    source: infr_vulkan::pager::ExpertSource,
+    n_expert: usize,
+}
 
 /// Persistent per-session seam state: the uploaded weights, the KV cache (sized to `max_ctx`
 /// once), the per-step IO buffers, and the token ids currently MATERIALIZED in the cache. A caller
@@ -7093,9 +7210,39 @@ mod seam_helper_tests {
             "a measured deficit rounds up and skips directly past it"
         );
         assert_eq!(
+            super::next_auto_moe_arena_budget(current, 2 * GIB64, 1 * MIB),
+            Some(current - 64 * MIB),
+            "a small measured deficit must not trigger the conservative five-percent step"
+        );
+        assert_eq!(
             super::next_auto_moe_arena_budget(2 * GIB64, 2 * GIB64, 0),
             None,
             "the runtime plus one-layer floor is never crossed"
+        );
+    }
+
+    #[test]
+    fn measured_moe_arena_spends_only_the_post_load_remainder() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        let live = 10 * GIB;
+        let post = 256 * MIB;
+        let elastic = 2 * GIB;
+
+        assert_eq!(
+            super::moe_arena_budget_after_fixed(live, post, None, elastic),
+            live - post,
+            "dynamic/runtime bytes belong inside the measured arena"
+        );
+        assert_eq!(
+            super::moe_arena_budget_after_fixed(live, post, Some(4 * GIB), elastic),
+            6 * GIB,
+            "an explicit cache caps only the Expert share"
+        );
+        assert_eq!(
+            super::moe_arena_budget_after_fixed(live, post, Some(20 * GIB), elastic),
+            live - post,
+            "an explicit request still cannot exceed the live device remainder"
         );
     }
 
