@@ -1891,6 +1891,35 @@ impl SeamModel {
             .ok_or_else(no_template_err)
     }
 
+    /// Validate model-native chat-template controls against the actual embedded template
+    /// before any backend, VRAM arena, or expert residency is created.
+    ///
+    /// This uses this model's resolved tokenizer too, including an explicit tokenizer
+    /// override supplied to `load_with`.
+    pub fn preflight_chat_template_controls(&self) -> Result<()> {
+        let messages = [infr_chat::ChatMessage {
+            role: "user".into(),
+            content: "preflight".into(),
+            ..Default::default()
+        }];
+
+        infr_chat::render_chat_oai_with_options(
+            &self.gguf,
+            &self.tokenizer,
+            self.cfg.eos,
+            &messages,
+            None,
+            true,
+            &self.ecfg,
+            &infr_chat::ChatTemplateOptions::default(),
+        )
+        .map(|_| ())
+        .map_err(|e| match e {
+            infr_chat::TemplateError::NoTemplate => no_template_err(),
+            e @ infr_chat::TemplateError::Render(_) => anyhow::Error::new(e),
+        })
+    }
+
     /// Render a multi-turn conversation `(role, content)` through the model's OWN embedded chat
     /// template — the [`crate::chat::ChatModel::render`] primitive for the CPU dense/MoE path, so the
     /// shared [`crate::chat::Chat`] can drive a history-based REPL. Same template + error contract as
