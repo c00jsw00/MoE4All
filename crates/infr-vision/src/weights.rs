@@ -36,7 +36,8 @@ pub struct VisionWeights {
     pub patch_embd_weight: TensorInfo,
     /// `v.patch_embd.bias`, `[embd]`.
     pub patch_embd_bias: TensorInfo,
-    /// `v.patch_embd.weight.1` — the video-twin patch embedding. Parsed, unused in V1.
+    /// `v.patch_embd.weight.1` — the second temporal slice of the original Conv3D patch
+    /// embedding. A still image duplicates its frame, so both slices are applied and summed.
     pub patch_embd_weight_video: Option<TensorInfo>,
     /// `v.position_embd.weight`, `[embd, base_grid²]`, F32.
     pub position_embd_weight: TensorInfo,

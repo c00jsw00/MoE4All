@@ -39,7 +39,7 @@ use axum::{
     Json, Router,
 };
 use infr_core::config::Config;
-use infr_engine::{ChatMessage, Delta, ToolCall};
+use infr_engine::{ChatMessage, Delta, ToolCall, IMAGE_PART_PLACEHOLDER};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
@@ -2754,19 +2754,18 @@ fn unix_ts() -> i64 {
 
 /// Flatten a DTO `content` field (string OR content-part array) to a plain `String`.
 ///
-/// Mirrors the Python shim's `normalize_messages`: only `"text"` parts are kept.
+/// Text stays in place and each `image_url` becomes one sentinel, preserving interleaving through
+/// chat-template rendering. Image bytes are collected separately by [`collect_images`].
 pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
     match v {
         None | Some(serde_json::Value::Null) => String::new(),
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(parts)) => parts
             .iter()
-            .filter_map(|p| {
-                if p.get("type")?.as_str()? == "text" {
-                    p.get("text")?.as_str().map(str::to_owned)
-                } else {
-                    None
-                }
+            .filter_map(|part| match part.get("type")?.as_str()? {
+                "text" => part.get("text")?.as_str().map(str::to_owned),
+                "image_url" => Some(IMAGE_PART_PLACEHOLDER.to_string()),
+                _ => None,
             })
             .collect::<Vec<_>>()
             .join(""),
@@ -2774,10 +2773,30 @@ pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
     }
 }
 
+fn collect_images(v: &Option<serde_json::Value>) -> Vec<String> {
+    let Some(serde_json::Value::Array(parts)) = v else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| {
+            if part.get("type")?.as_str()? != "image_url" {
+                return None;
+            }
+            let image = part.get("image_url")?;
+            image
+                .as_str()
+                .or_else(|| image.get("url").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 fn dto_to_engine(dto: &ChatMessageDto) -> ChatMessage {
     ChatMessage {
         role: dto.role.clone(),
         content: flatten_content(&dto.content),
+        images: collect_images(&dto.content),
         tool_calls: dto.tool_calls.as_ref().and_then(parse_oai_tool_calls),
         tool_call_id: dto.tool_call_id.clone(),
         name: dto.name.clone(),
@@ -3227,8 +3246,11 @@ mod tests {
             }]
         }"#;
         let req: ChatRequest = serde_json::from_str(raw).unwrap();
-        // Only text parts are concatenated; image_url is discarded.
-        assert_eq!(flatten_content(&req.messages[0].content), "hello world");
+        assert_eq!(
+            flatten_content(&req.messages[0].content),
+            format!("hello{} world", IMAGE_PART_PLACEHOLDER)
+        );
+        assert_eq!(collect_images(&req.messages[0].content), ["data:..."]);
     }
 
     #[test]
@@ -3763,13 +3785,17 @@ mod tests {
     }
 
     #[test]
-    fn flatten_content_array_skips_non_text_parts() {
+    fn flatten_content_array_preserves_image_position() {
         let v = Some(serde_json::json!([
             {"type": "text",      "text": "hello"},
             {"type": "image_url", "image_url": {"url": "http://x"}},
             {"type": "text",      "text": " world"}
         ]));
-        assert_eq!(flatten_content(&v), "hello world");
+        assert_eq!(
+            flatten_content(&v),
+            format!("hello{} world", IMAGE_PART_PLACEHOLDER)
+        );
+        assert_eq!(collect_images(&v), ["http://x"]);
     }
 
     #[test]
@@ -4255,6 +4281,7 @@ mod tests {
         vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            images: Vec::new(),
             tool_calls: None,
             tool_call_id: None,
             name: None,

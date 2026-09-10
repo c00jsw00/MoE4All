@@ -1220,6 +1220,7 @@ dependencies = [
  "infr-llama",
  "infr-prof-rt",
  "infr-server",
+ "infr-vision",
  "infr-vulkan",
  "libc",
  "serde_json",
@@ -1434,10 +1435,12 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytemuck",
+ "half",
  "image",
  "infr-core",
  "infr-gguf",
  "infr-vulkan",
+ "rayon",
  "tracing",
 ]
 

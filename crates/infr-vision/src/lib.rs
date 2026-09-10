@@ -25,6 +25,9 @@ mod engine;
 mod preprocess;
 mod weights;
 
+#[cfg(test)]
+mod reference;
+
 pub use config::ClipConfig;
 pub use engine::{NativeVisionEngine, VisionEmbedding};
 pub use preprocess::{

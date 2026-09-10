@@ -70,6 +70,7 @@ struct BlockSpecs {
 
 struct SpecLayout {
     patch_embd_w: usize,
+    patch_embd_w_temporal: Option<usize>,
     patch_embd_b: usize,
     blocks: Vec<BlockSpecs>,
     post_ln_w: usize,
@@ -151,7 +152,15 @@ impl NativeVisionEngine {
         let wid = |index: usize| weight_ids[index];
         let layout = &self.layout;
 
-        let patch_embed = graph.internal(f32d(n, d));
+        let patch_embed_first = graph.internal(f32d(n, d));
+        let patch_embed_temporal = layout
+            .patch_embd_w_temporal
+            .map(|weight| (weight, graph.internal(f32d(n, d))));
+        let patch_embed = if patch_embed_temporal.is_some() {
+            graph.internal(f32d(n, d))
+        } else {
+            patch_embed_first
+        };
         let state = [graph.internal(f32d(n, d)), graph.internal(f32d(n, d))];
         let normed = graph.internal(f32d(n, d));
         let q = graph.internal(f32d(n, d));
@@ -174,12 +183,31 @@ impl NativeVisionEngine {
         graph.push(Op::Linear {
             x: patches,
             weight: wid(layout.patch_embd_w),
-            dst: patch_embed,
+            dst: patch_embed_first,
             m: n as u32,
             in_f: patch_in as u32,
             out_f: d as u32,
             w_off: 0,
         });
+        if let Some((weight, temporal)) = patch_embed_temporal {
+            // The source Conv3D has temporal depth two. GGUF stores its slices separately;
+            // still images duplicate one frame, so both projections are summed before bias.
+            graph.push(Op::Linear {
+                x: patches,
+                weight: wid(weight),
+                dst: temporal,
+                m: n as u32,
+                in_f: patch_in as u32,
+                out_f: d as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Add {
+                a: patch_embed_first,
+                b: temporal,
+                dst: patch_embed,
+                n: (n * d) as u32,
+            });
+        }
         graph.push(Op::AddBias {
             x: patch_embed,
             bias: wid(layout.patch_embd_b),
@@ -740,6 +768,11 @@ fn build_weight_catalog(
         &mut specs,
         matrix_slice_spec(&weights.patch_embd_weight, 0, d),
     )?;
+    let patch_embd_w_temporal = weights
+        .patch_embd_weight_video
+        .as_ref()
+        .map(|weight| push_spec(&mut specs, matrix_slice_spec(weight, 0, d)))
+        .transpose()?;
     let patch_embd_b = push_spec(&mut specs, f32_vector_spec(&weights.patch_embd_bias, 0, d))?;
     let mut blocks = Vec::with_capacity(weights.blocks.len());
     for block in &weights.blocks {
@@ -800,6 +833,7 @@ fn build_weight_catalog(
         specs,
         SpecLayout {
             patch_embd_w,
+            patch_embd_w_temporal,
             patch_embd_b,
             blocks,
             post_ln_w,
@@ -880,6 +914,8 @@ fn load_weight_buffers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use std::io::Cursor;
 
     #[test]
     fn q8_qkv_slices_are_disjoint_and_cover_the_tensor() {
@@ -928,6 +964,10 @@ mod tests {
         let weights = VisionWeights::load(&gguf).unwrap();
         let (specs, layout, bytes) = build_weight_catalog(&weights, &cfg).unwrap();
         assert_eq!(layout.blocks.len(), cfg.block_count);
+        assert!(
+            layout.patch_embd_w_temporal.is_some(),
+            "Qwen3-VL projector must retain both temporal Conv3D slices"
+        );
         assert_eq!(bytes, specs.iter().map(|spec| spec.nbytes() as u64).sum());
         assert!(specs.iter().any(|spec| spec.desc.dtype == DType::Q8_0));
         for spec in specs {
@@ -952,5 +992,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires MMPROJ_TEST_PATH and a Vulkan device"]
+    fn local_projector_matches_streaming_cpu_reference() {
+        let path = std::env::var_os("MMPROJ_TEST_PATH")
+            .expect("set MMPROJ_TEST_PATH to a local mmproj GGUF");
+        let path = Path::new(&path);
+        let gguf = Gguf::open(path).unwrap();
+        let cfg = ClipConfig::from_gguf(&gguf).unwrap();
+        let weights = VisionWeights::load(&gguf).unwrap();
+        let pos_raw = gguf
+            .tensor_bytes(&weights.position_embd_weight.name)
+            .unwrap();
+        let pos_table =
+            infr_gguf::dequant::dequant_block(weights.position_embd_weight.dtype, pos_raw).unwrap();
+
+        // Two merged tokens exercise spatial ordering as well as every projector block. Larger
+        // grids can be selected explicitly for local investigations without making CI run this
+        // deliberately heavy ignored test.
+        let width = std::env::var("VISION_PARITY_WIDTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(32);
+        let height = std::env::var("VISION_PARITY_HEIGHT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(64);
+        let image = RgbImage::from_fn(width, height, |x, y| {
+            Rgb([
+                ((x * 7 + y * 3) & 0xff) as u8,
+                ((x * 5 + 41) & 0xff) as u8,
+                ((y * 9 + 17) & 0xff) as u8,
+            ])
+        });
+        let mut png = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        let prepared = prepare_image_bytes(&png, &cfg, &pos_table).unwrap();
+
+        let started = std::time::Instant::now();
+        let expected = crate::reference::encode(path, &prepared).unwrap();
+        eprintln!("streaming CPU vision reference: {:?}", started.elapsed());
+
+        let backend = VulkanBackend::new().unwrap();
+        let engine = NativeVisionEngine::load_vulkan_with_backend(path, backend).unwrap();
+        let resident = load_weight_buffers(&gguf, &engine.specs, &engine.backend).unwrap();
+        let mut plan = engine
+            .build_plan(prepared.n_patches(), prepared.grid_nx * prepared.grid_ny)
+            .unwrap();
+        let actual = engine
+            .execute_plan(&mut plan, &prepared, &resident)
+            .unwrap();
+        assert_eq!(actual.len(), expected.len());
+
+        let mut max_abs = 0.0f32;
+        let mut sum_abs = 0.0f64;
+        let mut dot = 0.0f64;
+        let mut expected_sq = 0.0f64;
+        let mut actual_sq = 0.0f64;
+        for (&want, &got) in expected.iter().zip(&actual) {
+            let error = (want - got).abs();
+            max_abs = max_abs.max(error);
+            sum_abs += error as f64;
+            dot += want as f64 * got as f64;
+            expected_sq += (want as f64).powi(2);
+            actual_sq += (got as f64).powi(2);
+        }
+        let mean_abs = sum_abs / expected.len() as f64;
+        let cosine = dot / (expected_sq.sqrt() * actual_sq.sqrt());
+        eprintln!(
+            "CPU/Vulkan vision parity: max_abs={max_abs:.6} mean_abs={mean_abs:.6} cosine={cosine:.9}"
+        );
+        if let Some(directory) = std::env::var_os("VISION_PARITY_DUMP") {
+            let directory = Path::new(&directory);
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(
+                directory.join("rust_cpu.f32"),
+                bytemuck::cast_slice(&expected),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join("rust_vulkan.f32"),
+                bytemuck::cast_slice(&actual),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join("rust_patches.f32"),
+                bytemuck::cast_slice(&prepared.patches),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join("rust_pos_embed.f32"),
+                bytemuck::cast_slice(&prepared.pos_embed),
+            )
+            .unwrap();
+            std::fs::write(directory.join("input.png"), &png).unwrap();
+        }
+        assert!(
+            max_abs < 0.1 && cosine > 0.9999,
+            "CPU/Vulkan vision parity failed: max_abs={max_abs}, mean_abs={mean_abs}, cosine={cosine}"
+        );
     }
 }

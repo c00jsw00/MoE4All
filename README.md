@@ -165,6 +165,36 @@ chat template 仍必须完整。项目不会仅凭模型名称假定兼容。
 API Base URL 为 `http://127.0.0.1:8080/v1`。对局域网开放前请配置 API key，
 不要把无鉴权服务直接暴露到公网。
 
+#### Qwen3.8 视觉聊天
+
+将匹配的视觉 projector 放在文本模型旁边，启动向导可自动发现唯一的
+`mmproj*.gguf`；也可以直接指定：
+
+```powershell
+.\infr.exe serve --mmproj 'D:\Models\mmproj-Qwen3.8-Flash-Next-Q8_0.gguf' `
+  --addr 127.0.0.1:8080 'D:\Models\Qwen3.8-Flash-Next.gguf'
+```
+
+调用 `/v1/chat/completions` 时使用标准 OpenAI content parts，并将图片作为 data URI
+或裸 base64 放入 `image_url`：
+
+```json
+{
+  "model": "Qwen3.8-Flash-Next",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+      {"type": "text", "text": "请描述这张图片。"}
+    ]
+  }]
+}
+```
+
+当前原生视觉路径仅支持 Vulkan `qwen4exp`。为避免服务端代取 URL 带来的安全风险，
+不直接下载 HTTP(S) 图片；客户端应先编码图片。首版会在每个视觉请求中重新处理图片，
+不会跨请求复用视觉 KV。
+
 ### 性能测试
 
 ```powershell

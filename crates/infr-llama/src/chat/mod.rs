@@ -406,7 +406,9 @@ impl OaiRenderer {
             infr_chat::TemplateError::NoTemplate => no_template_err(),
             // The template EXISTS but failed to render → surface the actual jinja error so
             // serve's 500 body says what broke (not a generic "no usable template").
-            e @ infr_chat::TemplateError::Render(_) => anyhow::anyhow!("{e}"),
+            e @ (infr_chat::TemplateError::Render(_) | infr_chat::TemplateError::Vision(_)) => {
+                anyhow::anyhow!("{e}")
+            }
         })
     }
 
