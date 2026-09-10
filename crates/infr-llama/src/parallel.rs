@@ -203,6 +203,12 @@ impl ParallelSeam {
             .map_err(|error| anyhow!("derive unified Embedding backend: {error}"))
     }
 
+    pub fn fork_vision_backend(&self) -> Result<infr_vulkan::VulkanBackend> {
+        self.vk
+            .fork_vision_client()
+            .map_err(|error| anyhow!("derive unified Vision backend: {error}"))
+    }
+
     pub fn unified_vram_stats(&self) -> Option<infr_vulkan::unified::UnifiedVramStats> {
         self.vk.unified_vram().map(|pool| pool.stats())
     }

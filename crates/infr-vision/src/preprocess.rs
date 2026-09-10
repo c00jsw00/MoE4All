@@ -315,14 +315,14 @@ mod tests {
         let table = [0.0f32, 10.0, 20.0, 30.0]; // (x,y): (0,0),(1,0),(0,1),(1,1)
         let out = bilinear_resize_pos_table(&table, 1, 2, 4, 4).expect("resize");
         // Corners map exactly (align-corners): src = i*(1/3).
-        assert_eq!(out[0 * 4 + 0], 0.0);
-        assert_eq!(out[0 * 4 + 3], 10.0);
-        assert_eq!(out[3 * 4 + 0], 20.0);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[3], 10.0);
+        assert_eq!(out[12], 20.0);
         assert_eq!(out[3 * 4 + 3], 30.0);
         // (ox=1, oy=0): sx = 1/3 → 0 + (10-0)/3.
-        assert!((out[0 * 4 + 1] - 10.0 / 3.0).abs() < 1e-6);
+        assert!((out[1] - 10.0 / 3.0).abs() < 1e-6);
         // (ox=1, oy=1): sx=sy=1/3 → bilinear = (0*4 + 10*2 + 20*2 + 30*1)/9 = 90/9 = 10.
-        assert!((out[1 * 4 + 1] - 10.0).abs() < 1e-6);
+        assert!((out[5] - 10.0).abs() < 1e-6);
         // (ox=2, oy=2): sx=sy=2/3 → top = 20/3, bot = 80/3 → 20/3 + (60/3)(2/3) = 20.
         assert!((out[2 * 4 + 2] - 20.0).abs() < 1e-5);
     }

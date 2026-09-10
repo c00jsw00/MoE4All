@@ -2127,6 +2127,7 @@ pub struct VulkanBackend {
 #[derive(Clone, Copy)]
 enum UnifiedClient {
     Embedding,
+    Vision,
 }
 
 struct UnifiedPhaseState {
@@ -4981,10 +4982,21 @@ impl VulkanBackend {
     /// Derive a second execution backend over the same Vulkan device, queue, MoE pager and elastic
     /// arena. It owns independent graph/weight allocator cursors but no second device or VRAM pool.
     pub fn fork_embedding_client(&self) -> Result<Self> {
+        self.fork_auxiliary_client(UnifiedClient::Embedding, "Embedding")
+    }
+
+    /// Derive a vision execution client over the primary model's device, pager and unified arena.
+    /// Vision weights and runtime are separate ownership classes, so they can be released as one
+    /// temporary workload without disturbing the LLM's persistent state.
+    pub fn fork_vision_client(&self) -> Result<Self> {
+        self.fork_auxiliary_client(UnifiedClient::Vision, "Vision")
+    }
+
+    fn fork_auxiliary_client(&self, client: UnifiedClient, label: &str) -> Result<Self> {
         if self.unified_vram().is_none() {
-            return Err(be(
-                "cannot fork a unified Embedding backend before the MoE arena is initialized",
-            ));
+            return Err(be(format!(
+                "cannot fork a unified {label} backend before the MoE arena is initialized"
+            )));
         }
         let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
         let unified_phase_id = self.unified_phases.register(&runtime_phase);
@@ -4999,10 +5011,23 @@ impl VulkanBackend {
             unified_exec: Arc::clone(&self.unified_exec),
             unified_phases: Arc::clone(&self.unified_phases),
             unified_phase_id,
-            unified_client: Some(UnifiedClient::Embedding),
+            unified_client: Some(client),
             cfg: Arc::clone(&self.cfg),
             shared: Arc::clone(&self.shared),
         })
+    }
+
+    /// Drop this auxiliary client's retained graph workspace after its request finishes. Weight
+    /// handles remain caller-owned and can be dropped immediately afterwards; the primary LLM
+    /// restores the vacated expert slots when it next enters the shared execution gate.
+    pub fn release_auxiliary_runtime(&self) -> Result<()> {
+        if self.unified_client.is_none() {
+            return Err(be("the primary LLM backend is not an auxiliary client"));
+        }
+        self.with_unified_exclusive(|| {
+            self.runtime_phase.lock().unwrap().release_phase();
+        });
+        Ok(())
     }
 
     /// Hold optional Host DMA imports until a caller has materialized a batch of persistent KV
@@ -5791,18 +5816,13 @@ impl VulkanBackend {
         Ok(())
     }
 
-    /// Allocate `sizes.len()` buffers and zero-init them with (at most) ONE submit — the batched
-    /// twin of [`Backend::alloc`], same calloc contract. `alloc`'s per-buffer `fill_buf` costs a
-    /// one-shot submit + `queue_wait_idle` per device-local buffer; a graph execute's scratch set
-    /// (~70 Internal tensors) paid ~2.5ms of pure submit overhead per call on a 7900 XTX. Here
-    /// host-visible buffers are memset through their mapped pointer and every device-local fill is
-    /// recorded into a single one-shot command buffer.
-    pub(crate) fn alloc_zeroed_batch(
+    /// Claim all ranges as one allocator transaction, without initializing their contents.
+    fn alloc_uninit_batch_inner(
         &self,
         sizes: &[usize],
         usage: BufferUsage,
-    ) -> Result<Vec<Box<dyn Buffer>>> {
-        let bufs: Vec<VkBuffer> = if sizes.is_empty() {
+    ) -> Result<Vec<VkBuffer>> {
+        let buffers = if sizes.is_empty() {
             Vec::new()
         } else if let (Some(class), Some(pool)) =
             (self.unified_class_for_usage(usage), self.unified_vram())
@@ -5851,6 +5871,30 @@ impl VulkanBackend {
                 .map(|&bytes| self.make_alloc(bytes, usage))
                 .collect::<Result<_>>()?
         };
+        Ok(buffers)
+    }
+
+    /// Allocate a batch whose complete contents will immediately be overwritten. Unified-arena
+    /// clients claim every range in one transaction, without paying for a redundant device fill.
+    pub fn alloc_uninit_batch(
+        &self,
+        sizes: &[usize],
+        usage: BufferUsage,
+    ) -> Result<Vec<Box<dyn Buffer>>> {
+        Ok(self
+            .alloc_uninit_batch_inner(sizes, usage)?
+            .into_iter()
+            .map(|buffer| Box::new(buffer) as Box<dyn Buffer>)
+            .collect())
+    }
+
+    /// Allocate `sizes.len()` buffers and zero-init them with at most one device submission.
+    pub fn alloc_zeroed_batch(
+        &self,
+        sizes: &[usize],
+        usage: BufferUsage,
+    ) -> Result<Vec<Box<dyn Buffer>>> {
+        let bufs = self.alloc_uninit_batch_inner(sizes, usage)?;
         let mut dev: Vec<(vk::Buffer, u64, u64)> = Vec::new();
         for buf in &bufs {
             if let Some(ptr) = buf
@@ -5924,6 +5968,12 @@ impl VulkanBackend {
             }
             (Some(UnifiedClient::Embedding), BufferUsage::Activations) => {
                 Some(crate::unified::UnifiedVramClass::EmbeddingRuntime)
+            }
+            (Some(UnifiedClient::Vision), BufferUsage::Weights) => {
+                Some(crate::unified::UnifiedVramClass::VisionWeights)
+            }
+            (Some(UnifiedClient::Vision), BufferUsage::Activations) => {
+                Some(crate::unified::UnifiedVramClass::VisionRuntime)
             }
             (None, BufferUsage::Activations) if self.unified_vram().is_some() => {
                 Some(crate::unified::UnifiedVramClass::LlmRuntime)
