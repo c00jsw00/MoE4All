@@ -4485,6 +4485,17 @@ impl<'a> Recorder<'a> {
         self.dispatch(k, &[Self::vkb(x), Self::vkb(dst)], 1, &push, n.div_ceil(64));
     }
 
+    pub fn gelu(&self, x: &dyn Buffer, dst: &dyn Buffer, n: u32) {
+        let kernel = self.be.kernel("gelu", crate::gemm::gelu_spv(), 2, 4);
+        self.dispatch_wide(
+            kernel,
+            &[Self::vkb(x), Self::vkb(dst)],
+            1,
+            &n.to_ne_bytes(),
+            n.div_ceil(64),
+        );
+    }
+
     pub fn qwen_hc_mix(
         &self,
         x: &dyn Buffer,
@@ -4905,9 +4916,47 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    /// Interleaved (llama NORM) RoPE writing f16 — the llama q/k analogue of `qk_norm_rope`'s
-    /// f16 output: `out_base` shifts the output row (0 for the Q scratch; `pos` for the fused
-    /// K cache write via the kv_write peephole).
+    /// Qwen3-VL vision RoPE. One workgroup handles one `(row, head)` and reads the row's I32
+    /// `(y, x)` position directly from `pos_hw`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope2d(
+        &self,
+        pos_hw: &dyn Buffer,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        dst_q: &dyn Buffer,
+        dst_k: &dyn Buffer,
+        rows: usize,
+        n_head: usize,
+        head_dim: usize,
+        theta: f32,
+        sections: [u32; 4],
+    ) {
+        let kernel = self.be.kernel("rope2d", crate::gemm::rope2d_spv(), 5, 32);
+        let mut push = [0u8; 32];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_head as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(head_dim as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&theta.to_ne_bytes());
+        for (i, section) in sections.iter().enumerate() {
+            push[16 + i * 4..20 + i * 4].copy_from_slice(&section.to_ne_bytes());
+        }
+        self.dispatch_wide(
+            kernel,
+            &[
+                Self::vkb(pos_hw),
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(dst_q),
+                Self::vkb(dst_k),
+            ],
+            2,
+            &push,
+            (rows * n_head) as u32,
+        );
+    }
+
+    /// Interleaved (llama NORM) RoPE writing f16. `out_base` shifts the output row.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_f16(
         &self,
@@ -6727,9 +6776,56 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    /// Fused QkNormRope reading from an INTERLEAVED q+g buffer (stride = nh*2*hd per row,
-    /// query for head h at offset h*2*hd). Eliminates per-head CopyStrided dispatches for
-    /// qwen35 attention layers (768 dispatches on 27B, 204 on 4B).
+    /// Fused per-head QK-norm and interleaved multimodal RoPE. This is a static f16 scratch write;
+    /// image-prefill callers issue their ordinary KV write separately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_mrope(
+        &self,
+        x: &dyn Buffer,
+        norm: &dyn Buffer,
+        positions4: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        n_head: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        theta: f32,
+        eps: f32,
+        sections: [u32; 4],
+        x_stride: usize,
+    ) {
+        let kernel = self.be.kernel(
+            "qk_norm_rope_mrope",
+            crate::gemm::qk_norm_rope_mrope_spv(),
+            4,
+            44,
+        );
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_head as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(head_dim as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&eps.to_ne_bytes());
+        for (i, section) in sections.iter().enumerate() {
+            push[24 + i * 4..28 + i * 4].copy_from_slice(&section.to_ne_bytes());
+        }
+        push[40..44].copy_from_slice(&(x_stride as u32).to_ne_bytes());
+        self.dispatch_wide(
+            kernel,
+            &[
+                Self::vkb(x),
+                Self::vkb(norm),
+                Self::vkb(positions4),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            (rows * n_head) as u32,
+        );
+    }
+
+    /// Fused QkNormRope reading from an interleaved q+gate buffer.
     pub fn qk_norm_rope_interleaved(
         &self,
         qg: &dyn Buffer, // interleaved q+g [rows, nh*2*hd]

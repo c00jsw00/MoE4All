@@ -224,7 +224,8 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             | Op::Dsv4Gather { .. }
             | Op::QsaIndexer { .. }
             | Op::QsaGather { .. }
-            | Op::QsaBatchAttention { .. } => return false,
+            | Op::QsaBatchAttention { .. }
+            | Op::QkNormMrope { .. } => return false,
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -2408,6 +2409,14 @@ fn lower_op(
             rec.scale(r(*dst)?, *s, n);
         }
         Op::Silu { x, dst, n, scale } => rec.silu_scale(r(*x)?, r(*dst)?, *n, *scale),
+        Op::Gelu { x, dst, rows, cols } => {
+            if graph.desc(*x).dtype != infr_core::DType::F32
+                || graph.desc(*dst).dtype != infr_core::DType::F32
+            {
+                return Err(be("vulkan adapter: Gelu requires f32 input and output"));
+            }
+            rec.gelu(r(*x)?, r(*dst)?, *rows * *cols);
+        }
         Op::QwenHcMix {
             x,
             gate,
@@ -3116,6 +3125,80 @@ fn lower_op(
                 graph.desc(*k_cache).numel() as u32,
                 graph.desc(*v_cache).numel() as u32,
                 segment_shift,
+            );
+        }
+        Op::Rope2D {
+            q,
+            k,
+            pos_hw,
+            dst_q,
+            dst_k,
+            n_head,
+            head_dim,
+            theta,
+            sections,
+        } => {
+            if graph.desc(*q).dtype != infr_core::DType::F32
+                || graph.desc(*k).dtype != infr_core::DType::F32
+                || graph.desc(*pos_hw).dtype != infr_core::DType::I32
+                || graph.desc(*dst_q).dtype != infr_core::DType::F32
+                || graph.desc(*dst_k).dtype != infr_core::DType::F32
+            {
+                return Err(be(
+                    "vulkan adapter: Rope2D requires f32 q/k outputs and I32 positions",
+                ));
+            }
+            let (n_head, head_dim) = (*n_head as usize, *head_dim as usize);
+            let rows = graph.desc(*q).numel() / (n_head * head_dim).max(1);
+            rec.rope2d(
+                r(*pos_hw)?,
+                r(*q)?,
+                r(*k)?,
+                r(*dst_q)?,
+                r(*dst_k)?,
+                rows,
+                n_head,
+                head_dim,
+                *theta,
+                *sections,
+            );
+        }
+        Op::QkNormMrope {
+            x,
+            weight,
+            positions4,
+            dst,
+            rows,
+            n_head,
+            head_dim,
+            rope_dim,
+            theta,
+            eps,
+            sections,
+            x_stride,
+        } => {
+            if graph.desc(*x).dtype != infr_core::DType::F32
+                || graph.desc(*weight).dtype != infr_core::DType::F32
+                || graph.desc(*positions4).dtype != infr_core::DType::I32
+                || graph.desc(*dst).dtype != infr_core::DType::F16
+            {
+                return Err(be(
+                    "vulkan adapter: QkNormMrope requires f32 input/norm, I32 positions and f16 output",
+                ));
+            }
+            rec.qk_norm_rope_mrope(
+                r(*x)?,
+                r(*weight)?,
+                r(*positions4)?,
+                r(*dst)?,
+                *rows as usize,
+                *n_head as usize,
+                *head_dim as usize,
+                *rope_dim as usize,
+                *theta,
+                *eps,
+                *sections,
+                *x_stride as usize,
             );
         }
         // Fused per-head RMSNorm + RoPE. Peephole (see `kv_write_peephole`): a QkNormRope whose dst

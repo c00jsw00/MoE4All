@@ -1704,6 +1704,58 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+                Op::Rope2D {
+                    q,
+                    k,
+                    pos_hw,
+                    dst_q,
+                    dst_k,
+                    n_head,
+                    head_dim,
+                    theta,
+                    sections,
+                } => {
+                    let (nh, hd) = (n_head as usize, head_dim as usize);
+                    let n_pairs = hd / 2;
+                    let qs = &vals[q.0 as usize];
+                    let ks = &vals[k.0 as usize];
+                    let pos = &vals[pos_hw.0 as usize];
+                    let rows = pos.len() / 2;
+                    let mut out_q = qs.clone();
+                    let mut out_k = ks.clone();
+                    let mut starts = [0usize; 4];
+                    let mut total = 0usize;
+                    for i in 0..4 {
+                        starts[i] = total;
+                        total += sections[i] as usize;
+                    }
+                    assert!(n_pairs > 0 && total >= n_pairs);
+                    let theta_scale = theta.powf(-2.0 / n_pairs as f32);
+                    for r in 0..rows {
+                        let positions = [pos[r * 2], pos[r * 2 + 1]];
+                        for h in 0..nh {
+                            let base = (r * nh + h) * hd;
+                            for pair in 0..n_pairs {
+                                let section = (0..4)
+                                    .find(|&i| pair < starts[i] + sections[i] as usize)
+                                    .expect("Rope2D sections cover every pair");
+                                let local_pair = pair - starts[section];
+                                let angle =
+                                    positions[section % 2] * theta_scale.powi(local_pair as i32);
+                                let (sin, cos) = angle.sin_cos();
+                                let (i0, i1) = (base + pair, base + pair + n_pairs);
+                                let (qa, qb) = (qs[i0], qs[i1]);
+                                out_q[i0] = qa * cos - qb * sin;
+                                out_q[i1] = qa * sin + qb * cos;
+                                let (ka, kb) = (ks[i0], ks[i1]);
+                                out_k[i0] = ka * cos - kb * sin;
+                                out_k[i1] = ka * sin + kb * cos;
+                            }
+                        }
+                    }
+                    vals[dst_q.0 as usize] = out_q;
+                    vals[dst_k.0 as usize] = out_k;
+                }
                 Op::QkNormRope {
                     x,
                     weight: w,
@@ -1779,6 +1831,91 @@ impl Backend for CpuBackend {
                                     let bb = orow[b + i1];
                                     orow[b + i0] = a * c - bb * sn;
                                     orow[b + i1] = a * sn + bb * c;
+                                }
+                            }
+                        });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::QkNormMrope {
+                    x,
+                    weight: w,
+                    positions4,
+                    dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                    rope_dim,
+                    theta,
+                    eps,
+                    sections,
+                    x_stride,
+                } => {
+                    let (rows, nh, hd, rd) = (
+                        rows as usize,
+                        n_head as usize,
+                        head_dim as usize,
+                        rope_dim as usize,
+                    );
+                    let raw = &vals[x.0 as usize];
+                    let xs = if x_stride > 0 {
+                        let stride = x_stride as usize;
+                        let mut packed = vec![0.0; rows * nh * hd];
+                        for r in 0..rows {
+                            for h in 0..nh {
+                                let src = r * stride + h * 2 * hd;
+                                let dst = (r * nh + h) * hd;
+                                packed[dst..dst + hd].copy_from_slice(&raw[src..src + hd]);
+                            }
+                        }
+                        packed
+                    } else {
+                        raw.clone()
+                    };
+                    let ws = weight(w);
+                    let positions = &vals[positions4.0 as usize];
+                    let half = rd / 2;
+                    let section_widths = sections.map(|v| v as usize);
+                    let section_total: usize = section_widths.iter().sum();
+                    assert!(half > 0 && section_total > 0 && rd <= hd);
+                    let plane_for = |pair: usize| {
+                        let sector = pair % section_total;
+                        if sector % 3 == 1 && sector < 3 * section_widths[1] {
+                            1
+                        } else if sector % 3 == 2 && sector < 3 * section_widths[2] {
+                            2
+                        } else if sector % 3 == 0 && sector < 3 * section_widths[0] {
+                            0
+                        } else {
+                            3
+                        }
+                    };
+                    let mut out = vec![0.0; rows * nh * hd];
+                    self.pool()
+                        .for_chunks_mut(&mut out, nh * hd, 1, &|r, out_row| {
+                            let planes = &positions[r * 4..r * 4 + 4];
+                            let angles = (0..half)
+                                .map(|pair| {
+                                    let angle = planes[plane_for(pair)]
+                                        * theta.powf(-2.0 * pair as f32 / rd as f32);
+                                    angle.sin_cos()
+                                })
+                                .collect::<Vec<_>>();
+                            let x_row = &xs[r * nh * hd..(r + 1) * nh * hd];
+                            for h in 0..nh {
+                                let base = h * hd;
+                                let mean_sq = (0..hd)
+                                    .map(|i| x_row[base + i] * x_row[base + i])
+                                    .sum::<f32>()
+                                    / hd as f32;
+                                let scale = 1.0 / (mean_sq + eps).sqrt();
+                                for i in 0..hd {
+                                    out_row[base + i] = x_row[base + i] * scale * ws[i];
+                                }
+                                for (pair, &(sin, cos)) in angles.iter().enumerate() {
+                                    let (i0, i1) = (base + pair, base + pair + half);
+                                    let (a, b) = (out_row[i0], out_row[i1]);
+                                    out_row[i0] = a * cos - b * sin;
+                                    out_row[i1] = a * sin + b * cos;
                                 }
                             }
                         });
@@ -2695,6 +2832,22 @@ impl Backend for CpuBackend {
                             *o = v / (1.0 + (-v).exp());
                         }
                     });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::Gelu { x, dst, rows, cols } => {
+                    let n = (rows * cols) as usize;
+                    let xs = &vals[x.0 as usize];
+                    let c = (2.0 / std::f32::consts::PI).sqrt();
+                    let mut out = vec![0.0; n];
+                    self.pool()
+                        .for_chunks_mut(&mut out, 4096, 4, &|chunk, dst| {
+                            let base = chunk * 4096;
+                            for (i, value) in dst.iter_mut().enumerate() {
+                                let x = xs[base + i];
+                                let inner = c * (x + 0.044715 * x * x * x);
+                                *value = 0.5 * x * (1.0 + inner.tanh());
+                            }
+                        });
                     vals[dst.0 as usize] = out;
                 }
                 Op::QwenHcMix {
@@ -4581,6 +4734,91 @@ fn deltanet_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infr_core::tensor::TensorDesc;
+
+    #[test]
+    fn multimodal_rope_matches_plain_rope_when_text_planes_are_equal() {
+        let backend = CpuBackend::new();
+        let mut graph = Graph::new();
+        let x = graph.input(TensorDesc::new(vec![1, 1, 8], DType::F32));
+        let norm = graph.weight(TensorDesc::new(vec![8], DType::F32));
+        let pos = graph.input(TensorDesc::new(vec![1], DType::I32));
+        let pos4 = graph.input(TensorDesc::new(vec![1, 4], DType::I32));
+        let plain = graph.output(TensorDesc::new(vec![1, 1, 8], DType::F32));
+        let multimodal = graph.output(TensorDesc::new(vec![1, 1, 8], DType::F32));
+        graph.push(Op::QkNormRope {
+            x,
+            weight: norm,
+            positions: pos,
+            dst: plain,
+            rows: 1,
+            n_head: 1,
+            head_dim: 8,
+            rope_dim: 8,
+            theta: 10_000.0,
+            eps: 1e-6,
+            freq_factors: None,
+            x_stride: 0,
+        });
+        graph.push(Op::QkNormMrope {
+            x,
+            weight: norm,
+            positions4: pos4,
+            dst: multimodal,
+            rows: 1,
+            n_head: 1,
+            head_dim: 8,
+            rope_dim: 8,
+            theta: 10_000.0,
+            eps: 1e-6,
+            sections: [2, 1, 1, 0],
+            x_stride: 0,
+        });
+
+        let plan = backend.compile(&graph).expect("compile");
+        let values = [0.2f32, -0.4, 0.6, -0.8, 1.0, -1.2, 1.4, -1.6];
+        let xb = backend.alloc(32, BufferUsage::Activations).expect("x");
+        let wb = backend.alloc(32, BufferUsage::Weights).expect("norm");
+        let pb = backend.alloc(4, BufferUsage::Activations).expect("pos");
+        let p4b = backend.alloc(16, BufferUsage::Activations).expect("pos4");
+        let ob0 = backend.alloc(32, BufferUsage::Readback).expect("plain");
+        let ob1 = backend
+            .alloc(32, BufferUsage::Readback)
+            .expect("multimodal");
+        backend
+            .upload(xb.as_ref(), bytemuck::cast_slice(&values))
+            .unwrap();
+        backend
+            .upload(wb.as_ref(), bytemuck::cast_slice(&[1.0f32; 8]))
+            .unwrap();
+        backend
+            .upload(pb.as_ref(), bytemuck::cast_slice(&[7i32]))
+            .unwrap();
+        backend
+            .upload(p4b.as_ref(), bytemuck::cast_slice(&[7i32, 7, 7, 0]))
+            .unwrap();
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(x, xb.as_ref())
+            .bind(norm, wb.as_ref())
+            .bind(pos, pb.as_ref())
+            .bind(pos4, p4b.as_ref())
+            .bind(plain, ob0.as_ref())
+            .bind(multimodal, ob1.as_ref());
+        backend.execute(plan.as_ref(), &bindings).expect("execute");
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        backend.download(ob0.as_ref(), &mut a).unwrap();
+        backend.download(ob1.as_ref(), &mut b).unwrap();
+        let a = bytemuck::cast_slice::<u8, f32>(&a);
+        let b = bytemuck::cast_slice::<u8, f32>(&b);
+        let max_error = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_error < 1e-6, "text-plane collapse error {max_error}");
+    }
 
     #[test]
     fn dsv4_mixed_fp8_row_roundtrips_and_uses_official_page_offsets() {

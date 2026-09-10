@@ -339,6 +339,20 @@ pub enum Op {
         /// asserts.
         backward: bool,
     },
+    /// Qwen3-VL vision RoPE. Q and K are `[rows, n_head, head_dim]` f32 tensors and
+    /// `pos_hw` is `[rows, 2]` I32 `(y, x)` in the same patch order. All head dimensions rotate
+    /// in split-half pairs; each section selects y/x alternately and restarts the frequency ramp.
+    Rope2D {
+        q: TensorId,
+        k: TensorId,
+        pos_hw: TensorId,
+        dst_q: TensorId,
+        dst_k: TensorId,
+        n_head: u32,
+        head_dim: u32,
+        theta: f32,
+        sections: [u32; 4],
+    },
     /// Fused per-head RMSNorm + NEOX RoPE — `QkNorm` immediately followed by `Rope` on the same
     /// tensor (the common qwen3/gemma q/k case). One pass: each head is rmsnormed (`× weight`) then
     /// its first `rope_dim` rotated, dims beyond `rope_dim` passing through normed. Maps 1:1 to the
@@ -357,6 +371,25 @@ pub enum Op {
         eps: f32,
         freq_factors: Option<TensorId>,
         /// Per-row stride in `x`. 0 = packed (stride = n_head * head_dim).
+        x_stride: u32,
+    },
+    /// Fused per-head RMSNorm and interleaved multimodal RoPE. `positions4` contains row-major
+    /// `(T, H, W, E)` coordinates; `sections` follows the model's
+    /// `rope.dimension_sections` metadata.
+    QkNormMrope {
+        x: TensorId,
+        weight: TensorId,
+        positions4: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        sections: [u32; 4],
+        /// Per-row source stride; zero means packed. Qwen3.5's interleaved q+gate projection uses
+        /// a non-zero stride.
         x_stride: u32,
     },
     /// Append `src` (`rows × row_stride`) into the persistent KV `cache` starting at row `pos`,
@@ -926,6 +959,13 @@ pub enum Op {
         n: u32,
         scale: f32,
     },
+    /// Elementwise tanh-approximation GELU used by the Qwen3-VL vision FFN and merger.
+    Gelu {
+        x: TensorId,
+        dst: TensorId,
+        rows: u32,
+        cols: u32,
+    },
     /// Qwen3.8 stream collapse after its low-rank gate projection. `x` and `gate` are
     /// `[rows, hc, n_embd]`; gate contains raw logits. The output is
     /// `mean_h(x[r,h,d] * sigmoid(gate[r,h,d]))`.
@@ -1307,7 +1347,9 @@ impl Op {
             Op::QkNorm { .. } => "QkNorm",
             Op::GatedRmsNorm { .. } => "GatedRmsNorm",
             Op::Rope { .. } => "Rope",
+            Op::Rope2D { .. } => "Rope2D",
             Op::QkNormRope { .. } => "QkNormRope",
+            Op::QkNormMrope { .. } => "QkNormMrope",
             Op::WriteKv { .. } => "WriteKv",
             Op::Dsv4Compress { .. } => "Dsv4Compress",
             Op::Dsv4CacheWrite { .. } => "Dsv4CacheWrite",
@@ -1329,6 +1371,7 @@ impl Op {
             Op::AddBias { .. } => "AddBias",
             Op::Scale { .. } => "Scale",
             Op::Silu { .. } => "Silu",
+            Op::Gelu { .. } => "Gelu",
             Op::QwenHcMix { .. } => "QwenHcMix",
             Op::QwenHcInject { .. } => "QwenHcInject",
             Op::QwenPleGate { .. } => "QwenPleGate",
@@ -1400,6 +1443,14 @@ impl Op {
                 r.extend(freq_factors);
                 (r, vec![dst])
             }
+            Op::Rope2D {
+                q,
+                k,
+                pos_hw,
+                dst_q,
+                dst_k,
+                ..
+            } => (vec![q, k, pos_hw], vec![dst_q, dst_k]),
             Op::QkNormRope {
                 x,
                 weight,
@@ -1412,6 +1463,13 @@ impl Op {
                 r.extend(freq_factors);
                 (r, vec![dst])
             }
+            Op::QkNormMrope {
+                x,
+                weight,
+                positions4,
+                dst,
+                ..
+            } => (vec![x, weight, positions4], vec![dst]),
             Op::WriteKv { src, cache, .. } => (vec![src, cache], vec![cache]),
             Op::Dsv4Compress {
                 values,
@@ -1538,6 +1596,7 @@ impl Op {
             Op::AddBias { x, bias, dst, .. } => (vec![x, bias], vec![dst]),
             Op::Scale { x, dst, .. } => (vec![x], vec![dst]),
             Op::Silu { x, dst, .. } => (vec![x], vec![dst]),
+            Op::Gelu { x, dst, .. } => (vec![x], vec![dst]),
             Op::QwenHcMix { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
             Op::QwenHcInject {
                 residual,

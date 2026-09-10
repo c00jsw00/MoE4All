@@ -802,6 +802,8 @@ fn main() {
         ("hyper_pre", "hyper_pre", &[]),
         ("hyper_post", "hyper_post", &[]),
         ("silu_scale", "silu_scale", &[]),
+        ("gelu", "gelu", &[]),
+        ("qk_norm_rope_mrope", "qk_norm_rope_mrope", &[]),
         ("qwen_hc_mix", "qwen_hc_mix", &[]),
         ("qwen_hc_inject", "qwen_hc_inject", &[]),
         ("qwen_ple_gate", "qwen_ple_gate", &[]),
@@ -953,6 +955,7 @@ fn main() {
         ("rope", "rope_ff_back", &["-DFREQ_FACTORS", "-DBACKWARD"]),
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),
+        ("rope2d", "rope2d", &[]),
         ("linear_f16", "linear_f16", &[]),
         // !caps.f16 fallback (no shaderFloat16 ext): reads the f16 weight buffer as packed u32 +
         // unpackHalf2x16 (core GLSL) instead of a float16_t SSBO read.
