@@ -2867,12 +2867,13 @@ fn moe_host_backing(
     ram_request: infr_core::hostmem::RamRequest,
     available: Option<u64>,
     process_resident: Option<u64>,
+    commit_ceiling: Option<u64>,
     payload_bytes: usize,
 ) -> MoeHostBacking {
-    // `process_resident` is sampled before fixed Vulkan weights are uploaded. Do not add their
-    // GGUF source footprint here: bounded host storage is allocated and populated only after the
-    // upload finalizer, when those clean file-backed pages are reclaimable.
-    let budget = match ram_request {
+    // Automatic Windows sizing may supply a post-Vulkan snapshot so WDDM's commit charge is
+    // visible. Explicit total-process sizing retains the pre-upload resident snapshot because the
+    // clean GGUF source pages touched by fixed uploads are reclaimable before this arena is filled.
+    let requested_budget = match ram_request {
         infr_core::hostmem::RamRequest::TotalProcessBudget(total) => {
             infr_core::hostmem::cache_bytes_for_total_budget(
                 total,
@@ -2897,6 +2898,17 @@ fn moe_host_backing(
                 }
             })
             .unwrap_or(0),
+    };
+    // WDDM charges device-local Vulkan allocations against Windows' system commit limit. Automatic
+    // sizing must account for that live pressure. Every explicit request remains authoritative:
+    // advanced users may intentionally trade system headroom for a complete Host store.
+    let budget = match ram_request {
+        infr_core::hostmem::RamRequest::Auto => {
+            requested_budget.min(commit_ceiling.unwrap_or(u64::MAX))
+        }
+        infr_core::hostmem::RamRequest::TotalProcessBudget(_)
+        | infr_core::hostmem::RamRequest::LegacyCacheBudget(_)
+        | infr_core::hostmem::RamRequest::Bypass => requested_budget,
     } as usize;
     if budget >= payload_bytes {
         MoeHostBacking::Full
@@ -3257,7 +3269,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // before the adapter can inspect either one. Warm calls never bind and never receive a hook.
     let mut moe_host_offsets =
         std::collections::HashMap::<(usize, infr_vulkan::pager::Role), usize>::new();
-    let mut moe_bounded_host = false;
     if first_load && n_paged > 0 {
         use infr_vulkan::pager::Role;
         let moe = cfg.moe.as_ref().expect("n_paged > 0 implies MoE");
@@ -3318,7 +3329,35 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if current_layer.is_some() {
             host_layers.push((layer_start, host_bytes));
         }
-        let mut host_chunks = Vec::<infr_vulkan::pager::MoeHostChunkSpec>::new();
+        // Prepare both source descriptions before binding. The final Full-vs-Bounded decision is
+        // intentionally deferred until fixed Vulkan allocations have landed and Windows can
+        // report the real remaining WDDM/system commit headroom.
+        const HOST_CHUNK_MAX: usize = 2 * 1024 * 1024 * 1024;
+        let oversized_host_layer = host_layers
+            .iter()
+            .map(|&(start, end)| end - start)
+            .find(|&bytes| bytes > HOST_CHUNK_MAX);
+        let host_chunks: Vec<infr_vulkan::pager::MoeHostChunkSpec> =
+            if oversized_host_layer.is_none() {
+                let mut chunk_ranges = Vec::<(usize, usize)>::new();
+                for &(start, end) in &host_layers {
+                    match chunk_ranges.last_mut() {
+                        Some((chunk_start, chunk_end)) if end - *chunk_start <= HOST_CHUNK_MAX => {
+                            *chunk_end = end;
+                        }
+                        _ => chunk_ranges.push((start, end)),
+                    }
+                }
+                chunk_ranges
+                    .into_iter()
+                    .map(|(base_offset, end)| infr_vulkan::pager::MoeHostChunkSpec {
+                        base_offset,
+                        bytes: end - base_offset,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         if pool_blocks.is_empty() {
             // Defensive: an MoE config with NO pageable `_exps` weight banks (no arch this crate
             // loads ships that). Nothing to page — stay fully resident and let the alloc-time
@@ -3391,95 +3430,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     planned_pager_budget as f64 / MIB_F64,
                 )
             })?;
-            // The Host tier has two honest modes. If the configured/automatic RAM budget covers
-            // the whole expert payload, retain the existing layer-contiguous store (fastest
-            // Prefill and Decode source). Otherwise allocate bounded per-size-class victim
-            // caches and leave the remaining Experts on SSD. GPU-resident Experts retain a pinned
-            // RAM shadow when capacity permits, making GPU eviction metadata-only.
+            // Resolve the Host tier only after the physical device arena exists. In particular,
+            // Windows reports WDDM's real device-allocation commit charge only at that point.
             let ram_request = host_ram_request(ec);
-            let host_available = infr_core::hostmem::available_bytes();
-            let process_resident = infr_core::hostmem::process_resident_bytes();
-            let host_backing = moe_host_backing(
-                ec.device.auto_profile,
-                ram_request,
-                host_available,
-                process_resident,
-                host_bytes,
-            );
-            let (host_kind, host_resident_bytes) = match host_backing {
-                MoeHostBacking::Full => ("full-RAM", host_bytes),
-                MoeHostBacking::Bounded { bytes } => ("inclusive-RAM/SSD", bytes),
-            };
-            if ram_request == infr_core::hostmem::RamRequest::Auto {
-                if let Some(available) = host_available {
-                    tracing::info!(
-                        auto_profile = ?ec.device.auto_profile,
-                        available_host_bytes = available,
-                        expert_payload_bytes = host_bytes,
-                        headroom_after_full_bytes = available.saturating_sub(host_bytes as u64),
-                        full_fit_shortfall_bytes = (host_bytes as u64).saturating_sub(available),
-                        decision = host_kind,
-                        "MoE automatic host residency decision"
-                    );
-                }
-            }
-            log_host_ram_request(
-                "MoE",
-                ram_request,
-                process_resident,
-                reclaimable_fixed_host_source_bytes,
-                host_resident_bytes as u64,
-            );
+            let auto_profile = ec.device.auto_profile;
+            let planned_host_available = infr_core::hostmem::available_bytes();
+            let planned_process_resident = infr_core::hostmem::process_resident_bytes();
             let host_classes: Vec<(usize, usize)> = logical_pools
                 .iter()
                 .map(|&(slot_bytes, blocks, _)| (slot_bytes, blocks))
                 .collect();
-            if let MoeHostBacking::Bounded {
-                bytes: host_cache_budget,
-            } = host_backing
-            {
-                moe_bounded_host = true;
-                tracing::info!(
-                    "MoE host plan: bounded inclusive RAM/SSD tier {:.2} GiB / {:.2} GiB expert payload across {} size class(es); the RAM arena will be allocated after fixed GPU uploads",
-                    host_cache_budget as f64 / GIB_F64,
-                    host_bytes as f64 / GIB_F64,
-                    host_classes.len(),
-                );
-            } else {
-                // Keep the complete payload in one logical layer-major store, split only BETWEEN
-                // layers so each layer remains a contiguous Prefill source. Bounded-RAM mode does
-                // not allocate this store and therefore must not inherit its per-chunk limit.
-                const HOST_CHUNK_MAX: usize = 2 * 1024 * 1024 * 1024;
-                let mut chunk_ranges = Vec::<(usize, usize)>::new();
-                for &(start, end) in &host_layers {
-                    if end - start > HOST_CHUNK_MAX {
-                        return Err(anyhow!(
-                            "MoE expert layer requires {:.2} GiB, above the {:.2} GiB permanent \
-                             host-store chunk limit",
-                            (end - start) as f64 / 2f64.powi(30),
-                            HOST_CHUNK_MAX as f64 / 2f64.powi(30),
-                        ));
-                    }
-                    match chunk_ranges.last_mut() {
-                        Some((chunk_start, chunk_end)) if end - *chunk_start <= HOST_CHUNK_MAX => {
-                            *chunk_end = end;
-                        }
-                        _ => chunk_ranges.push((start, end)),
-                    }
-                }
-                host_chunks = chunk_ranges
-                    .into_iter()
-                    .map(|(base_offset, end)| infr_vulkan::pager::MoeHostChunkSpec {
-                        base_offset,
-                        bytes: end - base_offset,
-                    })
-                    .collect();
-                tracing::info!(
-                    "MoE host plan: full layer-contiguous RAM store {:.2} GiB; RAM budget covers \
-                     every routed expert, runtime SSD tier disabled",
-                    host_bytes as f64 / GIB_F64,
-                );
-            }
             // No per-pool arena ceiling: each MoE pool is a `bufferDeviceAddress` buffer read by
             // pointer, so it is NOT capped by one SSBO binding's maxStorageBufferRange (~4 GiB on
             // RADV) the way it was when the arena was a bound SSBO. A pool now holds as many experts
@@ -3520,7 +3480,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 )
                 .collect();
             let cached: usize = pools.iter().map(|p| p.n_slots).sum();
-            let host_chunk_count = host_chunks.len();
             let pool_desc: Vec<String> = logical_pools
                 .iter()
                 .zip(&pools)
@@ -3536,13 +3495,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
             tracing::info!(
                 "MoE pager plan: {n_paged}/{} expert layers PAGED ({cached} expert blocks cached — {}; \
              {:.2} GiB estimated device arena; Decode size bias {size_cache_bias:+.2} \
-             ({size_cache_bias_source}); host={} {:.2} GiB in {host_chunk_count} chunks; \
+             ({size_cache_bias_source}); host decision deferred until fixed Vulkan allocations; \
              ctx={want_ctx})",
                 cfg.n_layer,
                 pool_desc.join(", "),
                 pager_budget_bytes as f64 / GIB_F64,
-                host_kind,
-                host_resident_bytes as f64 / GIB_F64,
             );
             // Recurrent hybrids use current + the longest consecutive recurrent run. The pager
             // may lower that target to fit the Expert-cache share, but never spends the runtime
@@ -3667,6 +3624,95 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     candidate_budget = next;
                 };
 
+                let automatic_host_budget =
+                    matches!(ram_request, infr_core::hostmem::RamRequest::Auto);
+                let host_available = if cfg!(windows) && automatic_host_budget {
+                    infr_core::hostmem::available_bytes()
+                } else {
+                    planned_host_available
+                };
+                let process_resident = planned_process_resident;
+                // Leave a small commit tail for the pager metadata, initial KV segment and server
+                // objects created after this point. This ceiling is automatic policy only;
+                // explicit RAM budgets remain exact even when they deliberately exceed it.
+                let commit_available = infr_core::hostmem::commit_available_bytes();
+                let live_commit_ceiling =
+                    commit_available.map(|bytes| bytes.saturating_sub(512 << 20));
+                let automatic_commit_ceiling = automatic_host_budget
+                    .then_some(live_commit_ceiling)
+                    .flatten();
+                let host_backing = moe_host_backing(
+                    auto_profile,
+                    ram_request,
+                    host_available,
+                    process_resident,
+                    automatic_commit_ceiling,
+                    host_bytes,
+                );
+                let (host_kind, host_resident_bytes) = match host_backing {
+                    MoeHostBacking::Full => ("full-RAM", host_bytes),
+                    MoeHostBacking::Bounded { bytes } => ("inclusive-RAM/SSD", bytes),
+                };
+                if matches!(host_backing, MoeHostBacking::Full) {
+                    if let Some(bytes) = oversized_host_layer {
+                        return Err(anyhow!(
+                            "MoE expert layer requires {:.2} GiB, above the {:.2} GiB permanent \
+                             host-store chunk limit",
+                            bytes as f64 / GIB_F64,
+                            HOST_CHUNK_MAX as f64 / GIB_F64,
+                        ));
+                    }
+                }
+                if let (Some(available), Some(ceiling)) = (commit_available, live_commit_ceiling) {
+                    if automatic_host_budget {
+                        tracing::info!(
+                            available_commit_bytes = available,
+                            host_cache_commit_ceiling_bytes = ceiling,
+                            selected_host_cache_bytes = host_resident_bytes,
+                            "MoE Windows automatic commit guard after fixed Vulkan allocations"
+                        );
+                    } else if host_resident_bytes as u64 > ceiling {
+                        tracing::warn!(
+                            available_commit_bytes = available,
+                            host_cache_commit_ceiling_bytes = ceiling,
+                            selected_host_cache_bytes = host_resident_bytes,
+                            "explicit MoE RAM budget exceeds the current Windows commit headroom; honoring the user setting without automatic reduction"
+                        );
+                    }
+                }
+                if ram_request == infr_core::hostmem::RamRequest::Auto {
+                    if let Some(available) = host_available {
+                        tracing::info!(
+                            auto_profile = ?auto_profile,
+                            available_host_bytes = available,
+                            expert_payload_bytes = host_bytes,
+                            headroom_after_full_bytes = available.saturating_sub(host_bytes as u64),
+                            full_fit_shortfall_bytes = (host_bytes as u64).saturating_sub(available),
+                            decision = host_kind,
+                            "MoE automatic host residency decision"
+                        );
+                    }
+                }
+                log_host_ram_request(
+                    "MoE",
+                    ram_request,
+                    process_resident,
+                    reclaimable_fixed_host_source_bytes,
+                    host_resident_bytes as u64,
+                );
+                match host_backing {
+                    MoeHostBacking::Bounded { bytes } => tracing::info!(
+                        "MoE host plan: bounded inclusive RAM/SSD tier {:.2} GiB / {:.2} GiB expert payload across {} size class(es)",
+                        bytes as f64 / GIB_F64,
+                        host_bytes as f64 / GIB_F64,
+                        host_classes.len(),
+                    ),
+                    MoeHostBacking::Full => tracing::info!(
+                        "MoE host plan: full layer-contiguous RAM store {:.2} GiB; RAM and commit budgets cover every routed expert, runtime SSD tier disabled",
+                        host_bytes as f64 / GIB_F64,
+                    ),
+                }
+
                 let expert_cache_bytes = physical_bytes
                     .saturating_sub(elastic_reserve)
                     .min(expert_payload_bytes);
@@ -3745,13 +3791,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     dynamic_state_max_allocation_bytes,
                     prefill_min_lane_bytes,
                     runtime_reserve_bytes: plan.runtime_reserve_bytes,
-                    host_chunks: host_chunks
-                        .iter()
-                        .map(|chunk| infr_vulkan::pager::MoeHostChunkSpec {
-                            base_offset: chunk.base_offset,
-                            bytes: chunk.bytes,
-                        })
-                        .collect(),
+                    host_chunks: if host_tier.is_some() {
+                        Vec::new()
+                    } else {
+                        host_chunks
+                            .iter()
+                            .map(|chunk| infr_vulkan::pager::MoeHostChunkSpec {
+                                base_offset: chunk.base_offset,
+                                bytes: chunk.bytes,
+                            })
+                            .collect()
+                    },
                     prefill_target_lanes,
                     prefill_cache_bytes: expert_cache_bytes,
                 })
@@ -4255,27 +4305,23 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let host_offset = *moe_host_offsets.get(&(l, role)).ok_or_else(|| {
                     anyhow!("MoE permanent host-store plan has no offset for {name}")
                 })?;
-                let file = if moe_bounded_host {
-                    let (base, len) = bytes.file_range();
-                    if len != stride_bytes * n_expert {
-                        return Err(anyhow!(
-                            "MoE bounded Host tier: {name}'s file range is {len} bytes, expected \
-                             {n_expert} x {stride_bytes}"
-                        ));
-                    }
-                    let role_idx = match role {
-                        infr_vulkan::pager::Role::Gate => 0usize,
-                        infr_vulkan::pager::Role::Up => 1,
-                        infr_vulkan::pager::Role::Down => 2,
-                    };
-                    let block_base = (role_idx * n_paged * n_expert + l * n_expert) as u32;
-                    Some(infr_core::blockio::BlockDesc {
-                        id: block_base,
-                        extents: vec![infr_core::blockio::BlockExtent { offset: base, len }],
-                    })
-                } else {
-                    None
+                let (base, len) = bytes.file_range();
+                if len != stride_bytes * n_expert {
+                    return Err(anyhow!(
+                        "MoE Host tier: {name}'s file range is {len} bytes, expected \
+                         {n_expert} x {stride_bytes}"
+                    ));
+                }
+                let role_idx = match role {
+                    infr_vulkan::pager::Role::Gate => 0usize,
+                    infr_vulkan::pager::Role::Up => 1,
+                    infr_vulkan::pager::Role::Down => 2,
                 };
+                let block_base = (role_idx * n_paged * n_expert + l * n_expert) as u32;
+                let file = Some(infr_core::blockio::BlockDesc {
+                    id: block_base,
+                    extents: vec![infr_core::blockio::BlockExtent { offset: base, len }],
+                });
                 let source = infr_vulkan::pager::ExpertSource {
                     bank,
                     stride_bytes,
@@ -5530,6 +5576,7 @@ mod seam_helper_tests {
                 RamRequest::LegacyCacheBudget(payload as u64),
                 None,
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Full,
@@ -5541,6 +5588,7 @@ mod seam_helper_tests {
                 RamRequest::LegacyCacheBudget((40 * GIB) as u64),
                 None,
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Full,
@@ -5552,6 +5600,7 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((64 * GIB) as u64),
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Full,
@@ -5570,6 +5619,7 @@ mod seam_helper_tests {
                 RamRequest::LegacyCacheBudget((23 * GIB) as u64),
                 None,
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 23 * GIB }
@@ -5580,6 +5630,7 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((25 * GIB) as u64),
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes } if bytes < payload
@@ -5590,6 +5641,7 @@ mod seam_helper_tests {
                 RamRequest::TotalProcessBudget(0),
                 Some((64 * GIB) as u64),
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 }
@@ -5600,6 +5652,7 @@ mod seam_helper_tests {
                 RamRequest::Bypass,
                 Some((64 * GIB) as u64),
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 }
@@ -5618,6 +5671,7 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((payload + 4 * GIB) as u64),
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Full,
@@ -5629,6 +5683,7 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((payload + 4 * GIB - 1) as u64),
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes } if bytes < payload
@@ -5639,6 +5694,7 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((payload + 4 * GIB) as u64),
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes } if bytes < payload
@@ -5651,6 +5707,7 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 Some((40 * GIB) as u64),
                 Some(0),
+                None,
                 large_payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 32 * GIB },
@@ -5669,6 +5726,7 @@ mod seam_helper_tests {
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((48 * GIB) as u64),
                 Some((2 * GIB) as u64),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Bounded {
@@ -5682,6 +5740,7 @@ mod seam_helper_tests {
                 RamRequest::TotalProcessBudget((50 * GIB) as u64),
                 Some((48 * GIB) as u64),
                 Some((2 * GIB) as u64),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Bounded {
@@ -5695,10 +5754,55 @@ mod seam_helper_tests {
                 RamRequest::Auto,
                 None,
                 Some(0),
+                None,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 },
             "auto sizing without a probe must not assume the whole payload fits RAM"
+        );
+    }
+
+    #[test]
+    fn moe_host_backing_applies_post_vulkan_commit_ceiling_only_to_auto() {
+        use infr_core::hostmem::RamRequest;
+
+        let payload = 48 * GIB;
+        let ceiling = 41 * GIB;
+        assert_eq!(
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::Auto,
+                Some((56 * GIB) as u64),
+                Some(0),
+                Some(ceiling as u64),
+                payload,
+            ),
+            super::MoeHostBacking::Bounded { bytes: ceiling },
+            "automatic sizing must not cross the live Windows commit ceiling"
+        );
+        assert_eq!(
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                Some((56 * GIB) as u64),
+                Some(0),
+                Some(ceiling as u64),
+                payload,
+            ),
+            super::MoeHostBacking::Full,
+            "an explicit total-process budget must remain authoritative"
+        );
+        assert_eq!(
+            super::moe_host_backing(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::TotalProcessBudget((48 * GIB) as u64),
+                Some((56 * GIB) as u64),
+                Some(128 << 20),
+                Some((40 * GIB) as u64),
+                47 * GIB,
+            ),
+            super::MoeHostBacking::Full,
+            "a 48 GiB manual process budget must be allowed to hold a 47 GiB expert payload"
         );
     }
 

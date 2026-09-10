@@ -81,6 +81,23 @@ pub fn total_bytes() -> Option<u64> {
     })
 }
 
+/// Bytes the current process may still commit before the system commit limit is reached.
+///
+/// Windows/WDDM charges Vulkan device-memory allocations against this limit even when the bytes
+/// live in dedicated VRAM. Callers that allocate a large host arena after their Vulkan heaps are
+/// committed therefore need the raw commit headroom, independently from [`available_bytes`]'s
+/// physical-RAM minimum. Other platforms do not need this WDDM-specific second ceiling.
+pub fn commit_available_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        Some(windows_memory_status()?.ullAvailPageFile)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 fn platform_total_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -593,6 +610,7 @@ mod tests {
             status.ullTotalPhys
         );
         assert_eq!(total_bytes(), Some(status.ullTotalPhys));
+        assert_eq!(commit_available_bytes(), Some(status.ullAvailPageFile));
         assert!(
             avail <= status.ullAvailPageFile,
             "available {avail} exceeds commit headroom {}",
