@@ -8825,26 +8825,58 @@ impl<'a> Recorder<'a> {
         eps: f32,
         scale: f32,
         segment_shifts: Option<(u32, u32)>,
+        mrope: Option<(&dyn Buffer, [u32; 4])>,
     ) {
         let blocks = kv_len / ratio;
         let first_new = compress_from.min(blocks);
         let new_blocks = blocks - first_new;
         if new_blocks > 0 {
-            let (name, spv, push_bytes) = if segment_shifts.is_some() {
-                (
+            let (name, spv, push_bytes, bindings) = match (segment_shifts, mrope) {
+                (Some(_), Some((positions4, _))) => (
+                    "qsa_indexer_compress_mrope_seg",
+                    crate::gemm::qsa_indexer_compress_mrope_seg_spv(),
+                    52,
+                    vec![
+                        Self::vkb(k_cache),
+                        Self::vkb(k_norm),
+                        Self::vkb(positions4),
+                        Self::vkb(block_cache),
+                    ],
+                ),
+                (None, Some((positions4, _))) => (
+                    "qsa_indexer_compress_mrope",
+                    crate::gemm::qsa_indexer_compress_mrope_spv(),
+                    44,
+                    vec![
+                        Self::vkb(k_cache),
+                        Self::vkb(k_norm),
+                        Self::vkb(positions4),
+                        Self::vkb(block_cache),
+                    ],
+                ),
+                (Some(_), None) => (
                     "qsa_indexer_compress_seg",
                     crate::gemm::qsa_indexer_compress_seg_spv(),
                     36,
-                )
-            } else {
-                (
+                    vec![
+                        Self::vkb(k_cache),
+                        Self::vkb(k_norm),
+                        Self::vkb(block_cache),
+                    ],
+                ),
+                (None, None) => (
                     "qsa_indexer_compress",
                     crate::gemm::qsa_indexer_compress_spv(),
                     28,
-                )
+                    vec![
+                        Self::vkb(k_cache),
+                        Self::vkb(k_norm),
+                        Self::vkb(block_cache),
+                    ],
+                ),
             };
-            let compress_k = self.be.kernel(name, spv, 3, push_bytes);
-            let mut push = [0u8; 36];
+            let compress_k = self.be.kernel(name, spv, bindings.len(), push_bytes);
+            let mut push = [0u8; 52];
             push[0..4].copy_from_slice(&first_new.to_ne_bytes());
             push[4..8].copy_from_slice(&new_blocks.to_ne_bytes());
             push[8..12].copy_from_slice(&head_dim.to_ne_bytes());
@@ -8856,13 +8888,15 @@ impl<'a> Recorder<'a> {
                 push[28..32].copy_from_slice(&raw_shift.to_ne_bytes());
                 push[32..36].copy_from_slice(&block_shift.to_ne_bytes());
             }
+            if let Some((_, sections)) = mrope {
+                let off = if segment_shifts.is_some() { 36 } else { 28 };
+                for (i, section) in sections.into_iter().enumerate() {
+                    push[off + i * 4..off + (i + 1) * 4].copy_from_slice(&section.to_ne_bytes());
+                }
+            }
             self.dispatch_wide(
                 compress_k,
-                &[
-                    Self::vkb(k_cache),
-                    Self::vkb(k_norm),
-                    Self::vkb(block_cache),
-                ],
+                &bindings,
                 1,
                 &push[..push_bytes as usize],
                 new_blocks,

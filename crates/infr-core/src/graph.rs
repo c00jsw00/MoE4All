@@ -473,6 +473,10 @@ pub enum Op {
         k_cache: TensorId,
         block_cache: TensorId,
         k_norm: TensorId,
+        /// Optional full-context row-major `(T, H, W, E)` position table. When present, newly
+        /// compressed block keys use the first token's multimodal position; `None` preserves the
+        /// text-only linear `block * ratio` position exactly.
+        positions4: Option<TensorId>,
         dst: TensorId,
         /// Number of consecutive query rows. Row `r` sees
         /// `kv_len - rows + r + 1` cached tokens.
@@ -489,6 +493,8 @@ pub enum Op {
         theta: f32,
         eps: f32,
         scale: f32,
+        /// IMROPE section widths. Read only when `positions4` is present.
+        sections: [u32; 4],
     },
     /// Gather QSA-selected complete blocks plus the always-visible incomplete tail from the
     /// ordinary full-attention K/V caches into packed F16 scratch consumed by `Op::Attention`.
@@ -1509,12 +1515,14 @@ impl Op {
                 k_cache,
                 block_cache,
                 k_norm,
+                positions4,
                 dst,
                 ..
-            } => (
-                vec![q, k_cache, block_cache, k_norm],
-                vec![block_cache, dst],
-            ),
+            } => {
+                let mut reads = vec![q, k_cache, block_cache, k_norm];
+                reads.extend(positions4);
+                (reads, vec![block_cache, dst])
+            }
             Op::QsaGather {
                 k_cache,
                 v_cache,

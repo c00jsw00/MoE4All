@@ -143,6 +143,7 @@ fn bind_layer_io<'a>(
     vbufs: &'a [Box<dyn Buffer>],
     qsa_kbufs: &'a [Option<Box<dyn Buffer>>],
     qsa_cbufs: &'a [Option<Box<dyn Buffer>>],
+    mrope_history_buf: &'a Option<Box<dyn Buffer>>,
     wbufs: &'a [Box<dyn Buffer>],
     qwen_wide_buf: &'a Option<Box<dyn Buffer>>,
     ple_embd_buf: &'a Option<Box<dyn Buffer>>,
@@ -153,6 +154,9 @@ fn bind_layer_io<'a>(
     }
     if let (Some(yid), Some((yb, _))) = (h.yarn_ff, yff_buf) {
         b.bind(yid, yb.as_ref());
+    }
+    if let (Some(id), Some(buf)) = (h.mrope_history, mrope_history_buf) {
+        b.bind(id, buf.as_ref());
     }
     for l in 0..n_layer {
         b.bind(h.k_cache[l], kbufs[l].as_ref());
@@ -359,6 +363,10 @@ fn session_stable(
 pub(super) struct DecodeHandles {
     hidden: TensorId,
     positions: TensorId,
+    /// Per-execute `(T,H,W,E)` positions on multimodal builds.
+    positions4: Option<TensorId>,
+    /// Full request position table shared by every QSA layer while materializing block keys.
+    mrope_history: Option<TensorId>,
     rope_freqs: Option<TensorId>, // gemma4 proportional-RoPE divisors (full-attention layers)
     // DeepSeek V2+ YaRN per-pair frequency divisors (qk_rope_dim/2 floats): the graph Input the
     // driver binds `yff_buf` to (a per-step f32 Input like `rope_freqs`). `None` for non-yarn.
@@ -473,6 +481,8 @@ pub(crate) fn generate_dense_backend(
     // Vulkan paged-MoE cold loads defer their elastic arena until fixed allocations are resident.
     // Every other backend/path passes None; the hook is invoked exactly once before dynamic state.
     finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
+    // Vision request plan. `None` keeps every existing text-only graph and upload unchanged.
+    mm: Option<&crate::seam::MropePlan>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let state_trace = ec.debug.state_trace;
@@ -1716,6 +1726,78 @@ pub(crate) fn generate_dense_backend(
         }
         validate_token_ids(prompt, c.vocab)?;
     }
+    // One request-scoped full-context position table lets every QSA layer materialize historical
+    // block keys with the first token's true multimodal position, including the first sparse call
+    // that compresses blocks from earlier prefill chunks. Future generated rows are deterministic
+    // linear text positions, so fill them once now instead of mutating another persistent cache on
+    // every decode step. Text-only calls allocate nothing.
+    let mrope_history_buf = if let Some(plan) = mm {
+        if !c.qwen4exp {
+            return Err(anyhow!(
+                "multimodal RoPE is currently supported only by qwen4exp"
+            ));
+        }
+        if plan.prompt_pos4.len() != prompt.len() * 4 {
+            return Err(anyhow!(
+                "multimodal position table has {} values for {} prompt tokens (expected {})",
+                plan.prompt_pos4.len(),
+                prompt.len(),
+                prompt.len() * 4
+            ));
+        }
+        if c.rope_sections.iter().sum::<u32>() == 0 {
+            return Err(anyhow!("qwen4exp multimodal RoPE sections are empty"));
+        }
+        let mut previous_end = 0usize;
+        for (index, span) in plan.spans.iter().enumerate() {
+            let end = span
+                .start
+                .checked_add(span.n_tokens)
+                .ok_or_else(|| anyhow!("image span #{index} overflows token indices"))?;
+            if span.n_tokens == 0 || span.start < previous_end || end > prompt.len() {
+                return Err(anyhow!(
+                    "invalid image span #{index}: {}..{} for prompt length {}",
+                    span.start,
+                    end,
+                    prompt.len()
+                ));
+            }
+            if span.embeds.len() != span.n_tokens * ne {
+                return Err(anyhow!(
+                    "image span #{index} has {} embedding values, expected {}",
+                    span.embeds.len(),
+                    span.n_tokens * ne
+                ));
+            }
+            previous_end = end;
+        }
+        if plan.decode_base < 0 {
+            return Err(anyhow!(
+                "multimodal decode base must be non-negative, got {}",
+                plan.decode_base
+            ));
+        }
+        let mut all_positions = Vec::with_capacity(max_ctx * 4);
+        all_positions.extend_from_slice(&plan.prompt_pos4);
+        for token in prompt.len()..max_ctx {
+            let delta = i32::try_from(token - prompt.len())
+                .map_err(|_| anyhow!("multimodal context exceeds i32 position range"))?;
+            let pos = plan
+                .decode_base
+                .checked_add(delta)
+                .ok_or_else(|| anyhow!("multimodal decode position overflow"))?;
+            all_positions.extend_from_slice(&[pos, pos, pos, 0]);
+        }
+        let _gp = req.and_then(|r| r.gate_pass());
+        let buffer = be
+            .alloc_uninit(all_positions.len() * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("allocate multimodal QSA position table: {e}"))?;
+        be.upload(buffer.as_ref(), bytemuck::cast_slice(&all_positions))
+            .map_err(|e| anyhow!("upload multimodal QSA position table: {e}"))?;
+        Some(buffer)
+    } else {
+        None
+    };
     // Phase-2 DiffusionGemma denoise: capture the prompt length BEFORE the ordinary prefix-diff
     // logic below runs (a denoise call's `prompt`/`max_new` are empty/0 — see `DenoiseReq`'s
     // caller — so `start`/`cached` are left untouched: the `if denoise_req.is_some()` guard just
@@ -2112,6 +2194,8 @@ pub(crate) fn generate_dense_backend(
             g.input(f32d(batch * ne))
         };
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
+        let positions4 = mm.map(|_| g.input(TensorDesc::new(vec![batch, 4], DType::I32)));
+        let mrope_history = mm.map(|_| g.input(TensorDesc::new(vec![max_ctx, 4], DType::I32)));
         let qwen_wide = c.qwen4exp.then(|| g.input(f32d(batch * c.hc_mult * ne)));
         let span_has_ple = c.qwen4exp && (l_first..l_end).any(|l| c.is_ple_layer(l));
         let ple_embd = span_has_ple.then(|| {
@@ -4738,20 +4822,37 @@ pub(crate) fn generate_dense_backend(
                     // K: fused QkNorm+RoPE (qwen3/gemma) → f16 `k16`, else RoPE alone (llama) in-place f32.
                     let k_write = match aw.k_norm {
                         Some(kn) => {
-                            g.push(Op::QkNormRope {
-                                x: k,
-                                weight: kn,
-                                positions,
-                                dst: k16,
-                                rows: batch as u32,
-                                n_head: nkv as u32,
-                                head_dim: hd as u32,
-                                rope_dim: rope_dim as u32,
-                                theta,
-                                eps,
-                                freq_factors: layer_ff,
-                                x_stride: 0,
-                            });
+                            if let Some(pos4) = positions4 {
+                                g.push(Op::QkNormMrope {
+                                    x: k,
+                                    weight: kn,
+                                    positions4: pos4,
+                                    dst: k16,
+                                    rows: batch as u32,
+                                    n_head: nkv as u32,
+                                    head_dim: hd as u32,
+                                    rope_dim: rope_dim as u32,
+                                    theta,
+                                    eps,
+                                    sections: c.rope_sections,
+                                    x_stride: 0,
+                                });
+                            } else {
+                                g.push(Op::QkNormRope {
+                                    x: k,
+                                    weight: kn,
+                                    positions,
+                                    dst: k16,
+                                    rows: batch as u32,
+                                    n_head: nkv as u32,
+                                    head_dim: hd as u32,
+                                    rope_dim: rope_dim as u32,
+                                    theta,
+                                    eps,
+                                    freq_factors: layer_ff,
+                                    x_stride: 0,
+                                });
+                            }
                             k16
                         }
                         None if nope => {
@@ -4830,20 +4931,37 @@ pub(crate) fn generate_dense_backend(
                         } else {
                             (q, 0)
                         };
-                        g.push(Op::QkNormRope {
-                            x: q_src,
-                            weight: qn,
-                            positions,
-                            dst: q16,
-                            rows: batch as u32,
-                            n_head: nh as u32,
-                            head_dim: hd as u32,
-                            rope_dim: rope_dim as u32,
-                            theta,
-                            eps,
-                            freq_factors: layer_ff,
-                            x_stride: q_stride,
-                        });
+                        if let Some(pos4) = positions4 {
+                            g.push(Op::QkNormMrope {
+                                x: q_src,
+                                weight: qn,
+                                positions4: pos4,
+                                dst: q16,
+                                rows: batch as u32,
+                                n_head: nh as u32,
+                                head_dim: hd as u32,
+                                rope_dim: rope_dim as u32,
+                                theta,
+                                eps,
+                                sections: c.rope_sections,
+                                x_stride: q_stride,
+                            });
+                        } else {
+                            g.push(Op::QkNormRope {
+                                x: q_src,
+                                weight: qn,
+                                positions,
+                                dst: q16,
+                                rows: batch as u32,
+                                n_head: nh as u32,
+                                head_dim: hd as u32,
+                                rope_dim: rope_dim as u32,
+                                theta,
+                                eps,
+                                freq_factors: layer_ff,
+                                x_stride: q_stride,
+                            });
+                        }
                         q16
                     }
                     None if nope => {
@@ -4924,20 +5042,37 @@ pub(crate) fn generate_dense_backend(
                         out_f: (c.indexer_n_head * c.indexer_head_size) as u32,
                         w_off: 0,
                     });
-                    g.push(Op::QkNormRope {
-                        x: qsa_q,
-                        weight: qw.q_norm,
-                        positions,
-                        dst: qsa_q16,
-                        rows: batch as u32,
-                        n_head: c.indexer_n_head as u32,
-                        head_dim: c.indexer_head_size as u32,
-                        rope_dim: c.rope_dim as u32,
-                        theta,
-                        eps,
-                        freq_factors: layer_ff,
-                        x_stride: 0,
-                    });
+                    if let Some(pos4) = positions4 {
+                        g.push(Op::QkNormMrope {
+                            x: qsa_q,
+                            weight: qw.q_norm,
+                            positions4: pos4,
+                            dst: qsa_q16,
+                            rows: batch as u32,
+                            n_head: c.indexer_n_head as u32,
+                            head_dim: c.indexer_head_size as u32,
+                            rope_dim: c.rope_dim as u32,
+                            theta,
+                            eps,
+                            sections: c.rope_sections,
+                            x_stride: 0,
+                        });
+                    } else {
+                        g.push(Op::QkNormRope {
+                            x: qsa_q,
+                            weight: qw.q_norm,
+                            positions,
+                            dst: qsa_q16,
+                            rows: batch as u32,
+                            n_head: c.indexer_n_head as u32,
+                            head_dim: c.indexer_head_size as u32,
+                            rope_dim: c.rope_dim as u32,
+                            theta,
+                            eps,
+                            freq_factors: layer_ff,
+                            x_stride: 0,
+                        });
+                    }
                     Some((qsa_q16, cache, block_cache, qw.k_norm))
                 } else {
                     None
@@ -4957,6 +5092,7 @@ pub(crate) fn generate_dense_backend(
                         k_cache: ix_k,
                         block_cache: ix_blocks,
                         k_norm: ix_norm,
+                        positions4: mrope_history,
                         dst: qsa_indices,
                         rows: batch as u32,
                         kv_len: visible as u32,
@@ -4973,6 +5109,7 @@ pub(crate) fn generate_dense_backend(
                         theta,
                         eps,
                         scale: 1.0 / (c.indexer_head_size as f32).sqrt(),
+                        sections: c.rope_sections,
                     });
                     g.push(Op::QsaBatchAttention {
                         q: q_attn,
@@ -5003,6 +5140,7 @@ pub(crate) fn generate_dense_backend(
                                 k_cache: ix_k,
                                 block_cache: ix_blocks,
                                 k_norm: ix_norm,
+                                positions4: mrope_history,
                                 dst: qsa_indices,
                                 rows: 1,
                                 kv_len: visible as u32,
@@ -5019,6 +5157,7 @@ pub(crate) fn generate_dense_backend(
                                 theta,
                                 eps,
                                 scale: 1.0 / (c.indexer_head_size as f32).sqrt(),
+                                sections: c.rope_sections,
                             });
                             g.push(Op::QsaGather {
                                 k_cache: k_cache[kv_src],
@@ -5864,6 +6003,8 @@ pub(crate) fn generate_dense_backend(
             DecodeHandles {
                 hidden,
                 positions,
+                positions4,
+                mrope_history,
                 rope_freqs,
                 yarn_ff,
                 pl_tok_in: if pl_gathered { None } else { pl_tok_in },
@@ -6163,6 +6304,7 @@ pub(crate) fn generate_dense_backend(
             &vbufs[..],
             &qsa_kbufs[..],
             &qsa_cbufs[..],
+            &mrope_history_buf,
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -6419,6 +6561,7 @@ pub(crate) fn generate_dense_backend(
             &vbufs[..],
             &qsa_kbufs[..],
             &qsa_cbufs[..],
+            &mrope_history_buf,
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -6496,7 +6639,7 @@ pub(crate) fn generate_dense_backend(
     // step does (see `StepGate`: the command pool is externally synchronised, and the backend hands
     // its handle out from under the mutex). Scoped so the baton is released before the prefill loop
     // below, which takes its own per-chunk turn.
-    let (tok_id_buf, dec_ids_buf, u_buf) = {
+    let (tok_id_buf, dec_ids_buf, u_buf, pos4_buf) = {
         let _gp = req.and_then(|r| r.gate_pass());
         let tok_id_buf = be
             .alloc(4, BufferUsage::Readback)
@@ -6514,7 +6657,11 @@ pub(crate) fn generate_dense_backend(
         let u_buf = be
             .alloc(64 * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
-        (tok_id_buf, dec_ids_buf, u_buf)
+        let pos4_buf = mm
+            .map(|_| be.alloc_uninit(4 * 4, BufferUsage::Staging))
+            .transpose()
+            .map_err(|e| anyhow!("{e}"))?;
+        (tok_id_buf, dec_ids_buf, u_buf, pos4_buf)
     };
     // Host-side mirror of `u_buf`'s 64 slots. `Backend::upload` has no partial-buffer/offset
     // form, so setting one slot re-uploads the whole 256 bytes from this mirror — negligible cost.
@@ -6724,9 +6871,11 @@ pub(crate) fn generate_dense_backend(
             m: usize,
             /// Token ids (gpu_embed) or the host-embedded f32 rows.
             input: Box<dyn Buffer>,
+            gpu_embed: bool,
             /// The residual stream, when `input` holds ids and cannot serve as one.
             resid: Option<Box<dyn Buffer>>,
             pos: Box<dyn Buffer>,
+            pos4: Option<Box<dyn Buffer>>,
             /// gemma4-E2B per-layer token rows.
             ipl: Option<Box<dyn Buffer>>,
             /// Qwen3.8 caller-owned four-stream residual for this batch.
@@ -6816,11 +6965,17 @@ pub(crate) fn generate_dense_backend(
                         };
                         ensure_kv_depth!(cend);
                         let pf_m = cend - cstart;
+                        let chunk_has_image = mm.is_some_and(|plan| {
+                            plan.spans.iter().any(|span| {
+                                span.start < cend && span.start + span.n_tokens > cstart
+                            })
+                        });
+                        let gpu_embed_chunk = gpu_embed && !chunk_has_image;
                         if live[ci].is_none() {
                             // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
                             // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
                             // the old f32 rows upload (4*n_embd*pf_m bytes).
-                            let input = if gpu_embed {
+                            let input = if gpu_embed_chunk {
                                 let ids: Vec<i32> =
                                     prompt[cstart..cend].iter().map(|&t| t as i32).collect();
                                 let b = be
@@ -6840,6 +6995,22 @@ pub(crate) fn generate_dense_backend(
                                             .map(|&x| x * embed_scale),
                                     );
                                 }
+                                if let Some(plan) = mm {
+                                    for span in &plan.spans {
+                                        let lo = span.start.max(cstart);
+                                        let hi = (span.start + span.n_tokens).min(cend);
+                                        for token in lo..hi {
+                                            let dst = (token - cstart) * ne;
+                                            let src = (token - span.start) * ne;
+                                            for (out, &value) in pf_hidden[dst..dst + ne]
+                                                .iter_mut()
+                                                .zip(&span.embeds[src..src + ne])
+                                            {
+                                                *out = value * embed_scale;
+                                            }
+                                        }
+                                    }
+                                }
                                 let b = be
                                     .alloc(pf_m * ne * 4, BufferUsage::Staging)
                                     .map_err(|e| anyhow!("{e}"))?;
@@ -6855,7 +7026,7 @@ pub(crate) fn generate_dense_backend(
                             // binds — the interpreters' write-back is a length-checked `copy_from_slice`
                             // against the declared numel, and the host-embed path has always bound this
                             // shape, so nothing writes past it.
-                            let resid = if gpu_embed {
+                            let resid = if gpu_embed_chunk {
                                 Some(
                                     be.alloc(pf_m * ne * 4, BufferUsage::Activations)
                                         .map_err(|e| anyhow!("{e}"))?,
@@ -6870,6 +7041,19 @@ pub(crate) fn generate_dense_backend(
                                 .map_err(|e| anyhow!("{e}"))?;
                             be.upload(pos.as_ref(), bytemuck::cast_slice(&pf_positions))
                                 .map_err(|e| anyhow!("{e}"))?;
+                            let pos4 = if let Some(plan) = mm {
+                                let b = be
+                                    .alloc_uninit(pf_m * 4 * 4, BufferUsage::Staging)
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                be.upload(
+                                    b.as_ref(),
+                                    bytemuck::cast_slice(&plan.prompt_pos4[cstart * 4..cend * 4]),
+                                )
+                                .map_err(|e| anyhow!("{e}"))?;
+                                Some(b)
+                            } else {
+                                None
+                            };
                             // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
                             // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
                             // prologue).
@@ -6916,8 +7100,10 @@ pub(crate) fn generate_dense_backend(
                             live[ci] = Some(PfChunk {
                                 m: pf_m,
                                 input,
+                                gpu_embed: gpu_embed_chunk,
                                 resid,
                                 pos,
+                                pos4,
                                 ipl,
                                 qwen_wide,
                                 ple_embd,
@@ -6956,7 +7142,7 @@ pub(crate) fn generate_dense_backend(
                             false,
                             // The token-id input + in-graph gather belong to the span that STARTS the
                             // stack; a later span reads the residual stream that one left behind.
-                            gpu_embed && span.start == 0,
+                            ch.gpu_embed && span.start == 0,
                             false, // mtp_verify: ordinary chunked prefill, not MTP verify
                             Some(span.clone()),
                         );
@@ -6972,6 +7158,9 @@ pub(crate) fn generate_dense_backend(
                             ch.resid.as_deref().unwrap_or(ch.input.as_ref()),
                         );
                         pf_b.bind(pf_h.positions, ch.pos.as_ref());
+                        if let (Some(id), Some(buf)) = (pf_h.positions4, &ch.pos4) {
+                            pf_b.bind(id, buf.as_ref());
+                        }
                         if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &ch.ipl) {
                             pf_b.bind(pid, ib.as_ref());
                         }
@@ -6988,6 +7177,7 @@ pub(crate) fn generate_dense_backend(
                             &vbufs[..],
                             &qsa_kbufs[..],
                             &qsa_cbufs[..],
+                            &mrope_history_buf,
                             &wbufs[..],
                             if c.qwen4exp {
                                 &ch.qwen_wide
@@ -7167,6 +7357,7 @@ pub(crate) fn generate_dense_backend(
             &vbufs[..],
             &qsa_kbufs[..],
             &qsa_cbufs[..],
+            &mrope_history_buf,
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -7335,19 +7526,30 @@ pub(crate) fn generate_dense_backend(
         }
         let step_t0 = std::time::Instant::now();
         let tok = cur[pos] as usize;
+        let image_row = mm.and_then(|plan| {
+            plan.spans.iter().find_map(|span| {
+                (pos >= span.start && pos < span.start + span.n_tokens)
+                    .then_some((&span.embeds, (pos - span.start) * ne))
+            })
+        });
+        let gpu_embed_tok = gpu_embed && image_row.is_none();
         // The 4-byte token id, uploaded whenever the graph declared the ids Input: for the embed
         // gather (`gpu_embed`), and for a deepseek4 hash-routed layer's `ffn_gate_tid2eid`
         // selection gather (`hash_ids`), which needs it independently of how the embedding was
         // produced. Not a round trip — this is the id the host already fed this step.
-        if gpu_embed || hash_ids {
+        if gpu_embed_tok || hash_ids {
             be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[tok as i32]))
                 .map_err(|e| anyhow!("{e}"))?;
         }
-        if !gpu_embed {
+        if !gpu_embed_tok {
             // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
             // table slice is already the row to upload — hand it straight to the backend rather
             // than allocating a throwaway `Vec<f32>` per token to copy it.
-            let row = &token_embd.get()?[tok * ne..tok * ne + ne];
+            let table = token_embd.get()?;
+            let row = match image_row {
+                Some((embeds, offset)) => &embeds[offset..offset + ne],
+                None => &table[tok * ne..tok * ne + ne],
+            };
             if embed_scale == 1.0 {
                 be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
                     .map_err(|e| anyhow!("{e}"))?;
@@ -7359,6 +7561,23 @@ pub(crate) fn generate_dense_backend(
         }
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;
+        if let (Some(plan), Some(buffer)) = (mm, &pos4_buf) {
+            let row: [i32; 4] = if pos < prompt.len() {
+                plan.prompt_pos4[pos * 4..pos * 4 + 4]
+                    .try_into()
+                    .expect("validated multimodal prompt position row")
+            } else {
+                let delta = i32::try_from(pos - prompt.len())
+                    .map_err(|_| anyhow!("multimodal decode position exceeds i32"))?;
+                let value = plan
+                    .decode_base
+                    .checked_add(delta)
+                    .ok_or_else(|| anyhow!("multimodal decode position overflow"))?;
+                [value, value, value, 0]
+            };
+            be.upload(buffer.as_ref(), bytemuck::cast_slice(&row))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
 
         // gemma4 E2B host ipl path: this token's per-layer TOKEN embedding row (gather+dequant
         // only). `ipl_buf` is None under `gpu_ple` — the graph gathers on-device.
@@ -7428,7 +7647,7 @@ pub(crate) fn generate_dense_backend(
                 false,
                 false,
                 false,
-                gpu_embed,
+                gpu_embed_tok,
                 false,
                 Some(0..1),
             );
@@ -7440,6 +7659,9 @@ pub(crate) fn generate_dense_backend(
             // A partial span exposes hidden as an Input even when EmbedGather writes it.
             b0.bind(h0.hidden, hidden_buf.as_ref());
             b0.bind(h0.positions, pos_buf.as_ref());
+            if let (Some(id), Some(buf)) = (h0.positions4, &pos4_buf) {
+                b0.bind(id, buf.as_ref());
+            }
             bind_layer_io(
                 &mut b0,
                 &h0,
@@ -7450,6 +7672,7 @@ pub(crate) fn generate_dense_backend(
                 &vbufs[..],
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
+                &mrope_history_buf,
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7494,6 +7717,9 @@ pub(crate) fn generate_dense_backend(
             let mut b1 = Bindings::new();
             b1.bind(h1.hidden, hidden_buf.as_ref());
             b1.bind(h1.positions, pos_buf.as_ref());
+            if let (Some(id), Some(buf)) = (h1.positions4, &pos4_buf) {
+                b1.bind(id, buf.as_ref());
+            }
             bind_layer_io(
                 &mut b1,
                 &h1,
@@ -7504,6 +7730,7 @@ pub(crate) fn generate_dense_backend(
                 &vbufs[..],
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
+                &mrope_history_buf,
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7557,6 +7784,7 @@ pub(crate) fn generate_dense_backend(
                 &vbufs[..],
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
+                &mrope_history_buf,
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,

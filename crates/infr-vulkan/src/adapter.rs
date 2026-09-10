@@ -2884,6 +2884,7 @@ fn lower_op(
             k_cache,
             block_cache,
             k_norm,
+            positions4,
             dst,
             rows,
             kv_len,
@@ -2896,6 +2897,7 @@ fn lower_op(
             theta,
             eps,
             scale,
+            sections,
         } => {
             let blocks = *kv_len / *ratio.max(&1);
             let first_visible = kv_len.saturating_sub(*rows).saturating_add(1);
@@ -2911,6 +2913,10 @@ fn lower_op(
                 || *top_blocks == 0
                 || *top_blocks > first_blocks
                 || *top_blocks > QSA_MAX_TOP_BLOCKS
+                || positions4.is_some_and(|id| {
+                    graph.desc(id).dtype != infr_core::DType::I32
+                        || sections.iter().sum::<u32>() == 0
+                })
             {
                 return Err(be(format!(
                     "vulkan Op::QsaIndexer requires head_dim=128, 1..=4 heads, even rope_dim, \
@@ -2971,6 +2977,10 @@ fn lower_op(
                 *eps,
                 *scale,
                 segment_shifts,
+                positions4
+                    .map(|id| r(id))
+                    .transpose()?
+                    .map(|buffer| (buffer, *sections)),
             );
         }
         Op::QsaGather {

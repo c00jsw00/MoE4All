@@ -42,6 +42,101 @@ use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Result};
 use std::sync::{Arc, Condvar, Mutex};
 
+/// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
+/// depend on the optional vision crate.
+pub struct MultimodalEmbedding {
+    pub values: Vec<f32>,
+    pub grid_nx: usize,
+    pub grid_ny: usize,
+}
+
+fn expand_multimodal_prompt(
+    tokens: &[u32],
+    image_pad_id: u32,
+    images: Vec<MultimodalEmbedding>,
+    n_embd: usize,
+) -> Result<(Vec<u32>, crate::seam::MropePlan)> {
+    let mut expanded = Vec::new();
+    let mut positions4 = Vec::new();
+    let mut spans = Vec::with_capacity(images.len());
+    let mut images = images.into_iter();
+    let mut used = 0usize;
+    let mut cursor = 0i32;
+
+    for &token in tokens {
+        if token != image_pad_id {
+            expanded.push(token);
+            positions4.extend_from_slice(&[cursor, cursor, cursor, 0]);
+            cursor = cursor
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("multimodal position overflow"))?;
+            continue;
+        }
+
+        let image = images.next().ok_or_else(|| {
+            anyhow!("rendered prompt contains more <|image_pad|> markers than image payloads")
+        })?;
+        used += 1;
+        let n_tokens = image
+            .grid_nx
+            .checked_mul(image.grid_ny)
+            .ok_or_else(|| anyhow!("image #{used} token grid overflows"))?;
+        let expected_values = n_tokens
+            .checked_mul(n_embd)
+            .ok_or_else(|| anyhow!("image #{used} embedding size overflows"))?;
+        if n_tokens == 0 || image.values.len() != expected_values {
+            return Err(anyhow!(
+                "image #{used} projector output has {} values for a {}x{} grid; expected {}",
+                image.values.len(),
+                image.grid_nx,
+                image.grid_ny,
+                expected_values
+            ));
+        }
+        let start = expanded.len();
+        for index in 0..n_tokens {
+            let y = i32::try_from(index / image.grid_nx)
+                .map_err(|_| anyhow!("image #{used} row exceeds i32"))?;
+            let x = i32::try_from(index % image.grid_nx)
+                .map_err(|_| anyhow!("image #{used} column exceeds i32"))?;
+            expanded.push(image_pad_id);
+            positions4.extend_from_slice(&[
+                cursor,
+                cursor
+                    .checked_add(y)
+                    .ok_or_else(|| anyhow!("image #{used} row position overflow"))?,
+                cursor
+                    .checked_add(x)
+                    .ok_or_else(|| anyhow!("image #{used} column position overflow"))?,
+                0,
+            ]);
+        }
+        let extent = i32::try_from(image.grid_nx.max(image.grid_ny))
+            .map_err(|_| anyhow!("image #{used} grid exceeds i32"))?;
+        cursor = cursor
+            .checked_add(extent)
+            .ok_or_else(|| anyhow!("image #{used} position overflow"))?;
+        spans.push(crate::seam::ImageSpanEmbeds {
+            start,
+            n_tokens,
+            embeds: Arc::new(image.values),
+        });
+    }
+    if images.next().is_some() {
+        return Err(anyhow!(
+            "request carries more image payloads than rendered <|image_pad|> markers"
+        ));
+    }
+    Ok((
+        expanded,
+        crate::seam::MropePlan {
+            prompt_pos4: positions4,
+            spans,
+            decode_base: cursor,
+        },
+    ))
+}
+
 /// Pure continuation-slot selection (the "this conversation continuing" case of [`checkout`], and
 /// the twin of `seam::model::SlotPool::pick`'s first arm). Given `(slot_idx, prefix_score,
 /// cached_len)` for each candidate free slot and the `prompt_len`, pick the qualifying slot with
@@ -252,6 +347,7 @@ impl ParallelSeam {
                 Some(crate::seam::TurnCheckpoint::Enable),
                 None, // constraint
                 None, // req: startup, not a request — env sampling, no gate
+                None, // multimodal plan
             )
         })?;
         let mut slot0 = slot0.ok_or_else(|| anyhow!("warmup did not initialize a KV slot"))?;
@@ -438,6 +534,31 @@ impl ParallelSeam {
         }
     }
 
+    /// Take an LRU free slot without prefix seeding. Image payload identity is not represented by
+    /// the repeated image-pad token ids, so token-prefix reuse would be unsound until slots carry
+    /// an image fingerprint.
+    fn checkout_fresh(&self) -> SlotGuard<'_> {
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            if let Some(target) = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .min_by_key(|&index| pool.slots[index].tick)
+            {
+                pool.tick += 1;
+                let tick = pool.tick;
+                pool.slots[target].busy = true;
+                pool.slots[target].tick = tick;
+                let kv = pool.slots[target].kv.take();
+                return SlotGuard {
+                    engine: self,
+                    idx: target,
+                    kv,
+                };
+            }
+            pool = self.freed.wait(pool).expect("pool poisoned");
+        }
+    }
+
     /// Render an OpenAI conversation through the model's own chat template.
     pub fn render_chat_messages(&self, messages: &[(&str, &str)]) -> Result<String> {
         self.model.render_chat_messages(messages)
@@ -503,14 +624,102 @@ impl ParallelSeam {
             turn_checkpoint,
             constraint,
             Some(req),
+            None, // multimodal plan
         )?;
+        Ok(stats)
+    }
+
+    /// Generate one Qwen3.8 vision turn. Projector execution is completed by the caller before
+    /// entering here, so its request-scoped weights have already returned to the unified arena.
+    pub fn generate_multimodal_turn(
+        &self,
+        prompt: &str,
+        images: Vec<MultimodalEmbedding>,
+        max_new: usize,
+        req: &RequestCtx,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<GenStats> {
+        if !self.model.config().qwen4exp {
+            return Err(anyhow!(
+                "vision text integration currently supports qwen4exp models only"
+            ));
+        }
+        if images.is_empty() {
+            return self.generate_turn(prompt, None, max_new, None, req, on_piece);
+        }
+        let image_pad_id = self
+            .model
+            .tokenizer()
+            .token_to_id("<|image_pad|>")
+            .ok_or_else(|| anyhow!("model tokenizer has no <|image_pad|> token"))?;
+        let base_tokens = self.model.encode(prompt)?;
+        let image_count = images.len();
+        let (prompt_tokens, plan) = expand_multimodal_prompt(
+            &base_tokens,
+            image_pad_id,
+            images,
+            self.model.config().n_embd,
+        )?;
+        if prompt_tokens.len().saturating_add(1) > self.max_ctx {
+            return Err(anyhow!(
+                "multimodal prompt expands to {} tokens, exceeding this slot's {}-token context",
+                prompt_tokens.len(),
+                self.max_ctx
+            ));
+        }
+        let mut guard = self.checkout_fresh();
+        if let Some(kv) = guard.kv.as_mut() {
+            kv.reset();
+        }
+        let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let mut acc = Vec::new();
+        let mut printed = 0usize;
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
+        tracing::info!(
+            images = image_count,
+            base_tokens = base_tokens.len(),
+            expanded_tokens = prompt_tokens.len(),
+            decode_base = plan.decode_base,
+            "multimodal prompt prepared"
+        );
+        let result = crate::seam::generate_dense_vulkan_session(
+            &self.vk,
+            self.model.gguf(),
+            self.model.config(),
+            self.model.engine_cfg(),
+            self.model.embd(),
+            self.model.per_layer_embd(),
+            &prompt_tokens,
+            max_new,
+            |id| {
+                crate::stream_token(
+                    self.model.tokenizer(),
+                    &mut acc,
+                    &mut printed,
+                    id,
+                    &mut on_piece,
+                )
+            },
+            &mut guard.kv,
+            self.max_ctx,
+            None,
+            None,
+            Some(req),
+            Some(&plan),
+        );
+        // Do not expose image-backed KV to ordinary token-only prefix matching. A later revision
+        // can retain it once slot keys include deterministic image fingerprints.
+        if let Some(kv) = guard.kv.as_mut() {
+            kv.reset();
+        }
+        let (_, stats) = result?;
         Ok(stats)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pick_continuation;
+    use super::{expand_multimodal_prompt, pick_continuation, MultimodalEmbedding};
 
     #[test]
     fn continuation_picks_longest_prefix_not_first() {
@@ -539,5 +748,43 @@ mod tests {
         assert_eq!(pick_continuation(candidates, 100), None);
         // Empty candidate set.
         assert_eq!(pick_continuation(std::iter::empty(), 100), None);
+    }
+
+    #[test]
+    fn multimodal_expansion_preserves_order_and_grid_positions() {
+        let images = vec![
+            MultimodalEmbedding {
+                values: vec![1.0; 2 * 2 * 3],
+                grid_nx: 2,
+                grid_ny: 2,
+            },
+            MultimodalEmbedding {
+                values: vec![2.0; 3 * 3],
+                grid_nx: 3,
+                grid_ny: 1,
+            },
+        ];
+        let (tokens, plan) = expand_multimodal_prompt(&[10, 99, 11, 99, 12], 99, images, 3)
+            .expect("valid synthetic multimodal prompt");
+        assert_eq!(tokens, [10, 99, 99, 99, 99, 11, 99, 99, 99, 12]);
+        assert_eq!(plan.spans[0].start, 1);
+        assert_eq!(plan.spans[0].n_tokens, 4);
+        assert_eq!(plan.spans[1].start, 6);
+        assert_eq!(plan.spans[1].n_tokens, 3);
+        assert_eq!(
+            &plan.prompt_pos4[4..20],
+            &[1, 1, 1, 0, 1, 1, 2, 0, 1, 2, 1, 0, 1, 2, 2, 0]
+        );
+        assert_eq!(plan.decode_base, 8);
+    }
+
+    #[test]
+    fn multimodal_expansion_rejects_marker_count_mismatch() {
+        let image = MultimodalEmbedding {
+            values: vec![0.0; 4],
+            grid_nx: 1,
+            grid_ny: 1,
+        };
+        assert!(expand_multimodal_prompt(&[1, 2], 99, vec![image], 4).is_err());
     }
 }

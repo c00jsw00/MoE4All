@@ -3351,6 +3351,11 @@ qsa_spv!(qsa_indexer_topk_hist_spv, "qsa_indexer_topk_hist");
 qsa_spv!(qsa_indexer_topk_select_spv, "qsa_indexer_topk_select");
 qsa_spv!(qsa_indexer_topk_collect_spv, "qsa_indexer_topk_collect");
 qsa_spv!(qsa_indexer_compress_seg_spv, "qsa_indexer_compress_seg");
+qsa_spv!(qsa_indexer_compress_mrope_spv, "qsa_indexer_compress_mrope");
+qsa_spv!(
+    qsa_indexer_compress_mrope_seg_spv,
+    "qsa_indexer_compress_mrope_seg"
+);
 qsa_spv!(qsa_indexer_score_seg_spv, "qsa_indexer_score_seg");
 qsa_spv!(
     qsa_indexer_score_decode8_seg_spv,

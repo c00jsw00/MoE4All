@@ -722,8 +722,18 @@ fn main() {
         ("qsa_indexer_compress", "qsa_indexer_compress", &[]),
         (
             "qsa_indexer_compress",
+            "qsa_indexer_compress_mrope",
+            &["-DQSA_MROPE"],
+        ),
+        (
+            "qsa_indexer_compress",
             "qsa_indexer_compress_seg",
             &["-DKV_SEGMENTED"],
+        ),
+        (
+            "qsa_indexer_compress",
+            "qsa_indexer_compress_mrope_seg",
+            &["-DQSA_MROPE", "-DKV_SEGMENTED"],
         ),
         ("qsa_indexer_score", "qsa_indexer_score", &[]),
         (

@@ -553,6 +553,7 @@ pub(crate) fn generate_dense_cpu_mode(
         None, // turn checkpoint boundary
         req,
         None, // deferred fixed-allocation hook
+        None, // multimodal plan
     );
     if let Some(store) = store.filter(|_| ec.paging.stats) {
         report_host_paging(&store);
@@ -614,6 +615,7 @@ pub(crate) fn generate_dense_vulkan(
         None, // turn checkpoint boundary
         None, // constraint
         None, // req: the one-shot runner is a sole sequence — config sampling, no gate
+        None, // multimodal plan
     )
 }
 
@@ -627,6 +629,25 @@ pub(crate) enum TurnCheckpoint {
     Enable,
     /// Allocate if needed and capture state after this many prompt tokens.
     Boundary(usize),
+}
+
+/// One expanded image span consumed by the text-model prefill. Its rows replace the ordinary
+/// token-embedding rows for the corresponding `<|image_pad|>` run.
+pub struct ImageSpanEmbeds {
+    pub start: usize,
+    pub n_tokens: usize,
+    /// Row-major `[n_tokens, n_embd]` projector output.
+    pub embeds: std::sync::Arc<Vec<f32>>,
+}
+
+/// Qwen multimodal RoPE data for one request. Text-only callers pass `None` and retain the
+/// original graph and cache behavior.
+pub struct MropePlan {
+    /// Row-major `(T, H, W, E)` positions for every expanded prompt token.
+    pub prompt_pos4: Vec<i32>,
+    pub spans: Vec<ImageSpanEmbeds>,
+    /// Position used by the first generated token; later generated tokens advance linearly.
+    pub decode_base: i32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -646,6 +667,7 @@ pub(crate) fn generate_dense_vulkan_session(
     turn_checkpoint: Option<TurnCheckpoint>,
     constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
+    mm: Option<&MropePlan>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
@@ -692,6 +714,7 @@ pub(crate) fn generate_dense_vulkan_session(
         turn_checkpoint,
         req,
         finish_fixed_allocations.as_deref(),
+        mm,
     );
     if out.is_err() {
         // A failed forward may already have committed several prefill chunks to KV/QSA and
@@ -4399,6 +4422,7 @@ fn run_dense_oneshot(
         None, // turn checkpoint boundary
         None, // req
         None, // deferred fixed-allocation hook
+        None, // multimodal plan
     )
 }
 
@@ -5062,6 +5086,7 @@ pub(crate) fn verify_dense_cpu(
         None,
         None,
         None,
+        None,
     )?;
     Ok(logits)
 }
@@ -5101,6 +5126,7 @@ pub(crate) fn verify_dense_cpu_with_h(
         None,
         Some(&mut logits),
         Some(&mut h),
+        None,
         None,
         None,
         None,
@@ -5150,6 +5176,7 @@ pub(crate) fn verify_rows_cpu_with_h(
         None,
         None,
         None,
+        None,
     )?;
     Ok((logits, h))
 }
@@ -5194,6 +5221,7 @@ pub(crate) fn verify_dense_vulkan(
         None,
         None,
         Some(&mut logits),
+        None,
         None,
         None,
         None,

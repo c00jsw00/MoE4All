@@ -2291,6 +2291,7 @@ impl Backend for CpuBackend {
                     k_cache,
                     block_cache,
                     k_norm,
+                    positions4,
                     dst,
                     rows,
                     kv_len,
@@ -2303,6 +2304,7 @@ impl Backend for CpuBackend {
                     theta,
                     eps,
                     scale,
+                    sections,
                 } => {
                     let (rows, kv_len, nh, hd, top_blocks, ratio, rope_dim) = (
                         rows as usize,
@@ -2316,6 +2318,21 @@ impl Backend for CpuBackend {
                     let max_blocks = kv_len / ratio;
                     let q = &vals[q.0 as usize];
                     let norm = &vals[k_norm.0 as usize];
+                    let mrope_positions = positions4.map(|id| &vals[id.0 as usize]);
+                    let section_widths = sections.map(|v| v as usize);
+                    let section_total: usize = section_widths.iter().sum();
+                    let plane_for = |pair: usize| {
+                        let sector = pair % section_total;
+                        if sector % 3 == 1 && sector < 3 * section_widths[1] {
+                            1
+                        } else if sector % 3 == 2 && sector < 3 * section_widths[2] {
+                            2
+                        } else if sector % 3 == 0 && sector < 3 * section_widths[0] {
+                            0
+                        } else {
+                            3
+                        }
+                    };
                     let cache = cpu_buf(
                         bindings
                             .get(k_cache)
@@ -2350,15 +2367,22 @@ impl Backend for CpuBackend {
                             for d in 0..hd {
                                 key[d] *= inv * norm[d];
                             }
-                            let pos = (block * ratio) as f32;
                             for pair in 0..rope_dim / 2 {
-                                let d = pair * 2;
+                                let d = pair;
+                                let mate = pair + rope_dim / 2;
+                                let pos = match mrope_positions {
+                                    Some(pos4) => {
+                                        assert!(section_total > 0);
+                                        pos4[(block * ratio) * 4 + plane_for(pair)]
+                                    }
+                                    None => (block * ratio) as f32,
+                                };
                                 let angle =
                                     pos * theta.powf(-((2 * pair) as f32) / rope_dim as f32);
                                 let (sin, cos) = angle.sin_cos();
-                                let (a, b) = (key[d], key[d + 1]);
+                                let (a, b) = (key[d], key[mate]);
                                 key[d] = a * cos - b * sin;
-                                key[d + 1] = a * sin + b * cos;
+                                key[mate] = a * sin + b * cos;
                             }
                             blocks_f32[block * hd..(block + 1) * hd].copy_from_slice(&key);
                         }
