@@ -6474,6 +6474,7 @@ impl DecodePrefetchScheduler {
         let Some(control) = self.active.take() else {
             return Ok(0);
         };
+        let profile_t0 = infr_core::pager_profile::start();
         let matched = control.target_layer == layer;
         let elapsed = control.started.elapsed();
         let overrun = !control.worker_done.load(Ordering::Acquire)
@@ -6481,7 +6482,11 @@ impl DecodePrefetchScheduler {
         if overrun && infr_core::pager_profile::active() {
             infr_core::pager_profile::record_decode_prefetch_overrun();
         }
-        let value = self.quiesce(&control, !matched)?;
+        let quiesce = self.quiesce(&control, !matched);
+        if let Some(elapsed) = infr_core::pager_profile::elapsed(profile_t0) {
+            infr_core::pager_profile::record_decode_prefetch_target_finish(elapsed);
+        }
+        let value = quiesce?;
         if !matched {
             tracing::debug!(
                 stale_target = control.target_layer,
@@ -6517,7 +6522,11 @@ impl DecodePrefetchScheduler {
         // The worker checks cancellation both before and after acquiring this same lock. Taking it
         // here is therefore a barrier: after it returns, no later candidate can mutate residency or
         // enqueue another transfer for this job.
+        let lock_t0 = infr_core::pager_profile::start();
         drop(self.pager.lock().unwrap());
+        if let Some(elapsed) = infr_core::pager_profile::elapsed(lock_t0) {
+            infr_core::pager_profile::record_decode_prefetch_quiesce_lock_wait(elapsed);
+        }
         let value = control.latest_transfer.load(Ordering::Acquire);
         let worker_error = control.error.lock().unwrap().clone().or_else(|| {
             self.thread
@@ -6723,9 +6732,10 @@ fn run_decode_prefetch_worker(
                     job.control
                         .transfer_inflight
                         .store(false, Ordering::Release);
-                    observe_ram_prefetch(moved, started.elapsed(), &ram_ns_per_mib);
+                    let elapsed = started.elapsed();
+                    observe_ram_prefetch(moved, elapsed, &ram_ns_per_mib);
                     if profile && moved != 0 {
-                        infr_core::pager_profile::record_decode_prefetch_ram(moved);
+                        infr_core::pager_profile::record_decode_prefetch_ram_timed(moved, elapsed);
                     }
                 }
             }
@@ -6835,7 +6845,8 @@ fn complete_decode_prefetch_handoffs(be_: &VulkanBackend) {
 /// retain shape-stable scratch within one decode/prefill phase; other plans allocate it per call.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
-    match execute_static_inner(be_, graph, bindings) {
+    let profile_t0 = infr_core::pager_profile::start();
+    let result = match execute_static_inner(be_, graph, bindings) {
         Ok(()) => Ok(()),
         Err(error) => match cancel_decode_prefetch(be_) {
             Ok(()) => Err(error),
@@ -6843,7 +6854,11 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 "{error} (decode expert prefetch teardown also failed: {cleanup})"
             ))),
         },
+    };
+    if let Some(elapsed) = infr_core::pager_profile::elapsed(profile_t0) {
+        infr_core::pager_profile::record_backend_execute(elapsed);
     }
+    result
 }
 
 fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
@@ -8758,8 +8773,15 @@ fn execute_paged_moe<'a>(
     let roles_batched = shared_batch;
     if roles_batched {
         let overlap = if let Some(probe) = promotion_probe {
-            let profile = infr_core::pager_profile::active();
-            Some((probe, profile && prefetch_compute_live(ps, probe)?))
+            if infr_core::pager_profile::active() {
+                Some((
+                    probe,
+                    prefetch_compute_live(ps, probe)?,
+                    std::time::Instant::now(),
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -8778,14 +8800,35 @@ fn execute_paged_moe<'a>(
                     touch_all,
                 )?
         };
+        let bytes = push.bytes();
+        let prepared_profile = if let Some((probe, compute_live_at_start, started)) = overlap {
+            Some((
+                probe,
+                compute_live_at_start,
+                prefetch_compute_live(ps, probe)?,
+                started.elapsed(),
+                std::time::Instant::now(),
+            ))
+        } else {
+            None
+        };
         push.record(rec.as_ref().expect("segment always Some between ops"))?;
-        if let Some((probe, compute_live_at_start)) = overlap {
-            if infr_core::pager_profile::active() {
-                infr_core::pager_profile::record_prefetch_window(
-                    compute_live_at_start,
-                    prefetch_compute_live(ps, probe)?,
-                );
-            }
+        if let Some((
+            probe,
+            compute_live_at_start,
+            compute_live_after_prepare,
+            prepare_elapsed,
+            enqueue_started,
+        )) = prepared_profile
+        {
+            infr_core::pager_profile::record_prefetch_window_detailed(
+                compute_live_at_start,
+                compute_live_after_prepare,
+                prefetch_compute_live(ps, probe)?,
+                bytes,
+                prepare_elapsed,
+                enqueue_started.elapsed(),
+            );
         }
     }
     let role_stage_ids = if roles_batched {
