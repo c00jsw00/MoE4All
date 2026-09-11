@@ -378,6 +378,68 @@ fn scratch_layout(graph: &Graph) -> Result<ScratchLayout> {
         .collect()
 }
 
+/// Internal tensors whose retained storage must recover the backend's calloc contract before the
+/// next execution. Most graph temporaries are fully overwritten by their producer before any read,
+/// so clearing every retained allocation only serializes a large device fill ahead of useful work.
+/// Keep the clear for genuine read-before-write values and conservatively partial producers.
+fn scratch_reset_indices(graph: &Graph) -> Vec<usize> {
+    let mut initialized = vec![false; graph.tensors.len()];
+    let mut reset = vec![false; graph.tensors.len()];
+
+    for op in &graph.ops {
+        let (reads, writes) = op.io();
+        for id in reads {
+            let i = id.0 as usize;
+            if matches!(graph.tensors[i].kind, TensorKind::Internal) && !initialized[i] {
+                reset[i] = true;
+                // The one clear happens before the command stream and therefore initializes this
+                // tensor for every later read/write in the execution.
+                initialized[i] = true;
+            }
+        }
+        for id in writes {
+            let i = id.0 as usize;
+            if matches!(graph.tensors[i].kind, TensorKind::Internal)
+                && op_fully_overwrites_internal(op, id, graph)
+            {
+                initialized[i] = true;
+            }
+        }
+    }
+
+    reset
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, needs_reset)| needs_reset.then_some(i))
+        .collect()
+}
+
+fn op_fully_overwrites_internal(op: &Op, id: TensorId, graph: &Graph) -> bool {
+    match op {
+        // These ops can address only a slice of their destination. Treat anything except a packed
+        // whole-tensor copy as partial; a later read will then retain the safe zero reset.
+        Op::Copy {
+            dst, dst_off, n, ..
+        } if *dst == id => *dst_off == 0 && *n as usize >= graph.desc(id).numel(),
+        Op::CopyStrided {
+            dst,
+            dst_off,
+            dst_stride,
+            rows,
+            n,
+            ..
+        } if *dst == id => {
+            *dst_off == 0
+                && *dst_stride == *n
+                && (*rows as usize).saturating_mul(*n as usize) >= graph.desc(id).numel()
+        }
+        // The compressed row is emitted only on a ratio boundary. Preserve zero in the skipped
+        // executions if this scratch handle is subsequently consumed.
+        Op::Dsv4Compress { dst, .. } if *dst == id => false,
+        _ => true,
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn alloc_scratch_layout(be_: &VulkanBackend, layout: &ScratchLayout) -> Result<ScratchSet> {
     let mut scratch: ScratchSet = (0..layout.len()).map(|_| None).collect();
@@ -557,14 +619,23 @@ enum RuntimePhase {
 #[derive(Default)]
 pub(crate) struct RuntimePhaseArena {
     phase: Option<RuntimePhase>,
+    scratch_topology: Vec<bool>,
     scratch_layout: ScratchLayout,
     scratch: ScratchSet,
+    parked_scratch: Option<PhaseScratch>,
     pool: ScratchPool,
+}
+
+struct PhaseScratch {
+    topology: Vec<bool>,
+    layout: ScratchLayout,
+    scratch: ScratchSet,
 }
 
 struct RuntimePhaseStart {
     previous: Option<RuntimePhase>,
     scratch_reused: bool,
+    reset_retained_scratch: bool,
 }
 
 impl RuntimePhaseArena {
@@ -578,21 +649,106 @@ impl RuntimePhaseArena {
         }
         self.pool.begin_execute();
 
-        let scratch_reused = self.scratch_layout == *layout && self.scratch.len() == layout.len();
-        if !scratch_reused {
-            // Release the prior graph as one logical owner before claiming its replacement. Pooled
-            // high-water workspaces remain valid within the same phase and grow independently.
-            self.scratch.clear();
-            self.scratch_layout.clear();
-        }
+        self.activate_scratch_topology(layout);
+        let reset_retained_scratch = self.scratch.iter().any(Option::is_some);
+        let scratch_reused = self.scratch_satisfies(layout);
         RuntimePhaseStart {
             previous,
             scratch_reused,
+            reset_retained_scratch,
         }
     }
 
+    /// Keep the two graph families used by split Qwen3.8 decode (layer 0 and layers 1..end). A
+    /// third family replaces the inactive one, bounding retained VRAM while preserving the common
+    /// A/B/A/B path. Buffers never move while an execute is live: callers enter here only after the
+    /// preceding execution has drained.
+    fn activate_scratch_topology(&mut self, layout: &ScratchLayout) {
+        let topology: Vec<bool> = layout.iter().map(Option::is_some).collect();
+        if self.scratch_topology == topology {
+            return;
+        }
+
+        let current = (!self.scratch.is_empty()).then(|| PhaseScratch {
+            topology: std::mem::take(&mut self.scratch_topology),
+            layout: std::mem::take(&mut self.scratch_layout),
+            scratch: std::mem::take(&mut self.scratch),
+        });
+        if self
+            .parked_scratch
+            .as_ref()
+            .is_some_and(|parked| parked.topology == topology)
+        {
+            let parked = self.parked_scratch.take().expect("checked above");
+            self.scratch_topology = parked.topology;
+            self.scratch_layout = parked.layout;
+            self.scratch = parked.scratch;
+            self.parked_scratch = current;
+        } else {
+            // Only one inactive family is retained. Dropping an older parked family before
+            // installing the current one returns its unified ranges to the expert filler first.
+            self.parked_scratch = current;
+            self.scratch_topology = topology;
+            self.scratch_layout = layout.iter().map(|_| None).collect();
+            self.scratch = (0..layout.len()).map(|_| None).collect();
+        }
+    }
+
+    fn scratch_satisfies(&self, layout: &ScratchLayout) -> bool {
+        self.scratch.len() == layout.len()
+            && self
+                .scratch_layout
+                .iter()
+                .zip(layout)
+                .zip(&self.scratch)
+                .all(
+                    |((capacity, required), buffer)| match (capacity, required, buffer) {
+                        (Some(capacity), Some(required), Some(_)) => capacity >= required,
+                        (None, None, None) => true,
+                        _ => false,
+                    },
+                )
+    }
+
+    /// Allocate only missing/grown TensorId slots. Existing capacities are released before their
+    /// replacements are requested, and modest geometric growth amortizes context-dependent shapes
+    /// without reserving a second copy of the whole graph.
+    fn grow_scratch(&mut self, be_: &VulkanBackend, layout: &ScratchLayout) -> Result<()> {
+        debug_assert_eq!(self.scratch_topology.len(), layout.len());
+        let mut indices = Vec::new();
+        let mut capacities = Vec::new();
+        for (i, required) in layout.iter().copied().enumerate() {
+            let Some(required) = required else {
+                continue;
+            };
+            if self.scratch_layout[i].is_some_and(|capacity| capacity >= required)
+                && self.scratch[i].is_some()
+            {
+                continue;
+            }
+            let capacity = match self.scratch_layout[i] {
+                Some(old) => required.max(old.saturating_add((old / 4).max(4096))),
+                None => required,
+            };
+            self.scratch[i].take();
+            self.scratch_layout[i] = None;
+            indices.push(i);
+            capacities.push(capacity);
+        }
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let buffers = be_.alloc_zeroed_batch(&capacities, BufferUsage::Activations)?;
+        for ((i, capacity), buffer) in indices.into_iter().zip(capacities).zip(buffers) {
+            self.scratch_layout[i] = Some(capacity);
+            self.scratch[i] = Some(buffer);
+        }
+        Ok(())
+    }
+
     fn install_scratch(&mut self, layout: &ScratchLayout, scratch: ScratchSet) {
-        debug_assert!(self.scratch.is_empty());
+        debug_assert!(self.scratch.iter().all(Option::is_none));
+        self.scratch_topology = layout.iter().map(Option::is_some).collect();
         self.scratch = scratch;
         self.scratch_layout.clone_from(layout);
     }
@@ -610,8 +766,10 @@ impl RuntimePhaseArena {
     }
 
     fn release_workspace(&mut self) {
+        self.scratch_topology.clear();
         self.scratch.clear();
         self.scratch_layout.clear();
+        self.parked_scratch = None;
         self.pool.clear();
     }
 }
@@ -6862,13 +7020,23 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
 }
 
 fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    let setup_t0 = infr_core::pager_profile::start();
+    let setup_part_t0 = infr_core::pager_profile::start();
     let layout = scratch_layout(graph)?;
+    let scratch_resets = scratch_reset_indices(graph);
+    if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_part_t0) {
+        infr_core::pager_profile::record_backend_setup_part(
+            infr_core::pager_profile::BackendSetupKind::Layout,
+            elapsed,
+        );
+    }
+    let setup_part_t0 = infr_core::pager_profile::start();
     // Paged decode plans are rebuilt per token, but their pooled workspace is shape-stable across
     // the whole decode phase. Retain that pool on the model backend so freeing one token's scratch
     // cannot restore an expert slot that the next token immediately has to borrow again. The
     // existing unified execution gate serializes this model's executes, so the mutex is only a
     // lifetime container rather than a hot-path contention point.
-    let mut scratch_reused = false;
+    let mut reset_retained_scratch = false;
     let mut phase_arena = if be_.moe_paged() {
         if let Some(phase) = paged_static_phase(graph) {
             if phase == RuntimePhase::Prefill {
@@ -6876,7 +7044,7 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             }
             let mut arena = be_.runtime_phase.lock().unwrap();
             let start = arena.begin_execute(phase, &layout);
-            scratch_reused = start.scratch_reused;
+            reset_retained_scratch = start.reset_retained_scratch;
             let pager_transition =
                 pager_static_transition(start.previous, phase, be_.cfg().paging.moe_layer_stream);
 
@@ -6896,9 +7064,8 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                 }
             }
 
-            if !scratch_reused {
-                let scratch = alloc_scratch_layout(be_, &layout)?;
-                arena.install_scratch(&layout, scratch);
+            if !start.scratch_reused {
+                arena.grow_scratch(be_, &layout)?;
             }
             Some(arena)
         } else {
@@ -6911,13 +7078,6 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     if phase_arena.is_none() {
         local_scratch = Some(alloc_scratch_layout(be_, &layout)?);
     }
-    if scratch_reused {
-        let arena = phase_arena
-            .as_ref()
-            .expect("reused scratch requires a phase arena");
-        be_.zero_buffers_batch(arena.scratch.iter().filter_map(|buf| buf.as_deref()))?;
-    }
-
     let using_phase_arena = phase_arena.is_some();
     let mut local_pool = ScratchPool::default();
     let (scratch, pool): (&ScratchSet, &mut ScratchPool) = match phase_arena.as_mut() {
@@ -6935,12 +7095,19 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     if be_.moe_paged() {
         preallocate_paged_deltanet_scratch(be_, graph, pool)?;
     }
+    if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_part_t0) {
+        infr_core::pager_profile::record_backend_setup_part(
+            infr_core::pager_profile::BackendSetupKind::PhaseScratch,
+            elapsed,
+        );
+    }
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
     // carries a `positions` i32 tensor. Read `positions[0]` (decode rows=1, or the start of a
     // consecutive-prefill run) up front — `read_pos0` reads host-visible (mapped) positions
     // directly (the seam always binds Staging there) and only falls back to the syncing
     // `download` (a one-shot submit + wait) for a device-local buffer.
+    let setup_part_t0 = infr_core::pager_profile::start();
     let mut rope_pos: HashMap<u32, usize> = HashMap::new();
     for op in &graph.ops {
         let pid = match op {
@@ -6953,7 +7120,14 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             }
         }
     }
+    if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_part_t0) {
+        infr_core::pager_profile::record_backend_setup_part(
+            infr_core::pager_profile::BackendSetupKind::Rope,
+            elapsed,
+        );
+    }
 
+    let setup_part_t0 = infr_core::pager_profile::start();
     let mut plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
     // Dense layer streaming: the fused Linear+Add kernels bake a ZERO weight offset, so un-fuse
     // any pair whose Linear weight is a streamed block — the standalone Add op runs instead
@@ -6976,12 +7150,19 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             }
         }
     }
+    if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_part_t0) {
+        infr_core::pager_profile::record_backend_setup_part(
+            infr_core::pager_profile::BackendSetupKind::Fusion,
+            elapsed,
+        );
+    }
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
     // Strict decode-only Qwen peephole. Only suppress the six dense shared-expert ops when the
     // routed bank is actually backed by the Vulkan pager; resident/CPU/other-model graphs keep the
     // original op stream. `PagedMoeShared` is Copy and contains only graph handles.
+    let setup_part_t0 = infr_core::pager_profile::start();
     let mut paged_moe_shared = HashMap::<usize, PagedMoeShared>::new();
     for op_idx in 0..graph.ops.len() {
         let Some(shared) = paged_moe_shared_at(graph, op_idx) else {
@@ -7001,6 +7182,12 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             paged_moe_shared.insert(op_idx, shared);
             skip_op.extend(op_idx + 1..op_idx + 7);
         }
+    }
+    if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_part_t0) {
+        infr_core::pager_profile::record_backend_setup_part(
+            infr_core::pager_profile::BackendSetupKind::PagedMoeScan,
+            elapsed,
+        );
     }
 
     // Transient buffers allocated inside the op loop (GEMM/attention/MoE scratch) must outlive the
@@ -7033,7 +7220,22 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // time round. Single-token paged decode intentionally does not consume a calibration round.
     let submit_tune_round = be_.begin_submit_tune_round(single_token_paged_moe);
     let cap = submit_tune_round.cap();
+    if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_t0) {
+        infr_core::pager_profile::record_backend_setup(elapsed);
+    }
     let mut rec = Some(be_.recorder()?);
+    if reset_retained_scratch {
+        // Restore only true read-before-write scratch in the first useful command stream. Queue
+        // order provides the same zero-before-read guarantee as the former synchronous one-shot,
+        // without an extra submit + queue_wait_idle before every static decode execution.
+        let rec0 = rec.as_ref().expect("initial recorder is present");
+        for &i in &scratch_resets {
+            let buf = scratch[i]
+                .as_deref()
+                .expect("an Internal scratch reset must have an allocation");
+            rec0.zero(buf, buf.len_bytes().div_ceil(4));
+        }
+    }
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
@@ -8877,7 +9079,7 @@ fn execute_paged_moe<'a>(
             role_stage_ids,
             n_expert,
             touch_all,
-            shared_batch,
+            roles_batched,
         )?
     };
     // RAW: make every direct HOST write to the mapped arena visible before the first dispatch
@@ -9377,6 +9579,58 @@ mod tests {
         assert_eq!(estimate.load(Ordering::Relaxed), 70_000);
     }
 
+    #[test]
+    fn retained_scratch_resets_only_read_before_full_write_tensors() {
+        let mut graph = Graph::new();
+        let src = graph.input(TensorDesc::new(vec![8], DType::F32));
+        let weight = graph.weight(TensorDesc::new(vec![8], DType::F32));
+        let full = graph.internal(TensorDesc::new(vec![8], DType::F32));
+        let full_consumer = graph.internal(TensorDesc::new(vec![8], DType::F32));
+        let partial = graph.internal(TensorDesc::new(vec![8], DType::F32));
+        let partial_consumer = graph.internal(TensorDesc::new(vec![8], DType::F32));
+        let accumulator = graph.internal(TensorDesc::new(vec![8], DType::F32));
+
+        graph.push(Op::Copy {
+            src,
+            src_off: 0,
+            dst: full,
+            dst_off: 0,
+            n: 8,
+        });
+        graph.push(Op::Scale {
+            x: full,
+            dst: full_consumer,
+            s: 1.0,
+            n: 8,
+        });
+        graph.push(Op::Copy {
+            src,
+            src_off: 0,
+            dst: partial,
+            dst_off: 0,
+            n: 4,
+        });
+        graph.push(Op::Scale {
+            x: partial,
+            dst: partial_consumer,
+            s: 1.0,
+            n: 8,
+        });
+        graph.push(Op::RmsNormAdd {
+            x: src,
+            weight,
+            dst: accumulator,
+            rows: 1,
+            dim: 8,
+            eps: 1e-6,
+        });
+
+        assert_eq!(
+            scratch_reset_indices(&graph),
+            vec![partial.0 as usize, accumulator.0 as usize]
+        );
+    }
+
     struct TestBuffer(usize);
 
     impl Buffer for TestBuffer {
@@ -9443,8 +9697,8 @@ mod tests {
             arena.pool.buffers.is_empty(),
             "decode scratch must drop on the decode-to-prefill transition"
         );
-        assert!(arena.scratch_layout.is_empty());
-        assert!(arena.scratch.is_empty());
+        assert!(arena.scratch_layout.iter().all(Option::is_none));
+        assert!(arena.scratch.iter().all(Option::is_none));
         arena.install_scratch(&prefill_layout, vec![Some(Box::new(TestBuffer(8)))]);
         arena
             .pool
@@ -9467,8 +9721,8 @@ mod tests {
             arena.pool.buffers.is_empty(),
             "prefill scratch must drop on the prefill-to-decode transition"
         );
-        assert!(arena.scratch_layout.is_empty());
-        assert!(arena.scratch.is_empty());
+        assert!(arena.scratch_layout.iter().all(Option::is_none));
+        assert!(arena.scratch.iter().all(Option::is_none));
     }
 
     #[test]
@@ -9502,7 +9756,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_phase_shape_change_replaces_graph_but_keeps_pooled_high_water() {
+    fn runtime_phase_shape_growth_retains_old_slot_until_replacement() {
         let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut arena = RuntimePhaseArena::default();
         let old_layout = vec![Some(4)];
@@ -9526,9 +9780,54 @@ mod tests {
         let start = arena.begin_execute(RuntimePhase::Prefill, &new_layout);
 
         assert!(!start.scratch_reused);
-        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert!(arena.scratch.is_empty());
+        assert!(start.reset_retained_scratch);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(arena.scratch[0].is_some());
         assert!(arena.pool.buffers.contains_key(&("high_water", 8)));
+    }
+
+    #[test]
+    fn runtime_phase_keeps_two_alternating_scratch_topologies() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut arena = RuntimePhaseArena::default();
+        let head = vec![Some(4), None];
+        let tail = vec![None, Some(8)];
+
+        arena.begin_execute(RuntimePhase::Decode, &head);
+        arena.install_scratch(
+            &head,
+            vec![
+                Some(Box::new(DropCountBuffer {
+                    bytes: 4,
+                    drops: std::sync::Arc::clone(&drops),
+                })),
+                None,
+            ],
+        );
+
+        let start = arena.begin_execute(RuntimePhase::Decode, &tail);
+        assert!(!start.scratch_reused);
+        assert!(!start.reset_retained_scratch);
+        arena.install_scratch(
+            &tail,
+            vec![
+                None,
+                Some(Box::new(DropCountBuffer {
+                    bytes: 8,
+                    drops: std::sync::Arc::clone(&drops),
+                })),
+            ],
+        );
+
+        let start = arena.begin_execute(RuntimePhase::Decode, &head);
+        assert!(start.scratch_reused);
+        assert!(start.reset_retained_scratch);
+        assert!(arena.scratch[0].is_some());
+        assert!(arena.scratch[1].is_none());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        arena.release_phase();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
