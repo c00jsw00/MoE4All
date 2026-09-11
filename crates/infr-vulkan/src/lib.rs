@@ -801,7 +801,9 @@ impl VulkanShared {
             };
         }
         if let Some(t0) = started {
-            infr_core::pager_profile::record_queue_submit(0, t0.elapsed());
+            let elapsed = t0.elapsed();
+            infr_core::pager_profile::record_queue_submit(0, elapsed);
+            infr_core::pager_profile::record_dedicated_transfer_submit_cpu(elapsed);
         }
         match result {
             Ok(()) => {
@@ -842,15 +844,19 @@ impl VulkanShared {
             .timeline();
         let semaphores = [timeline];
         let values = [value];
-        unsafe {
+        let wait_t0 = infr_core::pager_profile::start();
+        let wait = unsafe {
             self.device.wait_semaphores(
                 &vk::SemaphoreWaitInfo::default()
                     .semaphores(&semaphores)
                     .values(&values),
                 u64::MAX,
             )
+        };
+        if let Some(elapsed) = infr_core::pager_profile::elapsed(wait_t0) {
+            infr_core::pager_profile::record_dedicated_transfer_timeline_wait(elapsed);
         }
-        .map_err(|error| be(format!("wait dedicated transfer timeline {value}: {error}")))
+        wait.map_err(|error| be(format!("wait dedicated transfer timeline {value}: {error}")))
     }
 
     fn queue_submit_commands_recovering(
@@ -1176,8 +1182,14 @@ impl VulkanShared {
             .and_then(SubmitAutoTuner::token_for_current_thread)
     }
 
-    pub(crate) fn take_submit_timing_query(&self) -> Option<(vk::QueryPool, SubmitTimingToken)> {
-        let token = self.submit_timing_token()?;
+    pub(crate) fn take_submit_timing_query(
+        &self,
+    ) -> Option<(vk::QueryPool, Option<SubmitTimingToken>, bool)> {
+        let token = self.submit_timing_token();
+        let pager_profile = infr_core::pager_profile::active();
+        if token.is_none() && !pager_profile {
+            return None;
+        }
         let pool = match self.recorder_submit_query_pools.lock().unwrap().pop() {
             Some(pool) => pool,
             None => match unsafe {
@@ -1195,7 +1207,7 @@ impl VulkanShared {
                 }
             },
         };
-        Some((pool, token))
+        Some((pool, token, pager_profile))
     }
 
     pub(crate) fn return_submit_timing_query(&self, pool: vk::QueryPool) {
@@ -1207,7 +1219,8 @@ impl VulkanShared {
     pub(crate) fn resolve_submit_timing_query(
         &self,
         pool: vk::QueryPool,
-        token: SubmitTimingToken,
+        token: Option<SubmitTimingToken>,
+        pager_profile: bool,
         dispatches: usize,
     ) {
         let mut ticks = [0u64; 2];
@@ -1221,8 +1234,22 @@ impl VulkanShared {
         };
         self.return_submit_timing_query(pool);
         if let Err(e) = result {
-            self.disable_submit_tuning(&format!("could not read timestamp query: {e}"));
+            if token.is_some() {
+                self.disable_submit_tuning(&format!("could not read timestamp query: {e}"));
+            } else {
+                tracing::warn!("[infr] pager profiler could not read main-queue timestamps: {e}");
+            }
             return;
+        }
+
+        if pager_profile {
+            infr_core::pager_profile::record_device_interval(
+                infr_core::pager_profile::DeviceIntervalKind::MainQueue,
+                ticks[0],
+                ticks[1],
+                self.submit_timestamp_valid_bits,
+                self.submit_timestamp_period_ns,
+            );
         }
 
         let delta = ticks[1].wrapping_sub(ticks[0]);
@@ -1232,8 +1259,10 @@ impl VulkanShared {
             delta & ((1u64 << self.submit_timestamp_valid_bits) - 1)
         };
         let gpu_ns = (valid_delta as f64 * self.submit_timestamp_period_ns as f64) as u64;
-        if let Some(tuner) = self.submit_auto_tuner.lock().unwrap().as_mut() {
-            tuner.record_submit(token, gpu_ns, dispatches);
+        if let Some(token) = token {
+            if let Some(tuner) = self.submit_auto_tuner.lock().unwrap().as_mut() {
+                tuner.record_submit(token, gpu_ns, dispatches);
+            }
         }
     }
 
@@ -3713,7 +3742,12 @@ impl VulkanBackend {
         // it explicitly; ordinary GpuOnly allocations never do.
         let host_overflow_type = probe_host_visible_non_device_local_type(&mem_props);
         let dedicated_transfer = dedicated_transfer_family_index.and_then(|family| {
-            match crate::transfer::DedicatedTransferQueue::new(&device, family) {
+            match crate::transfer::DedicatedTransferQueue::new(
+                &device,
+                family,
+                qf_props[family as usize].timestamp_valid_bits,
+                submit_timestamp_period_ns,
+            ) {
                 Ok(queue) => {
                     tracing::info!(
                         "[infr] host DMA: dedicated transfer queue family {family} enabled"

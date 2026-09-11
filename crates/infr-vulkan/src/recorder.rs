@@ -942,6 +942,7 @@ pub struct Recorder<'a> {
     /// submission; ownership moves to `PendingSegment` until its fence is collected.
     submit_query_pool: std::cell::Cell<vk::QueryPool>,
     submit_timing_token: std::cell::Cell<Option<crate::SubmitTimingToken>>,
+    submit_pager_profile: std::cell::Cell<bool>,
     ts_labels: RefCell<Vec<&'static str>>,
     /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
     ts_dropped: std::cell::Cell<usize>,
@@ -1016,6 +1017,7 @@ impl<'a> Recorder<'a> {
     }
 
     fn new_inner(backend: &'a VulkanBackend, persistent: bool) -> Result<Self> {
+        let profile_acquire_t0 = pager_profile::start();
         let device = &backend.shared.device;
         let cmd_pool = *backend.shared.cmd_pool.lock().unwrap();
         let cmd = match backend.shared.recorder_cmds.lock().unwrap().pop() {
@@ -1114,10 +1116,10 @@ impl<'a> Recorder<'a> {
             vk::QueryPool::null()
         };
 
-        let (submit_query_pool, submit_timing_token) = if !persistent {
+        let (submit_query_pool, submit_timing_token, submit_pager_profile) = if !persistent {
             backend.shared.take_submit_timing_query().map_or(
-                (vk::QueryPool::null(), None),
-                |(pool, token)| {
+                (vk::QueryPool::null(), None, false),
+                |(pool, token, pager_profile)| {
                     unsafe {
                         device.cmd_reset_query_pool(cmd, pool, 0, 2);
                         device.cmd_write_timestamp(
@@ -1127,13 +1129,16 @@ impl<'a> Recorder<'a> {
                             0,
                         );
                     }
-                    (pool, Some(token))
+                    (pool, token, pager_profile)
                 },
             )
         } else {
-            (vk::QueryPool::null(), None)
+            (vk::QueryPool::null(), None, false)
         };
 
+        if let Some(elapsed) = pager_profile::elapsed(profile_acquire_t0) {
+            pager_profile::record_command_recorder_acquire(elapsed);
+        }
         Ok(Self {
             be: backend,
             cmd,
@@ -1154,6 +1159,7 @@ impl<'a> Recorder<'a> {
             query_pool,
             submit_query_pool: std::cell::Cell::new(submit_query_pool),
             submit_timing_token: std::cell::Cell::new(submit_timing_token),
+            submit_pager_profile: std::cell::Cell::new(submit_pager_profile),
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
@@ -11506,13 +11512,11 @@ impl<'a> Recorder<'a> {
     fn resolve_submit_timing(&self, dispatches: usize) {
         let pool = self.submit_query_pool.replace(vk::QueryPool::null());
         let token = self.submit_timing_token.take();
-        match (pool != vk::QueryPool::null(), token) {
-            (true, Some(token)) => self
-                .be
+        let pager_profile = self.submit_pager_profile.replace(false);
+        if pool != vk::QueryPool::null() {
+            self.be
                 .shared
-                .resolve_submit_timing_query(pool, token, dispatches),
-            (true, None) => self.be.shared.return_submit_timing_query(pool),
-            _ => {}
+                .resolve_submit_timing_query(pool, token, pager_profile, dispatches);
         }
     }
 
@@ -11533,6 +11537,7 @@ impl<'a> Recorder<'a> {
         }
         let submit_pool = self.submit_query_pool.replace(vk::QueryPool::null());
         self.submit_timing_token.set(None);
+        self.submit_pager_profile.set(false);
         self.be.shared.return_submit_timing_query(submit_pool);
         self.be.shared.recorder_cmds.lock().unwrap().push(self.cmd);
         self.be
@@ -11548,6 +11553,10 @@ impl<'a> Recorder<'a> {
         let device = &self.be.shared.device;
         let dispatches = self.dispatches.get();
         let t_record = self.t0.elapsed();
+        let prof = pager_profile::active();
+        if prof {
+            pager_profile::record_command_recording(dispatches, t_record);
+        }
         if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
@@ -11569,7 +11578,6 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
-        let prof = pager_profile::active();
         let submit = self.be.shared.queue_submit_commands_recovering(
             std::slice::from_ref(&self.cmd),
             vk::Fence::null(),
@@ -11651,8 +11659,12 @@ impl<'a> Recorder<'a> {
                 buffer_keepalive: Vec::new(),
                 submit_query_pool: vk::QueryPool::null(),
                 submit_timing_token: None,
+                submit_pager_profile: false,
                 dispatches,
             });
+        }
+        if pager_profile::active() {
+            pager_profile::record_command_recording(dispatches, self.t0.elapsed());
         }
         let device = &self.be.shared.device;
         // On SUCCESS the cmd buffer + pools are handed to the returned `PendingSegment` (freed in
@@ -11697,6 +11709,7 @@ impl<'a> Recorder<'a> {
         let buffer_keepalive = std::mem::take(&mut *self.buffer_keepalive.borrow_mut());
         let submit_query_pool = self.submit_query_pool.replace(vk::QueryPool::null());
         let submit_timing_token = self.submit_timing_token.take();
+        let submit_pager_profile = self.submit_pager_profile.replace(false);
         self.owns_transient.set(false);
         Ok(PendingSegment {
             shared,
@@ -11706,6 +11719,7 @@ impl<'a> Recorder<'a> {
             buffer_keepalive,
             submit_query_pool,
             submit_timing_token,
+            submit_pager_profile,
             dispatches,
         })
     }
@@ -12022,6 +12036,7 @@ pub struct PendingSegment {
     /// caps, and on the already-drained profiling compatibility path.
     submit_query_pool: vk::QueryPool,
     submit_timing_token: Option<crate::SubmitTimingToken>,
+    submit_pager_profile: bool,
     /// Dispatches this segment carried; consumed by the submit profiler and finite GPU tuner.
     dispatches: usize,
 }
@@ -12061,14 +12076,15 @@ impl PendingSegment {
         }
         let submit_pool = std::mem::replace(&mut self.submit_query_pool, vk::QueryPool::null());
         let submit_token = self.submit_timing_token.take();
+        let submit_pager_profile = std::mem::take(&mut self.submit_pager_profile);
         if submit_pool != vk::QueryPool::null() {
             if waited.is_ok() {
-                if let Some(token) = submit_token {
-                    self.shared
-                        .resolve_submit_timing_query(submit_pool, token, self.dispatches);
-                } else {
-                    self.shared.return_submit_timing_query(submit_pool);
-                }
+                self.shared.resolve_submit_timing_query(
+                    submit_pool,
+                    submit_token,
+                    submit_pager_profile,
+                    self.dispatches,
+                );
             } else {
                 self.shared.return_submit_timing_query(submit_pool);
             }

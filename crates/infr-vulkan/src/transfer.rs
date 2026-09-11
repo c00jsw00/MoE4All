@@ -32,6 +32,8 @@ struct DedicatedTransferCommandSlot {
     cmd: vk::CommandBuffer,
     pending_value: u64,
     keepalive: Vec<Arc<dyn Buffer>>,
+    profile_pending: bool,
+    profile_bytes: u64,
 }
 
 /// Transfer-family stream for imported host RAM to device-arena copies. The timeline value is
@@ -44,10 +46,18 @@ pub(crate) struct DedicatedTransferQueue {
     slots: Vec<DedicatedTransferCommandSlot>,
     cursor: usize,
     next_value: u64,
+    profile_query_pool: vk::QueryPool,
+    profile_timestamp_period_ns: f32,
+    profile_timestamp_valid_bits: u32,
 }
 
 impl DedicatedTransferQueue {
-    pub(crate) fn new(device: &ash::Device, family_index: u32) -> Result<Self> {
+    pub(crate) fn new(
+        device: &ash::Device,
+        family_index: u32,
+        timestamp_valid_bits: u32,
+        timestamp_period_ns: f32,
+    ) -> Result<Self> {
         let queue = unsafe { device.get_device_queue(family_index, 0) };
         let pool = unsafe {
             device.create_command_pool(
@@ -91,6 +101,30 @@ impl DedicatedTransferQueue {
                 )));
             }
         };
+        let profile_query_pool = if pager_profile::active()
+            && timestamp_valid_bits > 0
+            && timestamp_period_ns.is_finite()
+            && timestamp_period_ns > 0.0
+        {
+            match unsafe {
+                device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count((DEDICATED_TRANSFER_COMMAND_SLOTS * 2) as u32),
+                    None,
+                )
+            } {
+                Ok(pool) => pool,
+                Err(error) => {
+                    tracing::warn!(
+                        "[infr] pager profiler could not timestamp dedicated DMA ({error}); device copy time will be unavailable"
+                    );
+                    vk::QueryPool::null()
+                }
+            }
+        } else {
+            vk::QueryPool::null()
+        };
         Ok(Self {
             queue,
             family_index,
@@ -102,11 +136,63 @@ impl DedicatedTransferQueue {
                     cmd,
                     pending_value: 0,
                     keepalive: Vec::new(),
+                    profile_pending: false,
+                    profile_bytes: 0,
                 })
                 .collect(),
             cursor: 0,
             next_value: 1,
+            profile_query_pool,
+            profile_timestamp_period_ns: timestamp_period_ns,
+            profile_timestamp_valid_bits: timestamp_valid_bits,
         })
+    }
+
+    fn resolve_profile_slot(
+        device: &ash::Device,
+        query_pool: vk::QueryPool,
+        timestamp_period_ns: f32,
+        timestamp_valid_bits: u32,
+        slot_index: usize,
+        slot: &mut DedicatedTransferCommandSlot,
+    ) {
+        if query_pool == vk::QueryPool::null() || !slot.profile_pending {
+            return;
+        }
+        let mut ticks = [0u64; 2];
+        let result = unsafe {
+            device.get_query_pool_results(
+                query_pool,
+                (slot_index * 2) as u32,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        };
+        slot.profile_pending = false;
+        let profile_bytes = std::mem::take(&mut slot.profile_bytes);
+        match result {
+            Ok(()) => {
+                pager_profile::record_device_interval(
+                    pager_profile::DeviceIntervalKind::DedicatedTransfer,
+                    ticks[0],
+                    ticks[1],
+                    timestamp_valid_bits,
+                    timestamp_period_ns,
+                );
+                pager_profile::record_dedicated_transfer_gpu_time(
+                    profile_bytes,
+                    std::time::Duration::from_nanos(timestamp_delta_ns(
+                        ticks[0],
+                        ticks[1],
+                        timestamp_valid_bits,
+                        timestamp_period_ns,
+                    )),
+                );
+            }
+            Err(error) => tracing::warn!(
+                "[infr] pager profiler could not read dedicated DMA timestamps ({error})"
+            ),
+        }
     }
 
     pub(crate) fn family_index(&self) -> u32 {
@@ -123,19 +209,32 @@ impl DedicatedTransferQueue {
         batches: &[TransferCopyBatch],
     ) -> Result<u64> {
         debug_assert!(!batches.is_empty());
-        let slot = &mut self.slots[self.cursor];
+        let slot_index = self.cursor;
+        let slot = &mut self.slots[slot_index];
         if slot.pending_value != 0 {
             let semaphores = [self.timeline];
             let values = [slot.pending_value];
-            unsafe {
+            let wait_t0 = pager_profile::start();
+            let wait = unsafe {
                 shared.device.wait_semaphores(
                     &vk::SemaphoreWaitInfo::default()
                         .semaphores(&semaphores)
                         .values(&values),
                     u64::MAX,
                 )
+            };
+            if let Some(elapsed) = pager_profile::elapsed(wait_t0) {
+                pager_profile::record_dedicated_transfer_slot_wait(elapsed);
             }
-            .map_err(|error| be(format!("wait reusable transfer command slot: {error}")))?;
+            wait.map_err(|error| be(format!("wait reusable transfer command slot: {error}")))?;
+            Self::resolve_profile_slot(
+                &shared.device,
+                self.profile_query_pool,
+                self.profile_timestamp_period_ns,
+                self.profile_timestamp_valid_bits,
+                slot_index,
+                slot,
+            );
             slot.keepalive.clear();
         }
         unsafe {
@@ -152,6 +251,26 @@ impl DedicatedTransferQueue {
             )
         }
         .map_err(|error| be(format!("begin dedicated transfer command buffer: {error}")))?;
+
+        let profile_active = pager_profile::active();
+        let profile_queries = profile_active && self.profile_query_pool != vk::QueryPool::null();
+        let query_base = (slot_index * 2) as u32;
+        if profile_queries {
+            unsafe {
+                shared.device.cmd_reset_query_pool(
+                    slot.cmd,
+                    self.profile_query_pool,
+                    query_base,
+                    2,
+                );
+                shared.device.cmd_write_timestamp(
+                    slot.cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    self.profile_query_pool,
+                    query_base,
+                );
+            }
+        }
 
         let host_barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::HOST_WRITE)
@@ -172,6 +291,14 @@ impl DedicatedTransferQueue {
                 shared
                     .device
                     .cmd_copy_buffer(slot.cmd, src, dst, &batch.regions);
+            }
+            if profile_queries {
+                shared.device.cmd_write_timestamp(
+                    slot.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.profile_query_pool,
+                    query_base + 1,
+                );
             }
             shared
                 .device
@@ -195,7 +322,26 @@ impl DedicatedTransferQueue {
             .push_next(&mut timeline);
         shared.submit_dedicated_transfer(self.queue, &submit)?;
 
+        let profile_bytes = if profile_active {
+            let (regions, bytes) = batches.iter().fold((0u64, 0u64), |totals, batch| {
+                (
+                    totals.0.saturating_add(batch.regions.len() as u64),
+                    totals.1.saturating_add(
+                        batch
+                            .regions
+                            .iter()
+                            .fold(0u64, |sum, region| sum.saturating_add(region.size)),
+                    ),
+                )
+            });
+            pager_profile::record_dedicated_transfer_submit(bytes, regions);
+            bytes
+        } else {
+            0
+        };
         slot.pending_value = value;
+        slot.profile_pending = profile_queries;
+        slot.profile_bytes = if profile_queries { profile_bytes } else { 0 };
         slot.keepalive.reserve(batches.len() * 2);
         for batch in batches {
             slot.keepalive.push(Arc::clone(&batch.src));
@@ -205,12 +351,38 @@ impl DedicatedTransferQueue {
         Ok(value)
     }
 
-    pub(crate) unsafe fn destroy(self, device: &ash::Device) {
+    pub(crate) unsafe fn destroy(mut self, device: &ash::Device) {
+        for (slot_index, slot) in self.slots.iter_mut().enumerate() {
+            Self::resolve_profile_slot(
+                device,
+                self.profile_query_pool,
+                self.profile_timestamp_period_ns,
+                self.profile_timestamp_valid_bits,
+                slot_index,
+                slot,
+            );
+        }
         unsafe {
+            if self.profile_query_pool != vk::QueryPool::null() {
+                device.destroy_query_pool(self.profile_query_pool, None);
+            }
             device.destroy_semaphore(self.timeline, None);
             device.destroy_command_pool(self.pool, None);
         }
     }
+}
+
+fn timestamp_delta_ns(start: u64, end: u64, valid_bits: u32, period_ns: f32) -> u64 {
+    if valid_bits == 0 || !period_ns.is_finite() || period_ns <= 0.0 {
+        return 0;
+    }
+    let delta = end.wrapping_sub(start);
+    let valid_delta = if valid_bits >= 64 {
+        delta
+    } else {
+        delta & ((1u64 << valid_bits) - 1)
+    };
+    (valid_delta as f64 * period_ns as f64).min(u64::MAX as f64) as u64
 }
 
 /// Backend contract consumed by residency logic. It exposes data movement, not Vulkan memory
