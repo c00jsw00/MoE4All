@@ -12937,6 +12937,7 @@ mod tests {
                 1e-6,
                 1.0 / (HD as f32).sqrt(),
                 None,
+                None,
             );
             rec.qsa_indexer(
                 q.as_ref(),
@@ -12958,6 +12959,7 @@ mod tests {
                 1e-6,
                 1.0 / (HD as f32).sqrt(),
                 segment_shifts,
+                None,
             );
             rec.finish().unwrap();
 
@@ -13292,6 +13294,7 @@ mod tests {
             1e-6,
             1.0 / (HD as f32).sqrt(),
             None,
+            None,
         );
         rec.qsa_attention_batch(
             queries.as_ref(),
@@ -13353,6 +13356,7 @@ mod tests {
                 10_000.0,
                 1e-6,
                 1.0 / (HD as f32).sqrt(),
+                None,
                 None,
             );
             rec.qsa_attention_batch(
