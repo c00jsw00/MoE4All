@@ -156,6 +156,21 @@ struct Counters {
     splitter_result_submits: AtomicU64,
     splitter_result_dispatches: AtomicU64,
 
+    ple_gathers: AtomicU64,
+    ple_tokens: AtomicU64,
+    ple_row_requests: AtomicU64,
+    ple_unique_rows: AtomicU64,
+    ple_logical_pages: AtomicU64,
+    ple_output_bytes: AtomicU64,
+    ple_parallel_gathers: AtomicU64,
+    ple_plan_ns: AtomicU64,
+    ple_work_ns: AtomicU64,
+    ple_waits: AtomicU64,
+    ple_wait_ns: AtomicU64,
+    ple_uploads: AtomicU64,
+    ple_upload_bytes: AtomicU64,
+    ple_upload_ns: AtomicU64,
+
     lru_mark_calls: AtomicU64,
     lru_mark_scan_steps: AtomicU64,
     lru_mark_max_scan_steps: AtomicU64,
@@ -274,6 +289,21 @@ impl Counters {
             splitter_cap_max: AtomicU64::new(0),
             splitter_result_submits: AtomicU64::new(0),
             splitter_result_dispatches: AtomicU64::new(0),
+
+            ple_gathers: AtomicU64::new(0),
+            ple_tokens: AtomicU64::new(0),
+            ple_row_requests: AtomicU64::new(0),
+            ple_unique_rows: AtomicU64::new(0),
+            ple_logical_pages: AtomicU64::new(0),
+            ple_output_bytes: AtomicU64::new(0),
+            ple_parallel_gathers: AtomicU64::new(0),
+            ple_plan_ns: AtomicU64::new(0),
+            ple_work_ns: AtomicU64::new(0),
+            ple_waits: AtomicU64::new(0),
+            ple_wait_ns: AtomicU64::new(0),
+            ple_uploads: AtomicU64::new(0),
+            ple_upload_bytes: AtomicU64::new(0),
+            ple_upload_ns: AtomicU64::new(0),
 
             lru_mark_calls: AtomicU64::new(0),
             lru_mark_scan_steps: AtomicU64::new(0),
@@ -439,6 +469,21 @@ pub struct Snapshot {
     pub splitter_cap_max: u64,
     pub splitter_result_submits: u64,
     pub splitter_result_dispatches: u64,
+
+    pub ple_gathers: u64,
+    pub ple_tokens: u64,
+    pub ple_row_requests: u64,
+    pub ple_unique_rows: u64,
+    pub ple_logical_pages: u64,
+    pub ple_output_bytes: u64,
+    pub ple_parallel_gathers: u64,
+    pub ple_plan_ns: u64,
+    pub ple_work_ns: u64,
+    pub ple_waits: u64,
+    pub ple_wait_ns: u64,
+    pub ple_uploads: u64,
+    pub ple_upload_bytes: u64,
+    pub ple_upload_ns: u64,
 
     pub lru_mark_calls: u64,
     pub lru_mark_scan_steps: u64,
@@ -977,6 +1022,65 @@ pub fn record_splitter_forward(
         .fetch_add(dispatches as u64, Ordering::Relaxed);
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn record_ple_gather(
+    tokens: usize,
+    row_requests: usize,
+    unique_rows: usize,
+    logical_pages: usize,
+    output_bytes: usize,
+    parallel: bool,
+    plan_elapsed: Duration,
+    work_elapsed: Duration,
+) {
+    COUNTERS.ple_gathers.fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .ple_tokens
+        .fetch_add(tokens as u64, Ordering::Relaxed);
+    COUNTERS
+        .ple_row_requests
+        .fetch_add(row_requests as u64, Ordering::Relaxed);
+    COUNTERS
+        .ple_unique_rows
+        .fetch_add(unique_rows as u64, Ordering::Relaxed);
+    COUNTERS
+        .ple_logical_pages
+        .fetch_add(logical_pages as u64, Ordering::Relaxed);
+    COUNTERS
+        .ple_output_bytes
+        .fetch_add(output_bytes as u64, Ordering::Relaxed);
+    if parallel {
+        COUNTERS
+            .ple_parallel_gathers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    COUNTERS
+        .ple_plan_ns
+        .fetch_add(ns(plan_elapsed), Ordering::Relaxed);
+    COUNTERS
+        .ple_work_ns
+        .fetch_add(ns(work_elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_ple_wait(elapsed: Duration) {
+    COUNTERS.ple_waits.fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .ple_wait_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_ple_upload(bytes: usize, elapsed: Duration) {
+    COUNTERS.ple_uploads.fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .ple_upload_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+    COUNTERS
+        .ple_upload_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
 pub fn record_lru_work(stats: LruWorkStats) {
     if !stats.has_activity() {
         return;
@@ -1120,6 +1224,21 @@ pub fn snapshot() -> Snapshot {
         splitter_cap_max: load(&COUNTERS.splitter_cap_max),
         splitter_result_submits: load(&COUNTERS.splitter_result_submits),
         splitter_result_dispatches: load(&COUNTERS.splitter_result_dispatches),
+
+        ple_gathers: load(&COUNTERS.ple_gathers),
+        ple_tokens: load(&COUNTERS.ple_tokens),
+        ple_row_requests: load(&COUNTERS.ple_row_requests),
+        ple_unique_rows: load(&COUNTERS.ple_unique_rows),
+        ple_logical_pages: load(&COUNTERS.ple_logical_pages),
+        ple_output_bytes: load(&COUNTERS.ple_output_bytes),
+        ple_parallel_gathers: load(&COUNTERS.ple_parallel_gathers),
+        ple_plan_ns: load(&COUNTERS.ple_plan_ns),
+        ple_work_ns: load(&COUNTERS.ple_work_ns),
+        ple_waits: load(&COUNTERS.ple_waits),
+        ple_wait_ns: load(&COUNTERS.ple_wait_ns),
+        ple_uploads: load(&COUNTERS.ple_uploads),
+        ple_upload_bytes: load(&COUNTERS.ple_upload_bytes),
+        ple_upload_ns: load(&COUNTERS.ple_upload_ns),
 
         lru_mark_calls: load(&COUNTERS.lru_mark_calls),
         lru_mark_scan_steps: load(&COUNTERS.lru_mark_scan_steps),
@@ -1364,6 +1483,25 @@ pub fn print_summary_if_enabled() {
         cap_range,
         s.splitter_result_submits,
         s.splitter_result_dispatches,
+    );
+    let _ = writeln!(
+        out,
+        "qwen3.8 PLE: gathers={} tokens={} row_requests={} unique_rows={} duplicate_rows={} logical_4KiB_pages={} output={} parallel_gathers={} plan={} mmap_dequant={} residual_waits={} residual_wait={} uploads={} upload_bytes={} upload_time={}",
+        s.ple_gathers,
+        s.ple_tokens,
+        s.ple_row_requests,
+        s.ple_unique_rows,
+        s.ple_row_requests.saturating_sub(s.ple_unique_rows),
+        s.ple_logical_pages,
+        fmt_bytes(s.ple_output_bytes),
+        s.ple_parallel_gathers,
+        fmt_ns(s.ple_plan_ns),
+        fmt_ns(s.ple_work_ns),
+        s.ple_waits,
+        fmt_ns(s.ple_wait_ns),
+        s.ple_uploads,
+        fmt_bytes(s.ple_upload_bytes),
+        fmt_ns(s.ple_upload_ns),
     );
     let _ = writeln!(
         out,

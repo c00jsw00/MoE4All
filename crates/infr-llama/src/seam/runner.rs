@@ -7091,8 +7091,16 @@ pub(crate) fn generate_dense_backend(
                                 let b = be
                                     .alloc(rows.len() * 4, BufferUsage::Staging)
                                     .map_err(|e| anyhow!("{e}"))?;
-                                be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
+                                let upload_t0 = infr_core::pager_profile::start();
+                                be.upload(b.as_ref(), bytemuck::cast_slice(rows.as_slice()))
                                     .map_err(|e| anyhow!("{e}"))?;
+                                if let Some(elapsed) = infr_core::pager_profile::elapsed(upload_t0)
+                                {
+                                    infr_core::pager_profile::record_ple_upload(
+                                        rows.len() * 4,
+                                        elapsed,
+                                    );
+                                }
                                 Some(b)
                             } else {
                                 None
@@ -7696,8 +7704,12 @@ pub(crate) fn generate_dense_backend(
                     ple_buf.len_bytes()
                 ));
             }
-            be.upload(ple_buf.as_ref(), bytemuck::cast_slice(&ple_rows))
+            let upload_t0 = infr_core::pager_profile::start();
+            be.upload(ple_buf.as_ref(), bytemuck::cast_slice(ple_rows.as_slice()))
                 .map_err(|e| anyhow!("{e}"))?;
+            if let Some(elapsed) = infr_core::pager_profile::elapsed(upload_t0) {
+                infr_core::pager_profile::record_ple_upload(ple_rows.len() * 4, elapsed);
+            }
 
             let (g1, h1) = build(
                 1,
