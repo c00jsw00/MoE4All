@@ -3752,19 +3752,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     planned_pager_budget as f64 / GIB_F64,
                     elastic_reserve as f64 / GIB_F64,
                 );
-                let host_tier = if let MoeHostBacking::Bounded {
+                let file_io: std::sync::Arc<dyn infr_core::blockio::BlockIo> = std::sync::Arc::new(
+                    infr_core::blockio::FileBlockIo::open_shards(&g.shards())
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                let (host_tier, host_store_io) = if let MoeHostBacking::Bounded {
                     bytes: host_cache_budget,
                 } = host_backing
                 {
-                    let io = std::sync::Arc::new(
-                        infr_core::blockio::FileBlockIo::open_shards(&g.shards())
-                            .map_err(|e| anyhow!("{e}"))?,
-                    );
                     let tier = std::sync::Arc::new(
                         infr_core::hostpager::InclusiveHostTier::new(
                             host_cache_budget,
                             &host_classes,
-                            io,
+                            std::sync::Arc::clone(&file_io),
                         )
                         .map_err(|e| anyhow!("{e}"))?,
                     );
@@ -3774,9 +3774,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         tier.budget_bytes() as f64 / GIB_F64,
                         tier.classes().len(),
                     );
-                    Some(tier)
+                    (Some(tier), None)
                 } else {
-                    None
+                    (None, Some(file_io))
                 };
                 let registrations = std::mem::take(&mut *pending.lock().unwrap());
                 if let Some(tier) = &host_tier {
@@ -3787,6 +3787,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     n_blocks,
                     pools,
                     host_tier: host_tier.clone(),
+                    host_store_io,
                     dynamic_state_reserve_bytes: plan.dynamic_state_reserve_bytes,
                     dynamic_state_max_allocation_bytes,
                     prefill_min_lane_bytes,

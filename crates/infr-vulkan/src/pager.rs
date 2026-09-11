@@ -42,7 +42,7 @@ use ash::vk;
 use indicatif::ProgressBar;
 
 use infr_core::backend::{Buffer, BufferUsage};
-use infr_core::blockio::BlockDesc;
+use infr_core::blockio::{BlockDesc, BlockIo};
 use infr_core::error::Result;
 use infr_core::hostpager::{
     AlignedHostBuffer, HostPager, InclusiveBlockState, InclusiveHostCache, InclusiveHostTier,
@@ -1458,9 +1458,9 @@ fn stats_suffix(s: &PagerStats) -> String {
 }
 
 /// Load-time description of one paged layer's per-role expert bank. In full-RAM mode `register`
-/// copies it once into the session's CPU-only layer-major store. In bounded-RAM mode the seam
-/// registers the individual block descriptors after fixed GPU uploads and before calling
-/// `register` here.
+/// reads its file descriptor directly into the session's CPU-only layer-major store. In
+/// bounded-RAM mode the seam registers the individual block descriptors after fixed GPU uploads
+/// and before calling `register` here.
 pub struct ExpertSource {
     pub bank: Arc<dyn AsRef<[u8]> + Send + Sync>,
     pub stride_bytes: usize,
@@ -1471,8 +1471,9 @@ pub struct ExpertSource {
     pub layer_base: u32,
     /// Byte offset assigned by the seam's layer-major permanent host-store plan.
     pub host_offset: usize,
-    /// Exact file descriptor of this whole role bank. Present in bounded-RAM mode and validated
-    /// against the per-expert descriptors used to assemble Prefill banks from RAM plus SSD misses.
+    /// Exact file descriptor of this whole role bank. The full store reads it directly rather than
+    /// faulting GGUF mmap pages; bounded mode validates it against the per-expert descriptors used
+    /// to assemble Prefill banks from RAM plus SSD misses.
     pub file: Option<BlockDesc>,
 }
 
@@ -1506,15 +1507,18 @@ impl HostStoreChunk {
             .then(|| unsafe { self.bytes.slice(offset, len) })
     }
 
-    fn copy_from_slice(&self, offset: usize, src: &[u8]) -> Result<()> {
-        let dst = offset
-            .checked_add(src.len())
+    fn read_block(&self, offset: usize, desc: &BlockDesc, io: &dyn BlockIo) -> Result<()> {
+        let len = desc.nbytes();
+        let dst_end = offset
+            .checked_add(len)
             .filter(|&end| end <= self.bytes.len())
-            .ok_or_else(|| be("host-store copy range out of bounds"))?;
-        let len = dst - offset;
-        debug_assert_eq!(len, src.len());
-        unsafe { self.bytes.copy_from_slice(offset, src) };
-        Ok(())
+            .ok_or_else(|| be("host-store file-read range out of bounds"))?;
+        debug_assert_eq!(dst_end - offset, len);
+        // Registration is single-threaded before graph construction, and the seam assigns every
+        // expert bank a disjoint destination range. Reading directly into that final range avoids
+        // faulting the same bank through GGUF mmap while a second anonymous copy is being built.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.bytes.as_ptr().add(offset), len) };
+        io.read_block(desc, dst)
     }
 }
 
@@ -1811,6 +1815,10 @@ pub struct MoePagerSession {
     /// Bounded RAM/SSD owner. Size classes retain independent LRUs, while this object freezes their
     /// shared budget and lifetime for the model session. `None` selects the full host store above.
     _host_tier: Option<Arc<InclusiveHostTier>>,
+    /// File reader used only to populate the permanent full-RAM store. Keeping this separate from
+    /// the GGUF mapping prevents Windows from making both the mapped source pages and the final
+    /// anonymous Host Store resident during load.
+    host_store_io: Option<Arc<dyn BlockIo>>,
     /// Frozen host-to-device routes for this session. The pager submits opaque source/target
     /// requests through it and never branches on mapped memory, host import or staging details.
     transfer_plan: Arc<SessionTransferPlan>,
@@ -1901,6 +1909,9 @@ pub struct MoePagerLayout {
     /// One bounded RAM/SSD tier shared by all size classes. `None` selects the permanent full-RAM
     /// host store described by `host_chunks`.
     pub host_tier: Option<Arc<InclusiveHostTier>>,
+    /// Positioned file reader for populating a permanent full-RAM store without touching GGUF mmap
+    /// pages. Required when a full-store expert bank is registered; unused by the bounded tier.
+    pub host_store_io: Option<Arc<dyn BlockIo>>,
     /// Maximum lazily committed KV/QSA bytes. The unified arena reserves this low-address
     /// corridor logically while allowing Expert filler to occupy uncommitted cells.
     pub dynamic_state_reserve_bytes: u64,
@@ -2092,6 +2103,7 @@ impl MoePagerSession {
             role_stride: layout.n_blocks,
             host_store,
             _host_tier: layout.host_tier,
+            host_store_io: layout.host_store_io,
             transfer_plan: Arc::new(transfer_plan),
             prefill_host_worker_ready,
             pending_transfer_sources: transfer_sources,
@@ -2243,31 +2255,30 @@ impl MoePagerSession {
                     source.stride_bytes, role,
                 ))
             })?;
-        let bank = expert_bytes(&source.bank);
         let expected = source
             .stride_bytes
             .checked_mul(n_expert)
             .ok_or_else(|| be("moe pager: expert bank byte size overflow"))?;
-        if bank.len() != expected {
+        let bank_bytes = expert_bytes(&source.bank).len();
+        if bank_bytes != expected {
             return Err(be(format!(
-                "moe pager: bank is {} bytes, expected {n_expert} x {} = {expected}",
-                bank.len(),
+                "moe pager: bank is {bank_bytes} bytes, expected {n_expert} x {} = {expected}",
+                source.stride_bytes,
+            )));
+        }
+        let file = source
+            .file
+            .as_ref()
+            .ok_or_else(|| be("moe pager: expert bank has no file descriptor"))?;
+        if file.nbytes() != expected {
+            return Err(be(format!(
+                "moe pager: bank file descriptor is {} bytes, expected {n_expert} x {} = {expected}",
+                file.nbytes(),
                 source.stride_bytes,
             )));
         }
         let block_base = (role.index() * self.role_stride) as u32 + source.layer_base;
         let (host_chunk, chunk_offset) = if let Some(host) = &self.pools[pool].host {
-            let file = source
-                .file
-                .clone()
-                .ok_or_else(|| be("moe pager: bounded-RAM expert bank has no file descriptor"))?;
-            if file.nbytes() != bank.len() {
-                return Err(be(format!(
-                    "moe pager: bank file descriptor is {} bytes, expected {}",
-                    file.nbytes(),
-                    bank.len(),
-                )));
-            }
             for expert in 0..n_expert as u32 {
                 let id = block_base + expert;
                 if host.block_bytes(id) != Some(source.stride_bytes) {
@@ -2279,9 +2290,13 @@ impl MoePagerSession {
             }
             (None, 0)
         } else {
+            let io =
+                Arc::clone(self.host_store_io.as_ref().ok_or_else(|| {
+                    be("moe pager: permanent host store has no direct file reader")
+                })?);
             let end = source
                 .host_offset
-                .checked_add(bank.len())
+                .checked_add(expected)
                 .ok_or_else(|| be("moe pager: host-store offset overflow"))?;
             let (host_chunk, chunk) = self
                 .host_store
@@ -2298,11 +2313,7 @@ impl MoePagerSession {
                     ))
                 })?;
             let chunk_offset = source.host_offset - chunk.base_offset;
-            let copy_t0 = pager_profile::active().then(std::time::Instant::now);
-            chunk.copy_from_slice(chunk_offset, bank)?;
-            if let Some(t0) = copy_t0 {
-                pager_profile::record_memcpy(bank.len(), t0.elapsed());
-            }
+            chunk.read_block(chunk_offset, file, io.as_ref())?;
             (Some(host_chunk), chunk_offset)
         };
         self.sources.insert(
@@ -2316,7 +2327,7 @@ impl MoePagerSession {
                     block_base,
                     host_chunk,
                     host_offset: chunk_offset,
-                    bank_bytes: bank.len(),
+                    bank_bytes: expected,
                 },
             ),
         );
@@ -4010,6 +4021,48 @@ pub type DensePagerCell = Mutex<Option<DensePagerSession>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PatternBlockIo;
+
+    impl BlockIo for PatternBlockIo {
+        fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+            let len = desc.nbytes();
+            if dst.len() < len {
+                return Err(be("test destination is too short"));
+            }
+            for (index, byte) in dst[..len].iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(17).wrapping_add(3);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn full_host_store_reads_directly_into_the_final_range() {
+        let chunk = HostStoreChunk {
+            base_offset: 1024,
+            bytes: AlignedHostBuffer::new(32).expect("host store"),
+        };
+        let desc = BlockDesc {
+            id: 7,
+            extents: vec![
+                infr_core::blockio::BlockExtent { offset: 40, len: 3 },
+                infr_core::blockio::BlockExtent { offset: 90, len: 5 },
+            ],
+        };
+
+        chunk
+            .read_block(7, &desc, &PatternBlockIo)
+            .expect("direct host-store read");
+
+        assert_eq!(chunk.range(0, 7).unwrap(), &[0; 7]);
+        assert_eq!(
+            chunk.range(7, 8).unwrap(),
+            &[3, 20, 37, 54, 71, 88, 105, 122]
+        );
+        assert_eq!(chunk.range(15, 17).unwrap(), &[0; 17]);
+        assert!(chunk.read_block(25, &desc, &PatternBlockIo).is_err());
+    }
 
     // ── #4: GpuPager::new dimension validation returns Err (not panic) on bad input ──────────────
     #[test]
