@@ -3029,24 +3029,18 @@ impl MoePagerSession {
 
     /// Return one bit per routed slot whose expert is resident in every supplied role. This is a
     /// read-only Decode scheduling query used to launch complete hit triplets while the remaining
-    /// experts are promoted. All roles must share one physical size pool so a single pager epoch
-    /// can protect the in-flight hit slots from the later miss insertions.
+    /// experts are promoted. Each role's size pool opens its own pager epoch before those hits are
+    /// touched, protecting every in-flight role from later miss insertions.
     pub fn routed_roles_resident_mask(&self, buf_ids: &[usize], ids: &[u32]) -> Result<u32> {
         if ids.len() > u32::BITS as usize {
             return Err(be("moe pager: routed residency mask exceeds 32 slots"));
         }
         let mut resolved = Vec::with_capacity(buf_ids.len());
-        let mut common_pool = None;
         for &buf_id in buf_ids {
             let (_, pool, src) = self
                 .sources
                 .get(&buf_id)
                 .ok_or_else(|| be("moe pager: residency mask queried an unregistered buffer"))?;
-            match common_pool {
-                Some(existing) if existing != *pool => return Ok(0),
-                None => common_pool = Some(*pool),
-                _ => {}
-            }
             resolved.push((*pool, src.block_base));
         }
         let mut mask = 0u32;
@@ -3166,9 +3160,34 @@ impl MoePagerSession {
         Ok(())
     }
 
-    /// Open one epoch for several roles that share the same logical size pool. Gate, Up and Down
-    /// then remain eviction-protected until the complete routed set has been resolved, even though
-    /// their bytes may live in unrelated physical arenas.
+    /// Open one epoch in every logical size pool used by the supplied roles. Gate, Up and Down then
+    /// remain eviction-protected until the complete routed set has been resolved, including models
+    /// whose Down blocks use a different size class from Gate/Up.
+    pub fn begin_role_batches(&mut self, buf_ids: &[usize]) -> Result<bool> {
+        for &buf_id in buf_ids {
+            self.sources
+                .get(&buf_id)
+                .ok_or_else(|| be("moe pager: role begin_batch on an unregistered buffer"))?;
+        }
+        if buf_ids.is_empty() {
+            return Ok(false);
+        }
+        for (role_idx, &buf_id) in buf_ids.iter().enumerate() {
+            let pool_idx = self.sources[&buf_id].1;
+            let already_open = buf_ids[..role_idx]
+                .iter()
+                .any(|previous| self.sources[previous].1 == pool_idx);
+            if already_open {
+                continue;
+            }
+            self.pools[pool_idx].pager.begin_batch();
+        }
+        Ok(true)
+    }
+
+    /// Open one epoch for several roles only when they share a logical size pool. This is the
+    /// original combined-role path used by ordinary paging; cross-pool batching is reserved for
+    /// the Decode hit-first schedule that explicitly protects every involved pool.
     pub fn begin_shared_batch(&mut self, buf_ids: &[usize]) -> Result<bool> {
         let mut pool_idx = None;
         for &buf_id in buf_ids {
@@ -3202,11 +3221,10 @@ impl MoePagerSession {
         self.push_roles_cpu(executor, &[(buf_id, local_ids)], scan)
     }
 
-    /// Resolve several roles from one shared size pool in caller order, then move all resulting
-    /// misses as one transfer batch. This preserves the exact LRU/LUT decisions of repeated
-    /// [`Self::push_role_cpu`] calls while allowing split Gate/Up/Down banks to share one deeper
-    /// full-RAM, bounded-RAM or SSD-to-device batch. The caller must have opened one shared pager
-    /// epoch first.
+    /// Resolve several roles in caller order within each independent size pool, then move all
+    /// resulting misses as one transfer batch. This preserves each pool's exact LRU/LUT decisions
+    /// while allowing differently-sized Gate/Up/Down banks to share one full-RAM, bounded-RAM or
+    /// SSD-to-device batch. The caller must have opened one epoch for every involved pool first.
     pub(crate) fn push_roles_cpu<E: TransferExecutor>(
         &mut self,
         executor: &E,
@@ -3245,12 +3263,6 @@ impl MoePagerSession {
                 local_ids,
             ));
         }
-        let pool_idx = resolved[0].1;
-        if resolved.iter().any(|entry| entry.1 != pool_idx) {
-            return Err(be(
-                "moe pager: cross-role CPU push spans multiple size pools",
-            ));
-        }
         let requested = resolved.iter().map(|entry| entry.7.len()).sum();
         let trace_call = self.trace.as_mut().map(PagerTrace::begin_call);
         let Self {
@@ -3261,100 +3273,134 @@ impl MoePagerSession {
             ..
         } = self;
         let transfer_plan = Arc::clone(transfer_plan);
-        let pool = &mut pools[pool_idx];
         let mut transfer = PreparedTransfer::default();
         let mut transfer_bytes = 0usize;
-        if let Some(host) = pool.host.as_ref().cloned() {
-            // Resolve in the original order first: this preserves exact GPU-LRU victim selection
-            // and LUT contents. Only the resulting independent byte moves run in parallel.
-            let mut promotions = Vec::with_capacity(requested);
-            let mut targets = Vec::with_capacity(requested);
-            for &(role, _, stride, block_base, layer, _, _, local_ids) in &resolved {
-                for &lid in local_ids {
-                    let id = block_base + lid;
-                    let plan = pool.pager.plan_inclusive_cpu_push(
-                        id,
-                        pool.exchange_slot
-                            .as_mut()
-                            .expect("tiered pool has an exchange slot"),
-                        scan,
-                    )?;
-                    if let (Some(trace), Some(call)) = (trace.as_mut(), trace_call) {
-                        trace.records.push(PagerTraceRecord {
-                            call,
-                            pool: pool_idx as u32,
-                            layer,
-                            expert: lid,
-                            block_id: id,
-                            bytes: stride.min(u32::MAX as usize) as u32,
-                            evicted: plan
-                                .as_ref()
-                                .and_then(|plan| plan.evicted)
-                                .unwrap_or(TRACE_NO_EVICTION),
-                            role,
-                            gpu_hit: plan.is_none(),
-                        });
-                    }
-                    let Some(plan) = plan else {
-                        continue;
-                    };
-                    transfer_bytes = transfer_bytes.saturating_add(stride);
-                    let target = targets.len();
-                    targets.push(plan.target);
-                    promotions.push((id, plan.evicted, target));
-                }
-            }
-            let collected = std::sync::Mutex::new(PreparedTransfer::default());
-            host.promote_batch(&promotions, |bytes, target| {
-                let mut local = PreparedTransfer::default();
-                transfer_plan.prepare_upload(executor, bytes, &targets[target], &mut local)?;
-                collected.lock().unwrap().append(local);
-                Ok(())
-            })?;
-            transfer.append(collected.into_inner().unwrap());
-        } else {
-            for &(role, _, stride, block_base, layer, host_chunk, host_base, local_ids) in &resolved
+        let mut resident_uploads: Vec<(&[u8], DeviceTransferTarget)> = Vec::new();
+        for first_role_idx in 0..resolved.len() {
+            let pool_idx = resolved[first_role_idx].1;
+            if resolved[..first_role_idx]
+                .iter()
+                .any(|entry| entry.1 == pool_idx)
             {
-                for &lid in local_ids {
-                    let local = lid as usize;
-                    let id = block_base + lid;
-                    let host_chunk = host_chunk
-                        .ok_or_else(|| be("moe pager: resident Host Store source has no chunk"))?;
-                    let src = host_base
-                        .checked_add(local.saturating_mul(stride))
-                        .ok_or_else(|| be("moe pager: expert host offset overflow"))?;
-                    let plan = pool.pager.plan_cpu_push(id, scan)?;
-                    if let (Some(trace), Some(call)) = (trace.as_mut(), trace_call) {
-                        trace.records.push(PagerTraceRecord {
-                            call,
-                            pool: pool_idx as u32,
-                            layer,
-                            expert: lid,
-                            block_id: id,
-                            bytes: stride.min(u32::MAX as usize) as u32,
-                            evicted: plan
-                                .as_ref()
-                                .and_then(|plan| plan.evicted)
-                                .unwrap_or(TRACE_NO_EVICTION),
-                            role,
-                            gpu_hit: plan.is_none(),
-                        });
+                continue;
+            }
+            let pool = &mut pools[pool_idx];
+            let pool_requested = resolved
+                .iter()
+                .filter(|entry| entry.1 == pool_idx)
+                .map(|entry| entry.7.len())
+                .sum();
+            if let Some(host) = pool.host.as_ref().cloned() {
+                // Resolve in caller order within this pool first: pools have independent LRUs, so
+                // grouping them cannot change victim selection or LUT contents.
+                let mut promotions = Vec::with_capacity(pool_requested);
+                let mut targets = Vec::with_capacity(pool_requested);
+                for &(role, role_pool, stride, block_base, layer, _, _, local_ids) in &resolved {
+                    if role_pool != pool_idx {
+                        continue;
                     }
-                    if let Some(plan) = plan {
-                        transfer_bytes = transfer_bytes.saturating_add(stride);
-                        let bytes = host_store[host_chunk]
-                            .range(src, stride)
-                            .ok_or_else(|| be("moe pager: expert CPU-store range out of bounds"))?;
-                        transfer_plan.prepare_upload(
-                            executor,
-                            bytes,
-                            &plan.target,
-                            &mut transfer,
+                    for &lid in local_ids {
+                        let id = block_base + lid;
+                        let plan = pool.pager.plan_inclusive_cpu_push(
+                            id,
+                            pool.exchange_slot
+                                .as_mut()
+                                .expect("tiered pool has an exchange slot"),
+                            scan,
                         )?;
+                        if let (Some(trace), Some(call)) = (trace.as_mut(), trace_call) {
+                            trace.records.push(PagerTraceRecord {
+                                call,
+                                pool: pool_idx as u32,
+                                layer,
+                                expert: lid,
+                                block_id: id,
+                                bytes: stride.min(u32::MAX as usize) as u32,
+                                evicted: plan
+                                    .as_ref()
+                                    .and_then(|plan| plan.evicted)
+                                    .unwrap_or(TRACE_NO_EVICTION),
+                                role,
+                                gpu_hit: plan.is_none(),
+                            });
+                        }
+                        let Some(plan) = plan else {
+                            continue;
+                        };
+                        transfer_bytes = transfer_bytes.saturating_add(stride);
+                        let target = targets.len();
+                        targets.push(plan.target);
+                        promotions.push((id, plan.evicted, target));
+                    }
+                }
+                let collected = std::sync::Mutex::new(PreparedTransfer::default());
+                host.promote_batch(&promotions, |bytes, target| {
+                    let mut local = PreparedTransfer::default();
+                    transfer_plan.prepare_upload(executor, bytes, &targets[target], &mut local)?;
+                    collected.lock().unwrap().append(local);
+                    Ok(())
+                })?;
+                transfer.append(collected.into_inner().unwrap());
+            } else {
+                for &(
+                    role,
+                    role_pool,
+                    stride,
+                    block_base,
+                    layer,
+                    host_chunk,
+                    host_base,
+                    local_ids,
+                ) in &resolved
+                {
+                    if role_pool != pool_idx {
+                        continue;
+                    }
+                    for &lid in local_ids {
+                        let local = lid as usize;
+                        let id = block_base + lid;
+                        let host_chunk = host_chunk.ok_or_else(|| {
+                            be("moe pager: resident Host Store source has no chunk")
+                        })?;
+                        let src = host_base
+                            .checked_add(local.saturating_mul(stride))
+                            .ok_or_else(|| be("moe pager: expert host offset overflow"))?;
+                        let plan = pool.pager.plan_cpu_push(id, scan)?;
+                        if let (Some(trace), Some(call)) = (trace.as_mut(), trace_call) {
+                            trace.records.push(PagerTraceRecord {
+                                call,
+                                pool: pool_idx as u32,
+                                layer,
+                                expert: lid,
+                                block_id: id,
+                                bytes: stride.min(u32::MAX as usize) as u32,
+                                evicted: plan
+                                    .as_ref()
+                                    .and_then(|plan| plan.evicted)
+                                    .unwrap_or(TRACE_NO_EVICTION),
+                                role,
+                                gpu_hit: plan.is_none(),
+                            });
+                        }
+                        if let Some(plan) = plan {
+                            transfer_bytes = transfer_bytes.saturating_add(stride);
+                            let bytes =
+                                host_store[host_chunk].range(src, stride).ok_or_else(|| {
+                                    be("moe pager: expert CPU-store range out of bounds")
+                                })?;
+                            resident_uploads.push((bytes, plan.target));
+                        }
                     }
                 }
             }
         }
+        transfer_plan.prepare_upload_batch(
+            executor,
+            resident_uploads
+                .iter()
+                .map(|(bytes, target)| (*bytes, target)),
+            &mut transfer,
+        )?;
         Ok(PreparedHostPush {
             requested,
             bytes: transfer_bytes,

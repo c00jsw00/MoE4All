@@ -8568,7 +8568,7 @@ fn execute_paged_moe<'a>(
         })
     };
     let mut active_mask = all_active_mask;
-    let mut shared_batch_preopened = false;
+    let mut role_batches_preopened = false;
     let mut promotion_probe = None;
     // Decode-only hit-first schedule: launch complete resident Gate/Up/Down triplets together with
     // the shared expert while every missing triplet is promoted. The original slot order is
@@ -8587,9 +8587,10 @@ fn execute_paged_moe<'a>(
             let sess = guard.as_ref().expect("paged execution requires a session");
             sess.routed_roles_resident_mask(&[gate_id, up_id, down_id], stage_ids.as_slice())?
         };
+        let miss_mask = routed_mask ^ hit_mask;
         // Without a shared expert, an empty hit set still has no useful first-stage work. With
         // one, shared-only is useful work and overlaps the all-miss host promotion as requested.
-        if hit_mask != routed_mask && (hit_mask != 0 || shared.is_some()) {
+        if miss_mask != 0 && (hit_mask != 0 || shared.is_some()) {
             let mut hit_ids = Vec::with_capacity(n_used);
             let mut miss_ids = Vec::with_capacity(n_used);
             for (slot, &expert) in stage_ids.iter().enumerate() {
@@ -8599,11 +8600,11 @@ fn execute_paged_moe<'a>(
                     miss_ids.push(expert);
                 }
             }
-            let (shared, hit_push) = {
+            let (role_batches_open, hit_push) = {
                 let mut guard = be_.moe_pager().lock().unwrap();
                 let sess = guard.as_mut().expect("paged execution requires a session");
-                let shared = sess.begin_shared_batch(&[gate_id, up_id, down_id])?;
-                let push = if shared && !hit_ids.is_empty() {
+                let role_batches_open = sess.begin_role_batches(&[gate_id, up_id, down_id])?;
+                let push = if role_batches_open && !hit_ids.is_empty() {
                     Some(sess.push_roles_cpu(
                         be_,
                         &[
@@ -8616,14 +8617,14 @@ fn execute_paged_moe<'a>(
                 } else {
                     None
                 };
-                (shared, push)
+                (role_batches_open, push)
             };
             if let Some(push) = hit_push {
                 // The residency mask makes this empty in the ordinary case. Explicitly consume it
                 // so a future concurrent pager can never silently drop an unexpected promotion.
                 push.complete_without_recorder(be_)?;
             }
-            if shared {
+            if role_batches_open {
                 let gate_hit_w =
                     stage_and_window(be_, rec, ps, gate_id, &[], n_expert, false, true)?;
                 let up_hit_w = stage_and_window(be_, rec, ps, up_id, &[], n_expert, false, true)?;
@@ -8746,8 +8747,8 @@ fn execute_paged_moe<'a>(
                 fresh.arena_stream_barrier();
                 *rec = Some(fresh);
                 stage_ids = miss_ids;
-                active_mask = routed_mask ^ hit_mask;
-                shared_batch_preopened = true;
+                active_mask = miss_mask;
+                role_batches_preopened = true;
             }
         }
     }
@@ -8759,7 +8760,7 @@ fn execute_paged_moe<'a>(
     rec.as_ref()
         .expect("segment always Some between ops")
         .arena_stream_barrier();
-    let shared_batch = if shared_batch_preopened {
+    let roles_batched = if role_batches_preopened {
         true
     } else if !layer_stream && !stage_ids.is_empty() && !*fused_gate_up {
         let mut guard = be_.moe_pager().lock().unwrap();
@@ -8768,9 +8769,8 @@ fn execute_paged_moe<'a>(
     } else {
         false
     };
-    // Resolve all roles before moving bytes whenever they share one physical pool. This preserves
-    // one pager epoch and one transfer batch for full-RAM, bounded-RAM and SSD backing alike.
-    let roles_batched = shared_batch;
+    // Resolve every role under its size pool's epoch, then combine all full-RAM, bounded-RAM or
+    // SSD-backed moves into one transfer batch.
     if roles_batched {
         let overlap = if let Some(probe) = promotion_probe {
             if infr_core::pager_profile::active() {
@@ -8847,7 +8847,7 @@ fn execute_paged_moe<'a>(
             role_stage_ids,
             n_expert,
             touch_all,
-            shared_batch,
+            roles_batched,
         )?
     };
     let up_w = if *fused_gate_up {
@@ -8863,7 +8863,7 @@ fn execute_paged_moe<'a>(
             role_stage_ids,
             n_expert,
             touch_all,
-            shared_batch,
+            roles_batched,
         )?
     };
     let down_w = if layer_stream {

@@ -470,6 +470,64 @@ impl SessionTransferPlan {
         Ok(())
     }
 
+    /// Prepare several independent uploads while their source slices are all live. Imported-host
+    /// ranges keep their DMA path; ordinary mapped destinations are copied as one parallel host
+    /// batch instead of serialising sub-MiB expert writes that individually sit below
+    /// [`parallel_copy_to_mapped`]'s chunk threshold.
+    pub(crate) fn prepare_upload_batch<'a, 'b, E, I>(
+        &self,
+        executor: &E,
+        uploads: I,
+        prepared: &mut PreparedTransfer,
+    ) -> Result<()>
+    where
+        E: TransferExecutor,
+        I: IntoIterator<Item = (&'a [u8], &'b DeviceTransferTarget)>,
+    {
+        let mut mapped = Vec::new();
+        for (src, target) in uploads {
+            if src.len() != target.len() {
+                return Err(be(format!(
+                    "host upload has {} bytes but its device target has {}",
+                    src.len(),
+                    target.len()
+                )));
+            }
+            if self.append_imported(src, target, prepared) {
+                continue;
+            }
+            if let Some(dst) = target.mapped_ptr() {
+                mapped.push(MappedHostCopy {
+                    src: src.as_ptr() as usize,
+                    dst: dst as usize,
+                    len: src.len(),
+                });
+                continue;
+            }
+            let (source, source_ptr, dedicated) = executor.materialize_staging(src)?;
+            prepared.copies.push(PreparedCopy {
+                source,
+                source_offset: 0,
+                source_ptr,
+                target: target.clone(),
+                len: src.len(),
+                dedicated: dedicated && target.dedicated_compatible,
+            });
+        }
+
+        if !mapped.is_empty() {
+            let started = pager_profile::active().then(std::time::Instant::now);
+            parallel_copy_to_mapped_batch(&mapped);
+            if let Some(t0) = started {
+                let bytes = mapped
+                    .iter()
+                    .fold(0usize, |total, copy| total.saturating_add(copy.len));
+                pager_profile::record_memcpy_batch(mapped.len(), bytes, t0.elapsed());
+            }
+        }
+        Ok(())
+    }
+
     fn append_imported(
         &self,
         src: &[u8],
@@ -843,6 +901,27 @@ pub(crate) fn parallel_copy_to_mapped(src: &[u8], dst: *mut u8) {
                 chunk.len(),
             );
         });
+}
+
+#[derive(Clone, Copy)]
+struct MappedHostCopy {
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+fn parallel_copy_to_mapped_batch(copies: &[MappedHostCopy]) {
+    use rayon::prelude::*;
+
+    if let [copy] = copies {
+        unsafe {
+            std::ptr::copy_nonoverlapping(copy.src as *const u8, copy.dst as *mut u8, copy.len)
+        };
+        return;
+    }
+    copies.par_iter().for_each(|copy| unsafe {
+        std::ptr::copy_nonoverlapping(copy.src as *const u8, copy.dst as *mut u8, copy.len);
+    });
 }
 
 /// A byte range that can be consumed by Vulkan. `mapped_ptr` points at the start of this exact
@@ -1293,7 +1372,9 @@ mod tests {
 
     use infr_core::backend::Buffer;
 
-    use super::SessionTransferPlan;
+    use super::{
+        parallel_copy_to_mapped_batch, timestamp_delta_ns, MappedHostCopy, SessionTransferPlan,
+    };
     use crate::{ImportedHostAllocation, ImportedHostShard};
 
     struct DummyBuffer(usize);
@@ -1305,6 +1386,35 @@ mod tests {
 
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+    }
+
+    #[test]
+    fn timestamp_delta_masks_wrapped_queue_ticks() {
+        assert_eq!(timestamp_delta_ns(100, 140, 64, 2.0), 80);
+        assert_eq!(timestamp_delta_ns(250, 5, 8, 1.0), 11);
+        assert_eq!(timestamp_delta_ns(1, 2, 0, 1.0), 0);
+    }
+
+    #[test]
+    fn mapped_host_batch_copies_disjoint_ranges_exactly() {
+        let sources = [vec![0x17u8; 257], vec![0x5cu8; 513], vec![0xe1u8; 129]];
+        let offsets = [0usize, 320, 896];
+        let mut dst = vec![0u8; 1100];
+        let copies = sources
+            .iter()
+            .zip(offsets)
+            .map(|(src, offset)| MappedHostCopy {
+                src: src.as_ptr() as usize,
+                dst: unsafe { dst.as_mut_ptr().add(offset) } as usize,
+                len: src.len(),
+            })
+            .collect::<Vec<_>>();
+
+        parallel_copy_to_mapped_batch(&copies);
+
+        for (src, offset) in sources.iter().zip(offsets) {
+            assert_eq!(&dst[offset..offset + src.len()], src);
         }
     }
 
