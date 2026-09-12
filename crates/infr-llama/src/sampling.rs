@@ -292,7 +292,7 @@ impl StepGate {
 
     /// Block until this caller's ticket comes up. The returned [`GatePass`] releases the baton to
     /// the next ticket-holder on drop.
-    fn enter(&self) -> GatePass<'_> {
+    pub(crate) fn enter(&self) -> GatePass<'_> {
         let mut g = self.inner.lock().expect("step gate poisoned");
         let ticket = g.next;
         g.next += 1;

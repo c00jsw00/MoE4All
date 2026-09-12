@@ -35,12 +35,21 @@
 //! Slots are forked EAGERLY at startup (weights are shared through `Arc<SeamWeights>`; a fork costs
 //! only its own KV + IO buffers). That means a VRAM refusal happens at boot with a clear message,
 //! never halfway through serving.
+//!
+//! When `kv.session_cache_dir` is explicitly set, a background worker streams idle dynamic Q8 KV
+//! state to checksummed files and releases its physical 32K segments. A later prefix match restores
+//! that state into any free resident slot. This extends the number of retained conversations; it
+//! does not alter the token-granular GPU scheduling described above.
 
 use crate::sampling::{RequestCtx, StepGate};
 use crate::seam::SeamKv;
+use crate::session_cache::SessionCache;
 use crate::{Config, GenStats, SeamModel};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
@@ -166,6 +175,9 @@ struct Slot {
     busy: bool,
     /// LRU stamp.
     tick: u64,
+    /// Set only when the opt-in cold session cache is active. Ordinary serving does not read the
+    /// wall clock during slot selection or return.
+    idle_since: Option<Instant>,
 }
 
 /// The N-slot pool. Deliberately a plain `Mutex` + `Condvar` rather than the sequential
@@ -197,21 +209,153 @@ impl Drop for SlotGuard<'_> {
         s.kv = self.kv.take();
         s.busy = false;
         s.tick = tick;
+        if self.engine.session_cache.is_some() {
+            s.idle_since = Some(Instant::now());
+        }
         drop(p);
-        self.engine.freed.notify_one();
+        if self.engine.session_cache.is_some() {
+            // Both a queued request and the deadline worker may be asleep on this condition.
+            self.engine.freed.notify_all();
+        } else {
+            self.engine.freed.notify_one();
+        }
+    }
+}
+
+struct ColdWorker {
+    stop: Arc<AtomicBool>,
+    wake: Arc<Condvar>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for ColdWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!("cold KV maintenance thread panicked while shutting down");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cold_session_worker(
+    pool: Arc<Mutex<Pool>>,
+    wake: Arc<Condvar>,
+    cache: Arc<Mutex<SessionCache>>,
+    backend: Arc<infr_vulkan::VulkanBackend>,
+    gate: Option<Arc<StepGate>>,
+    model_cfg: Config,
+    idle_for: Duration,
+    stop: Arc<AtomicBool>,
+) {
+    loop {
+        let selected = {
+            let mut pool_guard = match pool.lock() {
+                Ok(pool) => pool,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    break None;
+                }
+                let now = Instant::now();
+                let mut next_wait: Option<Duration> = None;
+                let mut candidate: Option<usize> = None;
+                for (index, slot) in pool_guard.slots.iter().enumerate() {
+                    let Some(idle_since) = slot.idle_since else {
+                        continue;
+                    };
+                    if slot.busy || slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0) {
+                        continue;
+                    }
+                    let elapsed = now.saturating_duration_since(idle_since);
+                    if elapsed >= idle_for {
+                        if candidate.is_none_or(|old| slot.tick < pool_guard.slots[old].tick) {
+                            candidate = Some(index);
+                        }
+                    } else {
+                        let remaining = idle_for - elapsed;
+                        next_wait = Some(next_wait.map_or(remaining, |old| old.min(remaining)));
+                    }
+                }
+                if let Some(index) = candidate {
+                    pool_guard.slots[index].busy = true;
+                    pool_guard.slots[index].idle_since = None;
+                    let kv = pool_guard.slots[index]
+                        .kv
+                        .take()
+                        .expect("cold candidate has a resident KV slot");
+                    break Some((index, kv));
+                }
+                pool_guard = match next_wait {
+                    Some(timeout) => {
+                        wake.wait_timeout(pool_guard, timeout)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .0
+                    }
+                    None => wake
+                        .wait(pool_guard)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                };
+            }
+        };
+        let Some((index, mut kv)) = selected else {
+            break;
+        };
+
+        if !stop.load(Ordering::Acquire) {
+            let _gate = gate.as_deref().map(StepGate::enter);
+            if !stop.load(Ordering::Acquire) {
+                let mut cache = match cache.lock() {
+                    Ok(cache) => cache,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                match cache.spill(&mut kv, backend.as_ref(), &model_cfg) {
+                    Ok(true) => {}
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        slot = index,
+                        "cold KV idle spill failed; keeping the resident state: {error}"
+                    ),
+                }
+                if let Err(error) = cache.gc() {
+                    tracing::warn!("cold KV cache maintenance failed: {error}");
+                }
+            }
+        }
+
+        let mut pool_guard = match pool.lock() {
+            Ok(pool) => pool,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let slot = &mut pool_guard.slots[index];
+        slot.kv = Some(kv);
+        slot.busy = false;
+        slot.idle_since = Some(Instant::now());
+        drop(pool_guard);
+        wake.notify_all();
     }
 }
 
 /// The concurrent seam engine. `Sync`: `&self` is all a request needs, so N of them run at once.
 pub struct ParallelSeam {
+    /// Declared first so its `Drop` joins the maintenance thread before model/backend fields drop.
+    cold_worker: Option<ColdWorker>,
     model: SeamModel,
-    vk: infr_vulkan::VulkanBackend,
-    pool: Mutex<Pool>,
+    vk: Arc<infr_vulkan::VulkanBackend>,
+    pool: Arc<Mutex<Pool>>,
     /// Signalled when a slot is returned — a queued request waits here.
-    freed: Condvar,
+    freed: Arc<Condvar>,
     /// The GPU baton. `None` when `n_slots == 1`: a lone sequence must not pay even a mutex per
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
+    /// Opt-in disk-backed conversation catalog. `None` keeps the pre-existing checkout path
+    /// byte-for-byte isolated from file I/O and cache locking.
+    session_cache: Option<Arc<Mutex<SessionCache>>>,
+    session_idle: Duration,
     max_ctx: usize,
     /// This model's OWN placement pins (pinned prefill chunk / auto-q8 KV — see
     /// [`crate::seam::PlacementPins`]). Per-engine so a multi-model host (`infr multi` runs N of
@@ -273,23 +417,93 @@ impl ParallelSeam {
         let pins = Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
+        let session_idle = Duration::from_secs(model.engine_cfg().kv.session_idle_secs);
         let mut engine = Self {
+            cold_worker: None,
             model,
-            vk,
-            pool: Mutex::new(Pool {
+            vk: Arc::new(vk),
+            pool: Arc::new(Mutex::new(Pool {
                 slots: Vec::new(),
                 tick: 0,
-            }),
-            freed: Condvar::new(),
+            })),
+            freed: Arc::new(Condvar::new()),
             // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
+            session_cache: None,
+            session_idle,
             max_ctx,
             pins,
         };
         engine.init_slots(n_slots)?;
+        engine.init_session_cache()?;
         drop(scope);
+        engine.start_cold_worker()?;
         Ok(engine)
+    }
+
+    fn init_session_cache(&mut self) -> Result<()> {
+        if self.model.engine_cfg().kv.session_cache_dir.is_none() {
+            return Ok(());
+        }
+        let (supports_release, meta) = {
+            let pool = self.pool.lock().expect("fresh pool");
+            let kv = pool
+                .slots
+                .first()
+                .and_then(|slot| slot.kv.as_ref())
+                .ok_or_else(|| anyhow!("cold KV cache initialized before slot 0"))?;
+            (kv.can_release_session_state(), kv.session_state_meta())
+        };
+        if !supports_release {
+            return Err(anyhow!(
+                "kv.session_cache_dir requires dynamic segmented KV; use Qwen3.5/3.6/3.8 with Q8 KV and leave kv.dynamic enabled"
+            ));
+        }
+        self.session_cache = SessionCache::open(self.model.engine_cfg(), self.model.gguf(), &meta)?
+            .map(|cache| Arc::new(Mutex::new(cache)));
+        if self.session_cache.is_some() {
+            let now = Instant::now();
+            for slot in &mut self.pool.lock().expect("fresh pool").slots {
+                slot.idle_since = Some(now);
+            }
+        }
+        Ok(())
+    }
+
+    fn start_cold_worker(&mut self) -> Result<()> {
+        let Some(cache) = self.session_cache.as_ref().map(Arc::clone) else {
+            return Ok(());
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let pool = Arc::clone(&self.pool);
+        let wake = Arc::clone(&self.freed);
+        let backend = Arc::clone(&self.vk);
+        let gate = self.gate.as_ref().map(Arc::clone);
+        let model_cfg = self.model.config().clone();
+        let idle = self.session_idle;
+        let thread = std::thread::Builder::new()
+            .name("infr-kv-cold".into())
+            .spawn(move || {
+                cold_session_worker(
+                    pool,
+                    wake,
+                    cache,
+                    backend,
+                    gate,
+                    model_cfg,
+                    idle,
+                    worker_stop,
+                )
+            })
+            .context("start cold KV maintenance thread")?;
+        self.cold_worker = Some(ColdWorker {
+            stop,
+            wake: Arc::clone(&self.freed),
+            thread: Some(thread),
+        });
+        Ok(())
     }
 
     pub fn fork_embedding_backend(&self) -> Result<infr_vulkan::VulkanBackend> {
@@ -365,7 +579,11 @@ impl ParallelSeam {
             // A fork shares the `Arc<SeamWeights>` — it costs only its own KV + IO buffers. If VRAM
             // refuses, say so HERE, at boot, with the two knobs that fix it. Never mid-request.
             let kv = slot0
-                .fork(&self.vk, self.model.config(), self.model.engine_cfg())
+                .fork(
+                    self.vk.as_ref(),
+                    self.model.config(),
+                    self.model.engine_cfg(),
+                )
                 .map_err(|e| {
                     anyhow!(
                         "could not allocate KV slot {}/{n_slots} at ctx {}: {e}\n\
@@ -378,6 +596,7 @@ impl ParallelSeam {
                 kv: Some(kv),
                 busy: false,
                 tick: 0,
+                idle_since: None,
             });
         }
         slots.insert(
@@ -386,9 +605,10 @@ impl ParallelSeam {
                 kv: Some(slot0),
                 busy: false,
                 tick: 0,
+                idle_since: None,
             },
         );
-        self.pool.get_mut().expect("fresh pool").slots = slots;
+        self.pool.lock().expect("fresh pool").slots = slots;
         tracing::info!(
             "slots: {n_slots} x {} ctx ready in {:.1}s",
             self.max_ctx,
@@ -437,6 +657,16 @@ impl ParallelSeam {
     /// recycled. So under load the prefix cache degrades gracefully (fewer candidate slots) rather
     /// than corrupting an in-flight sequence.
     fn checkout(&self, prompt: &[u32], req: &RequestCtx) -> Result<SlotGuard<'_>> {
+        if self.session_cache.is_some() {
+            self.checkout_with_cold_cache(prompt, req)
+        } else {
+            self.checkout_resident(prompt, req)
+        }
+    }
+
+    /// Original resident-only checkout path. Keeping it separate means an unset cold-cache path
+    /// does not add a file-cache mutex or wall-clock query to ordinary serving.
+    fn checkout_resident(&self, prompt: &[u32], req: &RequestCtx) -> Result<SlotGuard<'_>> {
         /// Seeding shorter prefixes than this isn't worth the copy submit.
         const MIN_SEED: usize = 16;
         let cfg: &Config = self.model.config();
@@ -499,7 +729,7 @@ impl ParallelSeam {
                         let r = {
                             let _gp = req.gate_pass();
                             match dst.as_mut() {
-                                Some(dst) => dst.seed_from(&self.vk, cfg, ec, &src, best_s),
+                                Some(dst) => dst.seed_from(self.vk.as_ref(), cfg, ec, &src, best_s),
                                 None => Ok(()),
                             }
                         };
@@ -534,10 +764,144 @@ impl ParallelSeam {
         }
     }
 
+    /// Disk-extended slot checkout. Cold storage is deliberately serialized independently of the
+    /// slot pool: a target is reserved under `pool`, then all GPU/file work runs after that lock is
+    /// dropped. The maintenance thread handles timeout eviction independently.
+    fn checkout_with_cold_cache(&self, prompt: &[u32], req: &RequestCtx) -> Result<SlotGuard<'_>> {
+        let cache_mutex = self
+            .session_cache
+            .as_ref()
+            .expect("cold checkout requires a session cache");
+        let cfg: &Config = self.model.config();
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            let free = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .collect::<Vec<_>>();
+            if free.is_empty() {
+                pool = self.freed.wait(pool).expect("pool poisoned");
+                continue;
+            }
+            let continuation = pick_continuation(
+                free.iter().filter_map(|&index| {
+                    pool.slots[index].kv.as_ref().and_then(|kv| {
+                        kv.continuation_prefix_len(prompt)
+                            .map(|prefix| (index, prefix, prefix))
+                    })
+                }),
+                prompt.len(),
+            );
+            let resident_prefix = continuation
+                .and_then(|index| {
+                    pool.slots[index]
+                        .kv
+                        .as_ref()
+                        .and_then(|kv| kv.continuation_prefix_len(prompt))
+                })
+                .unwrap_or(0);
+            let target = continuation.unwrap_or_else(|| {
+                *free
+                    .iter()
+                    .min_by_key(|&&index| {
+                        let slot = &pool.slots[index];
+                        let empty = slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0);
+                        (!empty, slot.tick)
+                    })
+                    .expect("free is non-empty")
+            });
+
+            pool.tick += 1;
+            let tick = pool.tick;
+            pool.slots[target].busy = true;
+            pool.slots[target].tick = tick;
+            pool.slots[target].idle_since = None;
+            let mut target_kv = pool.slots[target].kv.take();
+            drop(pool);
+
+            {
+                // One pass owns both the inference baton and the cache catalog. No other request
+                // can submit against a state buffer while it is being downloaded or restored.
+                let _gate = req.gate_pass();
+                let mut cache = match cache_mutex.lock() {
+                    Ok(cache) => cache,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                let cold_prefix = cache.best_continuation_len(prompt);
+                let cold = (cold_prefix > resident_prefix && target_kv.is_some())
+                    .then(|| cache.take_best_continuation(prompt))
+                    .flatten();
+                if let (Some(entry), Some(kv)) = (cold, target_kv.as_mut()) {
+                    let mut released = false;
+                    if kv.cached_len() != 0 {
+                        match cache.spill(kv, self.vk.as_ref(), cfg) {
+                            Ok(true) => released = true,
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    slot = target,
+                                    "cold KV replacement spill failed; recycling the slot: {error}"
+                                );
+                                kv.reset();
+                            }
+                        }
+                    }
+                    if !released {
+                        released = kv.release_session_state(self.vk.as_ref(), cfg).is_ok()
+                            || kv.release_session_state(self.vk.as_ref(), cfg).is_ok();
+                    }
+                    if released {
+                        match cache.restore(entry, kv, self.vk.as_ref(), cfg) {
+                            Ok(()) => {}
+                            Err(error) => tracing::warn!(
+                                slot = target,
+                                "cold KV restore failed; re-prefilling the request: {error}"
+                            ),
+                        }
+                    } else {
+                        tracing::warn!(
+                            slot = target,
+                            "could not release the target KV slot for cold restore; re-prefilling"
+                        );
+                        cache.return_entry(entry);
+                        kv.reset();
+                    }
+                } else if continuation.is_none() {
+                    if let Some(kv) = target_kv.as_mut().filter(|kv| kv.cached_len() != 0) {
+                        if let Err(error) = cache.spill(kv, self.vk.as_ref(), cfg) {
+                            tracing::warn!(
+                                slot = target,
+                                "cold KV replacement spill failed; forgetting the old conversation: {error}"
+                            );
+                            kv.reset();
+                        }
+                    }
+                }
+                if let Err(error) = cache.gc() {
+                    tracing::warn!("cold KV cache maintenance failed: {error}");
+                }
+            }
+
+            return Ok(SlotGuard {
+                engine: self,
+                idx: target,
+                kv: target_kv,
+            });
+        }
+    }
+
     /// Take an LRU free slot without prefix seeding. Image payload identity is not represented by
     /// the repeated image-pad token ids, so token-prefix reuse would be unsound until slots carry
     /// an image fingerprint.
-    fn checkout_fresh(&self) -> SlotGuard<'_> {
+    fn checkout_fresh(&self, req: &RequestCtx) -> SlotGuard<'_> {
+        if self.session_cache.is_some() {
+            self.checkout_fresh_with_cold_cache(req)
+        } else {
+            self.checkout_fresh_resident()
+        }
+    }
+
+    fn checkout_fresh_resident(&self) -> SlotGuard<'_> {
         let mut pool = self.pool.lock().expect("pool poisoned");
         loop {
             if let Some(target) = (0..pool.slots.len())
@@ -549,6 +913,51 @@ impl ParallelSeam {
                 pool.slots[target].busy = true;
                 pool.slots[target].tick = tick;
                 let kv = pool.slots[target].kv.take();
+                return SlotGuard {
+                    engine: self,
+                    idx: target,
+                    kv,
+                };
+            }
+            pool = self.freed.wait(pool).expect("pool poisoned");
+        }
+    }
+
+    fn checkout_fresh_with_cold_cache(&self, req: &RequestCtx) -> SlotGuard<'_> {
+        let cache_mutex = self
+            .session_cache
+            .as_ref()
+            .expect("cold checkout requires a session cache");
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            if let Some(target) = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .min_by_key(|&index| pool.slots[index].tick)
+            {
+                pool.tick += 1;
+                let tick = pool.tick;
+                pool.slots[target].busy = true;
+                pool.slots[target].tick = tick;
+                pool.slots[target].idle_since = None;
+                let mut kv = pool.slots[target].kv.take();
+                drop(pool);
+                if let Some(kv) = kv.as_mut().filter(|kv| kv.cached_len() != 0) {
+                    let _gate = req.gate_pass();
+                    let mut cache = match cache_mutex.lock() {
+                        Ok(cache) => cache,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if let Err(error) = cache.spill(kv, self.vk.as_ref(), self.model.config()) {
+                        tracing::warn!(
+                            slot = target,
+                            "cold KV spill before multimodal reuse failed; forgetting the old conversation: {error}"
+                        );
+                        kv.reset();
+                    }
+                    if let Err(error) = cache.gc() {
+                        tracing::warn!("cold KV cache maintenance failed: {error}");
+                    }
+                }
                 return SlotGuard {
                     engine: self,
                     idx: target,
@@ -667,7 +1076,7 @@ impl ParallelSeam {
                 self.max_ctx
             ));
         }
-        let mut guard = self.checkout_fresh();
+        let mut guard = self.checkout_fresh(req);
         if let Some(kv) = guard.kv.as_mut() {
             kv.reset();
         }

@@ -90,6 +90,17 @@ force_q8 = false
 # Prefix-cache slots (`infr serve` reuses a matching prefix across requests).
 slots = 4
 
+# Grow supported Qwen Vulkan KV caches in 32K-token physical segments.
+dynamic = true
+
+# Optional disk-backed conversation state. Unset keeps every session resident and creates no
+# worker or files. This currently requires dynamic Q8_0/Q8_0 KV on Qwen3.5/3.6/3.8. Cache files
+# contain token ids and model state; use a private directory.
+# session_cache_dir = "D:/infr-kv"
+session_idle_secs = 120
+session_cache_max = "64GiB" # absolute size only; 0 disables the store
+session_cache_ttl_hours = 24 # 0 disables age expiry
+
 # The sliding-window ring cache (INFR_NO_KV_RING inverted).
 ring = true
 

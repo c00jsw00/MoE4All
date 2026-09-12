@@ -458,7 +458,7 @@ pub(crate) struct SeamKv {
 #[derive(Default)]
 pub(super) struct SegmentedKvState {
     pub(super) enabled: bool,
-    committed_tokens: usize,
+    pub(super) committed_tokens: usize,
 }
 
 impl SegmentedKvState {
@@ -586,16 +586,16 @@ pub(super) struct MtpDeltaCkpt {
 /// allocated once per slot and reused; `copied` lets layer-major prefill capture each recurrent
 /// layer exactly when that layer reaches the boundary without any per-operation allocation.
 pub(super) struct TurnRecurrentCkpt {
-    kbufs: Vec<Box<dyn Buffer>>,
-    vbufs: Vec<Box<dyn Buffer>>,
+    pub(super) kbufs: Vec<Box<dyn Buffer>>,
+    pub(super) vbufs: Vec<Box<dyn Buffer>>,
     /// Qwen3.8's model-level PLE convolution history is recurrent state too. Keeping it beside
     /// the per-layer DeltaNet snapshots makes one stable conversation boundary self-contained.
-    ple_state: Option<Box<dyn Buffer>>,
-    layers: Vec<usize>,
-    tokens: Vec<u32>,
-    copied: Vec<bool>,
-    ple_copied: bool,
-    valid: bool,
+    pub(super) ple_state: Option<Box<dyn Buffer>>,
+    pub(super) layers: Vec<usize>,
+    pub(super) tokens: Vec<u32>,
+    pub(super) copied: Vec<bool>,
+    pub(super) ple_copied: bool,
+    pub(super) valid: bool,
 }
 
 fn checkpoint_extension_start(checkpoint: &[u32], prompt: &[u32]) -> Option<usize> {

@@ -206,6 +206,21 @@ spills KV to system RAM when VRAM runs out. The two `_mb` path names and their
 `INFR_*_MB` environment aliases are frozen compatibility spellings; their numeric
 values have always represented MiB.
 
+`kv.session_cache_dir` opt-in enables disk-backed idle conversations for dynamic
+Q8 Vulkan KV on Qwen3.5/3.6/3.8. A free slot is streamed to one checksummed file
+after `kv.session_idle_secs` (default 120), releasing its dynamic VRAM segments;
+a later request whose token prefix matches restores it instead of re-prefilling
+the saved prefix. `kv.session_cache_max` caps all `.infrkv` files under the root
+directory (default `64GiB`, absolute sizes only), and
+`kv.session_cache_ttl_hours` removes old files (default 24; 0 disables age
+expiry). The environment aliases are `INFR_KV_SESSION_CACHE_DIR`,
+`INFR_KV_SESSION_IDLE_SECS`, `INFR_KV_SESSION_CACHE_MAX`, and
+`INFR_KV_SESSION_CACHE_TTL_HOURS`. The feature is off when the directory is
+unset or the size cap is zero. Cache files include token IDs and model state, so
+the directory should be private. `--parallel` continues to mean simultaneously
+active resident slots; cold sessions extend retained history, not compute
+parallelism.
+
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),
 `ring` overrides the upload staging ring, `stats` prints per-pool

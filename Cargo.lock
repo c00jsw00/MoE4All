@@ -1365,6 +1365,8 @@ dependencies = [
  "llguidance",
  "rayon",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokenizers 0.20.4",
  "toktrie_hf_tokenizers",
  "tracing",

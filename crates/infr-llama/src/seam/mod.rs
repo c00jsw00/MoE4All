@@ -25,11 +25,13 @@ mod ple;
 mod runner;
 mod sc;
 mod segmented_kv;
+mod session_state;
 mod weights;
 
 pub(crate) use runner::generate_dense_backend;
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
+pub(crate) use session_state::{SessionBuffer, SessionBufferKey, SessionStateMeta};
 pub(crate) use weights::SeamKv;
 
 /// A LAZILY-dequantized host f32 token-embedding table, threaded through the seam runners in place
