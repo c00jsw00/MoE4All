@@ -773,6 +773,59 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompts: &[Vec<u32>],
+    primary: &mut Option<SeamKv>,
+    peers: &mut [SeamKv],
+    want_ctx: usize,
+    turn_checkpoints: &[Option<TurnCheckpoint>],
+    req: Option<&crate::sampling::RequestCtx>,
+) -> AResult<Vec<GenStats>> {
+    if primary.is_none() {
+        return Err(anyhow!(
+            "parallel Vulkan prefill requires an initialized primary session"
+        ));
+    }
+    let bind: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
+        Err(anyhow!("warm parallel session must not re-bind {name}"))
+    });
+    let out = runner::generate_dense_backend_parallel_prefill(
+        vk,
+        &*bind,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompts,
+        primary,
+        peers,
+        want_ctx,
+        turn_checkpoints,
+        req,
+    );
+    if out.is_err() {
+        if let Some(slot) = primary.as_mut() {
+            slot.reset();
+        }
+        for slot in peers {
+            slot.reset();
+        }
+        vk.release_moe_load_reservation();
+    }
+    let out = out?;
+    vk.print_moe_pager_stats();
+    vk.print_dense_pager_stats();
+    Ok(out)
+}
+
 /// Honest activation/scratch reservation for a DENSE model's placement decision: the transient
 /// VRAM a resident session needs BEYOND weights + KV, at the largest shape it will ever run — a
 /// full prefill chunk of `rows = min(ubatch, want_ctx)` rows (the runner chunks batched prefill at

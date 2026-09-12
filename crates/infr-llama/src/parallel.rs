@@ -2,12 +2,12 @@
 //!
 //! # What this is (and what it is not)
 //!
-//! It is a hybrid concurrent engine. Every sequence owns one KV slot and prefill work takes fair
-//! token/chunk-grained turns through [`crate::sampling::StepGate`]. Ready, equal-depth Qwen3.8
-//! decode requests are additionally gathered into one layer-synchronous forward at
-//! `m = n_active`, so stateless work and paged expert traffic are shared while every row retains
-//! its own KV/recurrent state and sampler. Other architectures and incompatible depths keep the
-//! established interleaved path.
+//! It is a hybrid concurrent engine. Every sequence owns one KV slot. Compatible Qwen3.8 prefill
+//! requests divide the configured ubatch and run as one layer-synchronous activation batch; their
+//! decode frontiers then continue in one forward at `m = n_active`. Stateless work and paged
+//! expert traffic are shared while every sequence retains its own positions, KV/recurrent state
+//! and sampler. Other architectures and incompatible QSA phases keep the established interleaved
+//! path through [`crate::sampling::StepGate`].
 //!
 //! This is not general continuous batching: a decode cohort is fixed when its worker starts, and
 //! a request arriving after that point waits for the next cohort rather than being inserted into
@@ -46,6 +46,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const DECODE_BATCH_WAIT: Duration = Duration::from_secs(1);
+const PREFILL_BATCH_WAIT: Duration = Duration::from_millis(10);
 const MAX_DECODE_BATCH: usize = 8;
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
@@ -208,6 +209,7 @@ enum BatchEvent {
         prompt: Vec<u32>,
         max_new: usize,
         stats: GenStats,
+        turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
     },
     Failed {
         kv: SeamKv,
@@ -233,6 +235,7 @@ struct BatchWork {
     max_new: usize,
     generated: usize,
     stats: GenStats,
+    turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
     sampler: Option<ParallelSampler>,
     channels: Option<BatchChannels>,
 }
@@ -247,6 +250,12 @@ struct DecodeBatchQueue {
     running: bool,
     /// Batch-eligible requests registered before checkout/prefill but not yet ready for decode.
     prefilling: usize,
+    waiting: VecDeque<BatchWork>,
+}
+
+#[derive(Default)]
+struct PrefillBatchQueue {
+    running: bool,
     waiting: VecDeque<BatchWork>,
 }
 
@@ -476,6 +485,8 @@ pub struct ParallelSeam {
     decode_batch: Mutex<DecodeBatchQueue>,
     /// Wakes a cohort leader when a registered request reaches (or abandons) decode.
     decode_ready: Condvar,
+    prefill_batch: Mutex<PrefillBatchQueue>,
+    prefill_ready: Condvar,
     /// The GPU baton. `None` when `n_slots == 1`: a lone sequence must not pay even a mutex per
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
@@ -556,6 +567,8 @@ impl ParallelSeam {
             freed: Arc::new(Condvar::new()),
             decode_batch: Mutex::new(DecodeBatchQueue::default()),
             decode_ready: Condvar::new(),
+            prefill_batch: Mutex::new(PrefillBatchQueue::default()),
+            prefill_ready: Condvar::new(),
             // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
@@ -1171,6 +1184,7 @@ impl ParallelSeam {
                 prompt: work.prompt,
                 max_new: work.max_new,
                 stats: work.stats,
+                turn_checkpoint: work.turn_checkpoint,
             },
         );
     }
@@ -1225,8 +1239,24 @@ impl ParallelSeam {
         }
     }
 
-    fn batch_depth_ready(&self, kv: &SeamKv, prompt: &[u32]) -> bool {
+    fn batch_frontier_ready(&self, kv: &SeamKv, prompt: &[u32]) -> bool {
         self.model.config().qwen4exp && kv.cached_len() + 1 == prompt.len()
+    }
+
+    fn batch_qsa_sparse(&self, kv: &SeamKv) -> bool {
+        self.qsa_sparse_at(kv.cached_len() + 1)
+    }
+
+    fn qsa_sparse_at(&self, visible_tokens: usize) -> bool {
+        let cfg = self.model.config();
+        let ratio = cfg
+            .compress_ratios
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(4)
+            .max(1);
+        visible_tokens > cfg.indexer_top_k + ratio - 1
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1240,6 +1270,7 @@ impl ParallelSeam {
         printed: &mut usize,
         on_piece: &mut F,
         stats: GenStats,
+        turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
     ) -> Result<GenStats> {
         if max_new == 0 || crate::sampling::abort_requested(Some(req)) {
             return Ok(stats);
@@ -1256,7 +1287,7 @@ impl ParallelSeam {
             |id| crate::stream_token(self.model.tokenizer(), acc, printed, id, on_piece),
             &mut guard.kv,
             self.max_ctx,
-            None,
+            turn_checkpoint,
             None,
             Some(req),
             None,
@@ -1304,10 +1335,19 @@ impl ParallelSeam {
                     prompt,
                     max_new,
                     stats,
+                    turn_checkpoint,
                 } => {
                     guard.reattach(kv);
                     return self.continue_after_prefill(
-                        guard, &prompt, max_new, req, acc, printed, on_piece, stats,
+                        guard,
+                        &prompt,
+                        max_new,
+                        req,
+                        acc,
+                        printed,
+                        on_piece,
+                        stats,
+                        turn_checkpoint,
                     );
                 }
                 BatchEvent::Failed { kv, error } => {
@@ -1316,6 +1356,127 @@ impl ParallelSeam {
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_prefill_batch(
+        &self,
+        leader: BatchWork,
+        peers: Vec<BatchWork>,
+        leader_guard: &mut SlotGuard<'_>,
+        req: &RequestCtx,
+        leader_on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<GenStats> {
+        let mut active = Vec::with_capacity(1 + peers.len());
+        active.push(leader);
+        active.extend(peers);
+
+        let prompts = active
+            .iter()
+            .map(|work| work.prompt.clone())
+            .collect::<Vec<_>>();
+        let turn_checkpoints = active
+            .iter()
+            .map(|work| work.turn_checkpoint)
+            .collect::<Vec<_>>();
+        let mut primary = active[0].kv.take();
+        let mut peer_kv = active
+            .iter_mut()
+            .skip(1)
+            .map(|work| work.kv.take().expect("prefill lane owns a KV slot"))
+            .collect::<Vec<_>>();
+        let prefilled = crate::seam::generate_dense_vulkan_parallel_prefill_session(
+            self.vk.as_ref(),
+            self.model.gguf(),
+            self.model.config(),
+            self.model.engine_cfg(),
+            self.model.embd(),
+            self.model.per_layer_embd(),
+            &prompts,
+            &mut primary,
+            &mut peer_kv,
+            self.max_ctx,
+            &turn_checkpoints,
+            Some(req),
+        );
+
+        active[0].kv = primary;
+        for (work, kv) in active.iter_mut().skip(1).zip(peer_kv) {
+            work.kv = Some(kv);
+        }
+
+        let prefill_stats = match prefilled {
+            Ok(stats) if stats.len() == active.len() => stats,
+            Ok(stats) => {
+                let message = format!(
+                    "parallel prefill returned {} result lanes for {} active lanes",
+                    stats.len(),
+                    active.len()
+                );
+                for mut work in active {
+                    work.kv
+                        .as_mut()
+                        .expect("invalid prefill lane owns a KV slot")
+                        .reset();
+                    if work.channels.is_none() {
+                        leader_guard.reattach(
+                            work.kv
+                                .take()
+                                .expect("invalid prefill leader owns a KV slot"),
+                        );
+                    } else {
+                        self.fail_batch_work(work, &message);
+                    }
+                }
+                return Err(anyhow!(message));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                for mut work in active {
+                    if work.channels.is_none() {
+                        leader_guard.reattach(
+                            work.kv
+                                .take()
+                                .expect("failed prefill leader owns a KV slot"),
+                        );
+                    } else {
+                        self.fail_batch_work(work, &message);
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        for (work, stats) in active.iter_mut().zip(prefill_stats) {
+            work.stats = merge_stats(work.stats, stats);
+            work.turn_checkpoint = None;
+        }
+        if active.iter().any(|work| {
+            !work
+                .kv
+                .as_ref()
+                .is_some_and(|kv| self.batch_frontier_ready(kv, &work.prompt))
+        }) {
+            let message = "parallel prefill stopped before every lane reached its decode frontier";
+            for mut work in active {
+                work.kv
+                    .as_mut()
+                    .expect("incomplete prefill lane owns a KV slot")
+                    .reset();
+                if work.channels.is_none() {
+                    leader_guard.reattach(
+                        work.kv
+                            .take()
+                            .expect("incomplete prefill leader owns a KV slot"),
+                    );
+                } else {
+                    self.fail_batch_work(work, message);
+                }
+            }
+            return Err(anyhow!(message));
+        }
+
+        self.run_decode_batch(active.remove(0), active, leader_guard, req, leader_on_token)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1525,6 +1686,108 @@ impl ParallelSeam {
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS engine's pins for the decode (warm calls
         // must agree with the buffers placement sized). Concurrent requests share the one cell.
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
+        if batch_candidate {
+            let sampler = ParallelSampler::new(req, &self.model.engine_cfg().sampling);
+            let mut queue = self
+                .prefill_batch
+                .lock()
+                .expect("prefill batch queue poisoned");
+            if queue.running {
+                let (event_tx, event_rx) = mpsc::sync_channel(0);
+                let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+                let slot = guard.idx;
+                let kv = guard.detach();
+                queue.waiting.push_back(BatchWork {
+                    slot,
+                    kv: Some(kv),
+                    prompt: prompt_tokens,
+                    max_new,
+                    generated: 0,
+                    stats: GenStats::default(),
+                    turn_checkpoint,
+                    sampler: Some(sampler),
+                    channels: Some(BatchChannels {
+                        events: event_tx,
+                        acknowledgements: ack_rx,
+                    }),
+                });
+                self.prefill_ready.notify_all();
+                drop(queue);
+                drop(batch_prefill.take());
+                return self.wait_for_decode_batch(
+                    &mut guard,
+                    event_rx,
+                    ack_tx,
+                    req,
+                    &mut acc,
+                    &mut printed,
+                    &mut on_piece,
+                );
+            }
+
+            queue.running = true;
+            let (mut queue, _) = self
+                .prefill_ready
+                .wait_timeout_while(queue, PREFILL_BATCH_WAIT, |queue| queue.waiting.is_empty())
+                .expect("prefill batch queue poisoned");
+            let leader_sparse = self.qsa_sparse_at(prompt_tokens.len());
+            let (peers, fallback) = {
+                let mut peers = Vec::new();
+                let mut fallback = Vec::new();
+                for work in queue.waiting.drain(..) {
+                    if peers.len() + 1 < MAX_DECODE_BATCH
+                        && self.qsa_sparse_at(work.prompt.len()) == leader_sparse
+                    {
+                        peers.push(work);
+                    } else {
+                        fallback.push(work);
+                    }
+                }
+                queue.running = false;
+                (peers, fallback)
+            };
+            self.prefill_ready.notify_all();
+            drop(queue);
+            for work in fallback {
+                self.fallback_batch_work(work);
+            }
+
+            if !peers.is_empty() && !crate::sampling::abort_requested(Some(req)) {
+                drop(batch_prefill.take());
+                tracing::debug!(
+                    lanes = peers.len() + 1,
+                    "collected layer-synchronous prefill cohort"
+                );
+                let leader = BatchWork {
+                    slot: guard.idx,
+                    kv: Some(guard.detach()),
+                    prompt: prompt_tokens,
+                    max_new,
+                    generated: 0,
+                    stats: GenStats::default(),
+                    turn_checkpoint,
+                    sampler: Some(sampler),
+                    channels: None,
+                };
+                let mut leader_stream = |id| {
+                    if crate::sampling::abort_requested(Some(req)) {
+                        return false;
+                    }
+                    crate::stream_token(
+                        self.model.tokenizer(),
+                        &mut acc,
+                        &mut printed,
+                        id,
+                        &mut on_piece,
+                    );
+                    !crate::sampling::abort_requested(Some(req))
+                };
+                return self.run_prefill_batch(leader, peers, &mut guard, req, &mut leader_stream);
+            }
+            for work in peers {
+                self.fallback_batch_work(work);
+            }
+        }
         if !batch_candidate {
             let (_ids, stats) = crate::seam::generate_dense_vulkan_session(
                 self.vk.as_ref(),
@@ -1576,7 +1839,7 @@ impl ParallelSeam {
             || !guard
                 .kv
                 .as_ref()
-                .is_some_and(|kv| self.batch_depth_ready(kv, &prompt_tokens))
+                .is_some_and(|kv| self.batch_frontier_ready(kv, &prompt_tokens))
         {
             drop(batch_prefill.take());
             return self.continue_after_prefill(
@@ -1588,6 +1851,7 @@ impl ParallelSeam {
                 &mut printed,
                 &mut on_piece,
                 prefill_stats,
+                None,
             );
         }
 
@@ -1613,6 +1877,7 @@ impl ParallelSeam {
                 max_new,
                 generated: 0,
                 stats: prefill_stats,
+                turn_checkpoint: None,
                 sampler: Some(sampler),
                 channels: Some(BatchChannels {
                     events: event_tx,
@@ -1642,18 +1907,17 @@ impl ParallelSeam {
             })
             .expect("decode batch queue poisoned");
 
-        let depth = guard
-            .kv
-            .as_ref()
-            .expect("checked-out leader has a KV slot")
-            .cached_len();
+        let leader_kv = guard.kv.as_ref().expect("checked-out leader has a KV slot");
+        let depth = leader_kv.cached_len();
+        let leader_sparse = self.batch_qsa_sparse(leader_kv);
         let (peers, fallback) = {
             let mut peers = Vec::new();
             let mut fallback = Vec::new();
             for work in queue.waiting.drain(..) {
                 let compatible = peers.len() + 1 < MAX_DECODE_BATCH
                     && work.kv.as_ref().is_some_and(|kv| {
-                        kv.cached_len() == depth && self.batch_depth_ready(kv, &work.prompt)
+                        self.batch_frontier_ready(kv, &work.prompt)
+                            && self.batch_qsa_sparse(kv) == leader_sparse
                     });
                 if compatible {
                     peers.push(work);
@@ -1691,6 +1955,7 @@ impl ParallelSeam {
                 &mut printed,
                 &mut on_piece,
                 prefill_stats,
+                None,
             );
         }
 
@@ -1701,6 +1966,7 @@ impl ParallelSeam {
             max_new,
             generated: 0,
             stats: prefill_stats,
+            turn_checkpoint: None,
             sampler: Some(sampler),
             channels: None,
         };
