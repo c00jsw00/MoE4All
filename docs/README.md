@@ -6,6 +6,8 @@ the `infr` inference engine. The top-level project overview lives in the root
 
 ## Using infr
 
+- [thinking-controls.md](thinking-controls.md) — native reasoning effort, per-request
+  thinking controls, model differences, and reasoning-history replay.
 - [../GETTING_STARTED.md](../GETTING_STARTED.md) — clean-clone installation,
   native Windows 11 prerequisites, release build, Vulkan verification,
   small-model smoke test, launch wizard, GUI, server, and troubleshooting.

@@ -12,14 +12,20 @@ use infr_gguf::Gguf;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use crate::ChatMessage;
+use crate::{ChatMessage, ChatTemplateOptions};
 
 /// Compiled-environment cache keyed by the raw template source. A GGUF's chat template never
 /// changes across a process, but `serve` re-renders it on every request/turn — building the
 /// minijinja `Environment` and re-parsing the (often large, HF tool-calling) template each time is
 /// pure waste. Keyed by source so distinct templates don't collide; entry count is bounded by the
 /// number of distinct templates loaded (one per model), so no eviction is needed.
-type SharedEnv = Arc<minijinja::Environment<'static>>;
+struct CachedTemplate {
+    env: minijinja::Environment<'static>,
+    supports_effort: bool,
+    supports_preserve_thinking: bool,
+}
+
+type SharedEnv = Arc<CachedTemplate>;
 static ENV_CACHE: LazyLock<Mutex<HashMap<String, SharedEnv>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -59,6 +65,23 @@ static ENV_CACHE: LazyLock<Mutex<HashMap<String, SharedEnv>>> =
 /// hangs and no slot leaks.
 pub(crate) const CHAT_TEMPLATE_FUEL: u64 = 100_000_000;
 
+/// Marks explicit template input validation, distinct from a broken template's runtime errors.
+#[derive(Debug)]
+struct TemplateInputError;
+
+impl std::fmt::Display for TemplateInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid chat template input")
+    }
+}
+
+impl std::error::Error for TemplateInputError {}
+
+fn invalid_input_error(message: impl Into<String>) -> minijinja::Error {
+    minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message.into())
+        .with_source(TemplateInputError)
+}
+
 /// Build a minijinja `Environment` with the full infr jinja surface (pycompat, `raise_exception`,
 /// `strftime_now`, `tojson` with `indent=`), a [`CHAT_TEMPLATE_FUEL`] execution bound, and the
 /// given chat template compiled under `"chat"`.
@@ -74,10 +97,7 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
     env.add_function(
         "raise_exception",
         |msg: String| -> std::result::Result<String, minijinja::Error> {
-            Err(minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                msg,
-            ))
+            Err(invalid_input_error(msg))
         },
     );
     // `strftime_now(format)` — llama.cpp-minja parity: Llama-3.x templates stamp
@@ -135,7 +155,15 @@ fn cached_env(template: &str) -> Result<SharedEnv, minijinja::Error> {
     if let Some(env) = cache.get(template) {
         return Ok(env.clone());
     }
-    let env: SharedEnv = Arc::new(build_env(template)?);
+    let env = build_env(template)?;
+    // MiniJinja's static analysis reparses the source. Do it once per cached template, not twice
+    // on every render (and again for the stable prefix) during a conversation.
+    let variables = env.get_template("chat")?.undeclared_variables(false);
+    let env = Arc::new(CachedTemplate {
+        env,
+        supports_effort: variables.contains("reasoning_effort"),
+        supports_preserve_thinking: variables.contains("preserve_thinking"),
+    });
     cache.insert(template.to_owned(), env.clone());
     Ok(env)
 }
@@ -163,13 +191,31 @@ impl std::fmt::Display for TemplateError {
 
 impl std::error::Error for TemplateError {}
 
+impl TemplateError {
+    /// Only explicit input validation becomes an API input error. Syntax errors, fuel exhaustion
+    /// and unrelated template runtime errors remain server errors, even if also InvalidOperation.
+    pub fn is_invalid_input(&self) -> bool {
+        let Self::Render(error) = self else {
+            return false;
+        };
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(error) = source {
+            if error.is::<TemplateInputError>() {
+                return true;
+            }
+            source = error.source();
+        }
+        false
+    }
+}
+
 /// THE jinja chat renderer — turns `(role, content)` messages into a prompt via the GGUF's embedded
 /// `tokenizer.chat_template`. Template handling (pycompat, `enable_thinking`, bos/eos, tools) lives
 /// here so every caller (single-turn, multi-turn, CPU + GPU backends) shares it. Returns `None` if
 /// there's no template or it fails to render (caller falls back to [`chatml`]).
 ///
-/// `cfg` supplies the two knobs this renderer reads — `sampling.no_think` (`INFR_NO_THINK`) and
-/// `debug.chat` (`INFR_DEBUG_CHAT`). It is a BORROWED parameter rather than a field on a renderer
+/// `cfg` supplies thinking controls (`sampling.no_think`, `reasoning_effort`, `preserve_thinking`)
+/// and `debug.chat`. It is a BORROWED parameter rather than a field on a renderer
 /// struct because `infr-chat` deliberately owns no state at all (no model, no backend, no cache
 /// beyond the compiled-template memo): every entry point here is a pure function of its inputs, and
 /// the config is one of those inputs. Callers that DO own a renderer — `SeamModel`,
@@ -194,6 +240,7 @@ pub fn render_chat_jinja(
         Value::Null,
         add_generation_prompt,
         cfg,
+        &ChatTemplateOptions::default(),
     )
     .ok()
 }
@@ -219,6 +266,30 @@ pub fn render_chat_oai(
     add_generation_prompt: bool,
     cfg: &Config,
 ) -> Result<String, TemplateError> {
+    render_chat_oai_with_options(
+        gguf,
+        tokenizer,
+        eos,
+        messages,
+        tools,
+        add_generation_prompt,
+        cfg,
+        &ChatTemplateOptions::default(),
+    )
+}
+
+/// Render with request-local controls layered over the process defaults.
+#[allow(clippy::too_many_arguments)]
+pub fn render_chat_oai_with_options(
+    gguf: &Gguf,
+    tokenizer: &Tokenizer,
+    eos: u32,
+    messages: &[ChatMessage],
+    tools: Option<&Value>,
+    add_generation_prompt: bool,
+    cfg: &Config,
+    options: &ChatTemplateOptions,
+) -> Result<String, TemplateError> {
     let msgs: Vec<Value> = messages.iter().map(message_to_json).collect();
     let tools = tools.cloned().unwrap_or(Value::Null);
     render_core(
@@ -229,6 +300,7 @@ pub fn render_chat_oai(
         tools,
         add_generation_prompt,
         cfg,
+        options,
     )
 }
 
@@ -238,6 +310,9 @@ fn message_to_json(m: &ChatMessage) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("role".into(), m.role.clone().into());
     obj.insert("content".into(), m.content.clone().into());
+    if let Some(reasoning) = &m.reasoning_content {
+        obj.insert("reasoning_content".into(), reasoning.clone().into());
+    }
     if let Some(calls) = &m.tool_calls {
         let arr: Vec<Value> = calls
             .iter()
@@ -270,6 +345,7 @@ fn render_core(
     tools: Value,
     add_generation_prompt: bool,
     cfg: &Config,
+    options: &ChatTemplateOptions,
 ) -> Result<String, TemplateError> {
     let template = gguf
         .metadata()
@@ -289,15 +365,15 @@ fn render_core(
     // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5)
     // then behave the same under `infr run`/`serve` regardless of what their template's own
     // default is (Qwen3.5 defaults itself OFF via `enable_thinking is defined and is true`).
-    let think = thinking_enabled(cfg);
-    match render_template(
+    let options = options.resolve(cfg);
+    match render_template_with_options(
         template,
         msgs,
         tools,
         &bos,
         &eos_s,
         add_generation_prompt,
-        think,
+        &options,
     ) {
         Ok(s) => {
             if cfg.debug.chat {
@@ -306,22 +382,15 @@ fn render_core(
             Ok(s)
         }
         Err(e) => {
-            if cfg.debug.chat {
-                tracing::info!("[chat-template] render error: {e:#}");
+            if cfg.debug.chat
+                || options.reasoning_effort.is_some()
+                || options.preserve_thinking.is_some()
+            {
+                tracing::warn!("[chat-template] render error: {e:#}");
             }
             Err(TemplateError::Render(e))
         }
     }
-}
-
-/// The `enable_thinking` a render gets, from `sampling.no_think` (S7 — [`render_core`] used to
-/// read the `INFR_NO_THINK` variable from the process environment right here).
-///
-/// `INFR_NO_THINK=1` turns thinking OFF and `INFR_NO_THINK=0` is a NO-OP, matching the other
-/// `INFR_NO_*` toggles — that is the `SetNotZero` env grammar the config layer parses, so the
-/// polarity lives in exactly one place and this is a plain negation.
-fn thinking_enabled(cfg: &Config) -> bool {
-    !cfg.sampling.no_think
 }
 
 /// Render a raw chat-template STRING with the full infr jinja environment (pycompat,
@@ -338,17 +407,64 @@ pub fn render_template(
     add_generation_prompt: bool,
     enable_thinking: bool,
 ) -> Result<String, minijinja::Error> {
+    render_template_with_options(
+        template,
+        msgs,
+        tools,
+        bos_token,
+        eos_token,
+        add_generation_prompt,
+        &ChatTemplateOptions {
+            enable_thinking: Some(enable_thinking),
+            ..Default::default()
+        },
+    )
+}
+
+/// Render model-native controls without assigning a universal reasoning default. In particular,
+/// omit absent keys instead of inserting null: Jinja's `default` / `is undefined` depend on it.
+/// A template that does not reference an explicitly requested effort must fail, not silently
+/// pretend to implement effort levels. The template validates its own accepted level subset.
+#[allow(clippy::too_many_arguments)]
+pub fn render_template_with_options(
+    template: &str,
+    msgs: Vec<Value>,
+    tools: Value,
+    bos_token: &str,
+    eos_token: &str,
+    add_generation_prompt: bool,
+    options: &ChatTemplateOptions,
+) -> Result<String, minijinja::Error> {
     let env = cached_env(template)?;
     let tmpl = env
+        .env
         .get_template("chat")
         .expect("template was just added under this name");
+    if options.reasoning_effort.is_some() && !env.supports_effort {
+        return Err(invalid_input_error(
+            "this model's chat template does not support reasoning_effort",
+        ));
+    }
+    if options.preserve_thinking.is_some() && !env.supports_preserve_thinking {
+        return Err(invalid_input_error(
+            "this model's chat template does not support preserve_thinking",
+        ));
+    }
     let mut ctx = serde_json::Map::new();
     ctx.insert("messages".into(), Value::Array(msgs));
     ctx.insert("tools".into(), tools);
     ctx.insert("add_generation_prompt".into(), add_generation_prompt.into());
     ctx.insert("bos_token".into(), bos_token.into());
     ctx.insert("eos_token".into(), eos_token.into());
-    ctx.insert("enable_thinking".into(), enable_thinking.into());
+    if let Some(enabled) = options.enable_thinking {
+        ctx.insert("enable_thinking".into(), enabled.into());
+    }
+    if let Some(effort) = options.reasoning_effort {
+        ctx.insert("reasoning_effort".into(), effort.to_string().into());
+    }
+    if let Some(preserve) = options.preserve_thinking {
+        ctx.insert("preserve_thinking".into(), preserve.into());
+    }
     tmpl.render(serde_json::Value::Object(ctx))
 }
 
@@ -367,6 +483,36 @@ pub fn render_chat_user(
 #[cfg(test)]
 mod template_tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_template_input_errors_are_classified_as_client_errors() {
+        let render =
+            |source| render_template(source, vec![], Value::Null, "", "", true, true).unwrap_err();
+        assert!(
+            TemplateError::Render(render("{{ raise_exception('bad input') }}")).is_invalid_input()
+        );
+        assert!(!TemplateError::Render(render("{% broken %}")).is_invalid_input());
+        assert!(!TemplateError::Render(minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            "a broken template operation",
+        ))
+        .is_invalid_input());
+        assert!(!TemplateError::NoTemplate.is_invalid_input());
+    }
+
+    #[test]
+    fn message_reasoning_is_separate_from_content_and_optional() {
+        let mut message = ChatMessage {
+            role: "assistant".into(),
+            content: "Answer".into(),
+            ..Default::default()
+        };
+        assert!(message_to_json(&message).get("reasoning_content").is_none());
+        message.reasoning_content = Some("Earlier reasoning".into());
+        let value = message_to_json(&message);
+        assert_eq!(value["content"], "Answer");
+        assert_eq!(value["reasoning_content"], "Earlier reasoning");
+    }
 
     const TMPL: &str =
         "{% for m in messages %}{{ m.role }}:{{ m.content }}\n{% endfor %}bos={{ bos_token }}";
@@ -461,9 +607,19 @@ mod template_tests {
     #[test]
     fn no_think_config_drives_enable_thinking() {
         let mut cfg = Config::default();
-        assert!(thinking_enabled(&cfg), "default = thinking ON");
+        assert!(
+            ChatTemplateOptions::from_config(&cfg)
+                .enable_thinking
+                .unwrap(),
+            "default = thinking ON"
+        );
         cfg.sampling.no_think = true;
-        assert!(!thinking_enabled(&cfg), "sampling.no_think = thinking OFF");
+        assert!(
+            !ChatTemplateOptions::from_config(&cfg)
+                .enable_thinking
+                .unwrap(),
+            "sampling.no_think = thinking OFF"
+        );
 
         // …and the flag really reaches the template context.
         const PROBE: &str = "think={{ enable_thinking }}";
@@ -475,7 +631,9 @@ mod template_tests {
             "",
             "",
             true,
-            thinking_enabled(&cfg),
+            ChatTemplateOptions::from_config(&cfg)
+                .enable_thinking
+                .unwrap(),
         )
         .unwrap();
         cfg.sampling.no_think = true;
@@ -486,7 +644,9 @@ mod template_tests {
             "",
             "",
             true,
-            thinking_enabled(&cfg),
+            ChatTemplateOptions::from_config(&cfg)
+                .enable_thinking
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(on, "think=true");

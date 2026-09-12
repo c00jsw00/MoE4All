@@ -303,6 +303,9 @@ struct SamplingOpts {
     /// Force reasoning ON, overriding an inherited INFR_NO_THINK (`sampling.no_think = false`).
     #[arg(long)]
     think: bool,
+    /// Native reasoning level (Qwen3.8: low, medium, xhigh). Unset uses the model template default.
+    #[arg(long, value_name = "LEVEL")]
+    reasoning_effort: Option<infr_core::config::ReasoningEffort>,
 }
 
 impl SamplingOpts {
@@ -332,6 +335,9 @@ impl SamplingOpts {
             layer.sampling.no_think = Some(true);
         } else if self.think {
             layer.sampling.no_think = Some(false);
+        }
+        if let Some(effort) = self.reasoning_effort {
+            layer.sampling.reasoning_effort = Some(Some(effort));
         }
     }
 }
@@ -1468,6 +1474,23 @@ fn build_chat_model(
     }
 }
 
+/// Validate explicit native template controls before expensive model startup.
+///
+/// `SeamModel::load_with` opens metadata/tokenizer state but does not create the
+/// Vulkan backend or make expert weights resident, so a template rejection stays cheap.
+fn preflight_chat_template_controls(
+    gguf: &Path,
+    tok: Option<&Path>,
+    cfg: &Arc<Config>,
+) -> anyhow::Result<()> {
+    if cfg.sampling.reasoning_effort.is_none() && cfg.sampling.preserve_thinking.is_none() {
+        return Ok(());
+    }
+
+    let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
+    model.preflight_chat_template_controls()
+}
+
 fn cmd_run(
     model: &str,
     message: Option<&str>,
@@ -1477,6 +1500,7 @@ fn cmd_run(
 ) -> anyhow::Result<()> {
     use std::io::Write;
     let (gguf, tok) = resolve(model, cfg)?;
+    preflight_chat_template_controls(&gguf, tok.as_deref(), cfg)?;
     // Stamped next to the mapping it guards, then checked before every turn below.
     let watch = infr_llama::WeightWatch::open(&gguf)?;
     // diffusion-gemma (block text-diffusion, Phase 3 — docs/diffusion-gemma.md): a cheap arch peek
@@ -2323,7 +2347,11 @@ fn run_chat(
         // `infr_gguf::watch` for what this can and cannot see.
         be.weights().check()?;
         // `tools` arrives already parsed (a borrowed Value) — no Value→string→Value round-trip.
-        let (prompt, stable_prefix) = be.renderer().render_turn(messages, tools)?;
+        let (prompt, stable_prefix) = be.renderer().render_turn_with_options(
+            messages,
+            tools,
+            &params.chat_template_options,
+        )?;
         // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
         // (INFR_MAX_NEW, default 2048) is the server-side default for requests that don't set one.
         let max_new = params
@@ -4405,6 +4433,7 @@ fn cmd_serve(
     let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
 
     let cfg = &apply_model_sampling_defaults(cfg, specified, &gguf);
+    preflight_chat_template_controls(&gguf, tok.as_deref(), cfg)?;
     // The Vulkan path must warm the LLM first: that creates the unified expert arena from which
     // the native Embedding client borrows. Other backends and the llama.cpp compatibility runner
     // retain their established independent loading path.
@@ -5099,6 +5128,7 @@ mod tests {
             max_new: Some(64),
             no_think: false,
             think: false,
+            reasoning_effort: None,
         };
         let mut flags = PartialConfig::default();
         opts.overrides(&mut flags);
@@ -5311,7 +5341,28 @@ mod tests {
             max_new: None,
             no_think: false,
             think: false,
+            reasoning_effort: None,
         }
+    }
+
+    #[test]
+    fn reasoning_effort_flag_sets_only_the_native_effort() {
+        let mut flags = PartialConfig::default();
+        SamplingOpts {
+            reasoning_effort: Some(infr_core::config::ReasoningEffort::Medium),
+            ..no_sampling_opts()
+        }
+        .overrides(&mut flags);
+        assert_eq!(
+            flags.sampling.reasoning_effort,
+            Some(Some(infr_core::config::ReasoningEffort::Medium))
+        );
+        assert_eq!(flags.sampling.no_think, None);
+        let cfg = resolve_cfg(&[], flags, &[]);
+        assert_eq!(
+            cfg.sampling.reasoning_effort,
+            Some(infr_core::config::ReasoningEffort::Medium)
+        );
     }
 
     // ── finding 3: local `.gguf` FILE vs HF ref classifier ──────────────────────────────────────

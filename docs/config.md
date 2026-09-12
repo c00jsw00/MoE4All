@@ -118,7 +118,7 @@ when the cause is a global config file you forgot about.
 
 ## `--set`
 
-Most of the 155 knobs have no dedicated flag. `--set <config.path>=<value>`
+Most configuration knobs have no dedicated flag. `--set <config.path>=<value>`
 reaches all of them, using the same path grammar as the TOML file:
 
 ```bash
@@ -164,6 +164,7 @@ also on `bench`); `infr <cmd> --help` is the authority.
 | `--seed`                 | `sampling.seed`     | `INFR_SEED`     |
 | `--max-new`              | `sampling.max_new`  | `INFR_MAX_NEW`  |
 | `--no-think` / `--think` | `sampling.no_think` | `INFR_NO_THINK` |
+| `--reasoning-effort`      | `sampling.reasoning_effort` | — |
 
 `device.threads` has no `INFR_*` twin — it is published as `RAYON_NUM_THREADS`,
 because rayon's global pool has no other input.
@@ -190,7 +191,10 @@ For example, `INFR_VRAM_BUDGET=23g` and `INFR_VRAM_RESERVE=512m` are a hard
 unset, placement and allocation retain the historical behavior.
 
 **`[sampling]`** — `temp` (0 = greedy), `top_k`, `top_p`, `seed`, `max_new`,
-`ignore_eos`, `no_think`. **Provenance matters here**: `infr run` / `infr serve`
+`ignore_eos`, `no_think`, `reasoning_effort`, `preserve_thinking`.
+`reasoning_effort` and `preserve_thinking` have no `INFR_*` environment aliases;
+omit them to preserve the embedded chat template's defaults.
+**Provenance matters here**: `infr run` / `infr serve`
 fill `temp` / `top_k` / `top_p` / `max_new` from the model's own recommended
 sampling (an arch-family table plus any `generation_config.json` beside the
 model) only for knobs that **no layer specified**. Putting `temp` in your config
@@ -218,7 +222,7 @@ unified total-memory budget.
 kernel **tier** override: the engine picks the best tier the device supports,
 and these exist to force one off when bisecting a correctness or perf problem.
 
-- **`[kernels.vulkan]`** (the biggest section — 62 of the 155 keys): capability
+- **`[kernels.vulkan]`** (the biggest section — 62 keys): capability
   masks (`coopmat`, `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), GEMM/GEMV
   tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, the
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,

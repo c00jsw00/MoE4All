@@ -380,9 +380,20 @@ impl OaiRenderer {
         messages: &[infr_chat::ChatMessage],
         tools: Option<&serde_json::Value>,
     ) -> Result<(String, String)> {
+        self.render_turn_with_options(messages, tools, &infr_chat::ChatTemplateOptions::default())
+    }
+
+    /// Apply the SAME request-local controls to generation and stable history. A changed effort
+    /// changes the rendered prefix, so the KV cache cannot reuse an incompatible system prompt.
+    pub fn render_turn_with_options(
+        &self,
+        messages: &[infr_chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        options: &infr_chat::ChatTemplateOptions,
+    ) -> Result<(String, String)> {
         Ok((
-            self.render_mode(messages, tools, true)?,
-            self.render_mode(messages, tools, false)?,
+            self.render_mode_with_options(messages, tools, true, options)?,
+            self.render_mode_with_options(messages, tools, false, options)?,
         ))
     }
 
@@ -392,7 +403,22 @@ impl OaiRenderer {
         tools: Option<&serde_json::Value>,
         add_generation_prompt: bool,
     ) -> Result<String> {
-        infr_chat::render_chat_oai(
+        self.render_mode_with_options(
+            messages,
+            tools,
+            add_generation_prompt,
+            &infr_chat::ChatTemplateOptions::default(),
+        )
+    }
+
+    fn render_mode_with_options(
+        &self,
+        messages: &[infr_chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        add_generation_prompt: bool,
+        options: &infr_chat::ChatTemplateOptions,
+    ) -> Result<String> {
+        infr_chat::render_chat_oai_with_options(
             &self.gguf,
             &self.tokenizer,
             self.eos,
@@ -400,13 +426,14 @@ impl OaiRenderer {
             tools,
             add_generation_prompt,
             &self.ecfg,
+            options,
         )
         .map_err(|e| match e {
             // No embedded template at all → the standard "infr requires an instruct model" error.
             infr_chat::TemplateError::NoTemplate => no_template_err(),
             // The template EXISTS but failed to render → surface the actual jinja error so
             // serve's 500 body says what broke (not a generic "no usable template").
-            e @ infr_chat::TemplateError::Render(_) => anyhow::anyhow!("{e}"),
+            e @ infr_chat::TemplateError::Render(_) => anyhow::Error::new(e),
         })
     }
 

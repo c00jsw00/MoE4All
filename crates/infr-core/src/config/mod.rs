@@ -37,6 +37,8 @@ pub mod env;
 pub mod file;
 pub mod manifest;
 pub mod partial;
+mod reasoning;
+pub use reasoning::ReasoningEffort;
 
 #[cfg(test)]
 mod tests;
@@ -153,6 +155,10 @@ cfg_struct! {
         ignore_eos: bool = false,
         /// `INFR_NO_THINK`: suppress the model's thinking block. Set AND `!= "0"`.
         no_think: bool = false,
+        /// Model-native effort; unset preserves the embedded template's default.
+        reasoning_effort: Option<ReasoningEffort> = None,
+        /// Whether to retain previous reasoning. Unset preserves the template's policy.
+        preserve_thinking: Option<bool> = None,
     }
 }
 

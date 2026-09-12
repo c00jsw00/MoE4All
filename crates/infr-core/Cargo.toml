@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde.workspace = true
 infr-prof.workspace = true
 infr-prof-rt.workspace = true
 thiserror.workspace = true
