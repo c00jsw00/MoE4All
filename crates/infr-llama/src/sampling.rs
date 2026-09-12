@@ -137,6 +137,9 @@ pub struct RequestCtx {
     /// Latched by [`abort`](Self::abort) from inside a streaming callback (the server's
     /// stop-sequence matcher); polled once per decoded token by the decode loop.
     abort: std::sync::atomic::AtomicBool,
+    /// Frontend-owned cancellation latch. Unlike a text callback, this can fire while prefill is
+    /// running and is polled by the same natural work-boundary checks as `abort`.
+    external_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// This sequence's turn-taking baton on the GPU (`None` = sole user, e.g. `infr run`).
     gate: Option<std::sync::Arc<StepGate>>,
     /// Optional frontend observer for exact token/context progress. Server requests install one;
@@ -150,6 +153,7 @@ impl RequestCtx {
         Self {
             sampling,
             abort: std::sync::atomic::AtomicBool::new(false),
+            external_abort: None,
             gate: None,
             progress: None,
         }
@@ -161,6 +165,7 @@ impl RequestCtx {
         Self {
             sampling,
             abort: std::sync::atomic::AtomicBool::new(false),
+            external_abort: None,
             gate: Some(gate),
             progress: None,
         }
@@ -172,6 +177,16 @@ impl RequestCtx {
         progress: Option<infr_core::GenerationProgressCallback>,
     ) -> Self {
         self.progress = progress;
+        self
+    }
+
+    /// Attach the server request's cancellation latch so disconnects and deadlines are visible
+    /// during prefill as well as after the first decoded text callback.
+    pub fn with_external_abort(
+        mut self,
+        abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.external_abort = Some(abort);
         self
     }
 
@@ -187,9 +202,13 @@ impl RequestCtx {
         self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Polled by the decode loop once per token (one relaxed atomic load — no allocation, no lock).
+    /// Polled at prefill-chunk and decode-token boundaries (relaxed atomic loads, no lock).
     pub(crate) fn aborted(&self) -> bool {
         self.abort.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .external_abort
+                .as_ref()
+                .is_some_and(|abort| abort.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Take this sequence's turn on the GPU, blocking until the baton reaches it. `None` (no gate)
@@ -813,6 +832,19 @@ mod tests {
         assert!(!abort_requested(Some(&b)), "B must NOT see A's abort");
         // And a non-serve caller (run/bench/tests/goldens) has no latch at all.
         assert!(!abort_requested(None));
+    }
+
+    #[test]
+    fn frontend_abort_latch_is_observed_at_runner_boundaries() {
+        let frontend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = RequestCtx::new(cfg(0.0, 42)).with_external_abort(frontend.clone());
+
+        assert!(!abort_requested(Some(&req)));
+        frontend.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            abort_requested(Some(&req)),
+            "a frontend disconnect must reach existing prefill/decode abort checks"
+        );
     }
 
     /// `seed: 42` must reproduce byte-identically no matter how many other sequences are in flight.

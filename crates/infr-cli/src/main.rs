@@ -2317,7 +2317,7 @@ impl infr_server::ChatGenerator for SeamGenerator {
         tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
-        cancel: &std::sync::atomic::AtomicBool,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
         progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<infr_server::ChatOutcome> {
@@ -2341,7 +2341,7 @@ impl infr_server::ChatGenerator for ParallelGenerator {
         tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
-        cancel: &std::sync::atomic::AtomicBool,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
         progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<infr_server::ChatOutcome> {
@@ -2382,7 +2382,7 @@ fn run_chat(
     tools: Option<&serde_json::Value>,
     tool_choice: Option<&str>,
     params: &infr_server::GenParams,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     progress: Option<infr_core::GenerationProgressCallback>,
     on_delta: &mut dyn FnMut(infr_engine::Delta),
 ) -> anyhow::Result<infr_server::ChatOutcome> {
@@ -2409,6 +2409,7 @@ fn run_chat(
         // or leak into, any other in-flight request.
         let req = be
             .request_ctx(request_sampling(params))
+            .with_external_abort(cancel.clone())
             .with_progress(progress);
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the

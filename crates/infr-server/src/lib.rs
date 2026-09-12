@@ -21,10 +21,12 @@
 use std::{
     convert::Infallible,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -88,10 +90,10 @@ pub trait ChatGenerator: Send + Sync {
     /// * `tools` is the request's `tools` array as a borrowed [`serde_json::Value`] — passed by
     ///   reference so the generator parses the ONE it was already given instead of a
     ///   `Value`→string→`Value` round-trip (see audit finding 6).
-    /// * `cancel` is a PER-REQUEST abort latch. The server sets it when the client disconnects (an
-    ///   SSE `send` starts failing); the generator must poll it in its decode loop and stop promptly
-    ///   so the GPU slot is freed rather than held to `max_tokens`. It is ORed with the process-wide
-    ///   shutdown latch, never a replacement for it.
+    /// * `cancel` is a PER-REQUEST abort latch. The server sets it when the client disconnects or a
+    ///   request deadline expires; the generator must poll it at prefill/decode work boundaries so
+    ///   the GPU slot is released promptly. It is ORed with the process-wide shutdown latch, never
+    ///   a replacement for it.
     /// * `progress` receives exact cumulative model-token snapshots. Implementations should call it
     ///   only at natural work boundaries; it is optional so non-server frontends stay unaffected.
     /// * Returns a [`ChatOutcome`] carrying the finish reason AND the real prompt/completion token
@@ -102,7 +104,7 @@ pub trait ChatGenerator: Send + Sync {
         tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &GenParams,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome>;
@@ -2246,9 +2248,10 @@ async fn streaming(
     ));
     let progress_cb = progress.clone();
 
-    // Per-request abort latch: set when the client disconnects (an SSE `send` starts failing) and
-    // polled by the generator's decode loop so it stops promptly and frees the GPU slot instead of
-    // running to `max_tokens` into a dead socket (audit finding 2).
+    // Per-request abort latch: set as soon as the client-owned SSE response is dropped, with failed
+    // sends retained as a belt-and-suspenders fallback. The generator polls it at natural work
+    // boundaries so a disconnected client does not keep a GPU slot through the rest of a long
+    // prefill or decode (audit finding 2).
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_cb = cancel.clone();
 
@@ -2399,10 +2402,9 @@ async fn streaming(
         // above settled the stream it first reports the request as failed (B23).
     });
 
-    // Bridge the mpsc receiver to an async Stream for axum's Sse.
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    });
+    // The response body owns this stream. Axum drops it immediately when the client disconnects,
+    // including during a long prefill where no token has been sent yet.
+    let stream = CancelOnDropStream { rx, cancel };
 
     Sse::new(stream).into_response()
 }
@@ -2410,6 +2412,29 @@ async fn streaming(
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Turns the HTTP response body's lifetime into the generation's cancellation signal.
+///
+/// Relying only on a failed channel send is too late during prefill: no text delta exists yet, so a
+/// disconnected client can otherwise leave the backend running until the first decoded token.
+struct CancelOnDropStream {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Result<Event, Infallible>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl futures_util::Stream for CancelOnDropStream {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_recv(cx)
+    }
+}
+
+impl Drop for CancelOnDropStream {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Closes the SSE stream exactly once when it drops, from the normal end of the generation OR from
 /// an unwinding panic inside the decode closure.
@@ -2895,7 +2920,7 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            _cancel: &AtomicBool,
+            _cancel: &Arc<AtomicBool>,
             _progress: Option<infr_core::GenerationProgressCallback>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
@@ -2919,7 +2944,7 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            _cancel: &AtomicBool,
+            _cancel: &Arc<AtomicBool>,
             progress: Option<infr_core::GenerationProgressCallback>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
@@ -4237,7 +4262,7 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            cancel: &AtomicBool,
+            cancel: &Arc<AtomicBool>,
             _progress: Option<infr_core::GenerationProgressCallback>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
@@ -4250,6 +4275,36 @@ mod tests {
                 prompt_tokens: 3,
                 cached_prompt_tokens: 0,
                 completion_tokens: 1,
+            })
+        }
+    }
+
+    /// A prefill-shaped generator: it produces no delta before cancellation, so a failed `send`
+    /// can never be the mechanism that notices the disconnected client.
+    struct SilentLoopGen {
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl ChatGenerator for SilentLoopGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            cancel: &Arc<AtomicBool>,
+            _progress: Option<infr_core::GenerationProgressCallback>,
+            _on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            self.stopped.store(true, Ordering::Relaxed);
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 0,
+                cached_prompt_tokens: 0,
+                completion_tokens: 0,
             })
         }
     }
@@ -4396,6 +4451,39 @@ mod tests {
         assert!(text.contains("[DONE]"), "sentinel missing: {text}");
     }
 
+    /// Dropping the HTTP response must cancel generation even before the first content delta. This
+    /// is the long-prefill case behind a frontend Stop button appearing to do nothing.
+    #[tokio::test]
+    async fn dropping_streaming_response_cancels_before_first_delta() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let entry = deadline_entry(Arc::new(SilentLoopGen {
+            stopped: stopped.clone(),
+        }));
+        let resp = streaming(
+            entry.clone(),
+            user_msg(),
+            None,
+            None,
+            GenParams::default(),
+            test_ctx(None, true),
+        )
+        .await;
+
+        drop(resp);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !stopped.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("dropping the SSE body did not cancel the generator");
+        assert_eq!(
+            entry.slots.available_permits(),
+            1,
+            "the cancelled generation must release its GPU slot"
+        );
+    }
+
     /// The watchdog must not outlive its request. Dropping the "generation finished" sender — which
     /// is what the blocking task does when it returns, or unwinds — has to end the timer task, or a
     /// long-lived server accumulates one sleeping task per request. Asserted by waiting PAST the
@@ -4433,7 +4521,7 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            _cancel: &AtomicBool,
+            _cancel: &Arc<AtomicBool>,
             _progress: Option<infr_core::GenerationProgressCallback>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
@@ -4487,7 +4575,7 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            _cancel: &AtomicBool,
+            _cancel: &Arc<AtomicBool>,
             _progress: Option<infr_core::GenerationProgressCallback>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
