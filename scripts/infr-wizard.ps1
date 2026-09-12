@@ -645,6 +645,12 @@ $topP = [string](Get-SavedValue 'top_p' '')
 $seed = [string](Get-SavedValue 'seed' '')
 $serverAddr = [string](Get-SavedValue 'server_addr' '127.0.0.1:8080')
 $serverParallel = [string](Get-SavedValue 'server_parallel' '1')
+$defaultSessionCacheDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MoE4All\kv-sessions'
+$serverSessionCache = [bool](Get-SavedValue 'server_session_cache' $false)
+$sessionCacheDir = [string](Get-SavedValue 'session_cache_dir' $defaultSessionCacheDir)
+$sessionIdleSecs = [string](Get-SavedValue 'session_idle_secs' '120')
+$sessionCacheMax = [string](Get-SavedValue 'session_cache_max' '64GiB')
+$sessionCacheTtlHours = [string](Get-SavedValue 'session_cache_ttl_hours' '24')
 $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
 $serverVision = [bool](Get-SavedValue 'server_vision' $false)
@@ -714,6 +720,16 @@ if ($launchMode -eq 'benchmark') {
         Write-Host 'Use 127.0.0.1 locally. For LAN access use 0.0.0.0 and enable an API key.' -ForegroundColor DarkGray
         $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
         $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
+        $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
+        if ($serverSessionCache) {
+            Write-Host '闲置会话会在后台写入 SSD 并释放显存；再次访问时自动恢复。仅支持动态分段 Q8 KV。' -ForegroundColor DarkGray
+            Write-Host 'Idle sessions are written to SSD in the background and restored on demand. Dynamic segmented Q8 KV is required.' -ForegroundColor DarkGray
+            $sessionCacheDir = Read-TextValue -Label 'KV 缓存目录 / KV cache directory' -Default $sessionCacheDir -Required
+            $sessionCacheDir = ConvertTo-FullPath $sessionCacheDir
+            $sessionIdleSecs = Read-IntegerValue -Label '会话闲置多少秒后写入 SSD / Spill after idle seconds' -Default $sessionIdleSecs -Minimum 0
+            $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
+            $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
+        }
         $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
         if ($serverVision) {
             Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
@@ -840,6 +856,15 @@ if ($launchMode -eq 'server') {
     }
     [void]$nativeArgs.Add('--addr'); [void]$nativeArgs.Add($serverAddr)
     [void]$nativeArgs.Add('--parallel'); [void]$nativeArgs.Add($serverParallel)
+    if ($serverSessionCache) {
+        Add-SetArgument $nativeArgs 'kv.session_cache_dir' $sessionCacheDir
+        Add-SetArgument $nativeArgs 'kv.session_idle_secs' $sessionIdleSecs
+        Add-SetArgument $nativeArgs 'kv.session_cache_max' $sessionCacheMax
+        Add-SetArgument $nativeArgs 'kv.session_cache_ttl_hours' $sessionCacheTtlHours
+    } else {
+        # An explicit empty CLI layer disables a cache inherited from infr.toml or the environment.
+        Add-SetArgument $nativeArgs 'kv.session_cache_dir' ''
+    }
     if ($serverVision) {
         [void]$nativeArgs.Add('--mmproj'); [void]$nativeArgs.Add($visionProjectorPath)
     }
@@ -867,6 +892,9 @@ $state = [ordered]@{
     think_mode = $thinkMode; max_new = $maxNew; configure_sampling = $configureSampling
     temperature = $temperature; top_k = $topK; top_p = $topP; seed = $seed
     server_addr = $serverAddr; server_parallel = $serverParallel; server_auth = $serverAuth
+    server_session_cache = $serverSessionCache; session_cache_dir = $sessionCacheDir
+    session_idle_secs = $sessionIdleSecs; session_cache_max = $sessionCacheMax
+    session_cache_ttl_hours = $sessionCacheTtlHours
     server_vision = $serverVision; vision_projector = $visionProjectorPath
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout
