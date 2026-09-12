@@ -6370,6 +6370,189 @@ impl Backend for VulkanBackend {
         Ok(())
     }
 
+    fn buffer_committed_bytes(&self, buffer: &dyn Buffer) -> Result<usize> {
+        if let Some(segmented) = as_segmented_kv(buffer) {
+            return segmented
+                .committed()
+                .checked_mul(segmented.spec.segment_bytes)
+                .ok_or_else(|| be("segmented KV committed byte count overflow"));
+        }
+        Ok(as_vk_buf(buffer)?.size)
+    }
+
+    fn download_range(&self, src: &dyn Buffer, offset: usize, dst: &mut [u8]) -> Result<()> {
+        if let Some(segmented) = as_segmented_kv(src) {
+            let segments = segmented.segments.lock().unwrap();
+            let committed = segments
+                .len()
+                .checked_mul(segmented.spec.segment_bytes)
+                .ok_or_else(|| be("segmented KV committed byte count overflow"))?;
+            let end = offset
+                .checked_add(dst.len())
+                .ok_or_else(|| be("download_range offset overflow"))?;
+            if end > committed {
+                return Err(be(format!(
+                    "download_range: byte range {offset}..{end} exceeds segmented KV committed size {committed}"
+                )));
+            }
+            let mut logical = offset;
+            let mut written = 0usize;
+            while written < dst.len() {
+                let index = logical / segmented.spec.segment_bytes;
+                let within = logical % segmented.spec.segment_bytes;
+                let n = (segmented.spec.segment_bytes - within).min(dst.len() - written);
+                self.download_range(&segments[index], within, &mut dst[written..written + n])?;
+                logical += n;
+                written += n;
+            }
+            return Ok(());
+        }
+
+        let vk_src = as_vk_buf(src)?;
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(|| be("download_range offset overflow"))?;
+        check_extent("download_range", "out of", end, vk_src.size)?;
+        // A unified-arena mapping is the CPU-write ReBAR path. Reading it in the opposite
+        // direction is extremely slow on discrete AMD GPUs (tens of MiB/s), so bulk session
+        // spill must use the copy engine into cached readback memory even though a pointer exists.
+        // Ordinary host/readback buffers retain their direct mapped fast path.
+        if !matches!(&vk_src.backing, Backing::UnifiedSub(_)) {
+            if let Some(ptr) = vk_src.mapped_ptr() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ptr.add(offset) as *const u8,
+                        dst.as_mut_ptr(),
+                        dst.len(),
+                    )
+                };
+                return Ok(());
+            }
+        }
+        let staging = self.make_buf(
+            dst.len(),
+            MemoryLocation::GpuToCpu,
+            "download_range_staging",
+        )?;
+        let src_buf = vk_src.buffer;
+        let stg_buf = staging.buffer;
+        let src_off = vk_src
+            .sub_offset
+            .checked_add(offset)
+            .ok_or_else(|| be("download_range source offset overflow"))?
+            as u64;
+        let size = dst.len() as u64;
+        let shared = Arc::clone(&self.shared);
+        self.one_shot(move |cmd| {
+            let region = vk::BufferCopy {
+                src_offset: src_off,
+                dst_offset: 0,
+                size,
+            };
+            unsafe {
+                shared
+                    .device
+                    .cmd_copy_buffer(cmd, src_buf, stg_buf, &[region])
+            };
+        })?;
+        let ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("readback staging is not mapped"))? as *const u8;
+        unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len()) };
+        Ok(())
+    }
+
+    fn upload_range(&self, dst: &dyn Buffer, offset: usize, src: &[u8]) -> Result<()> {
+        if let Some(segmented) = as_segmented_kv(dst) {
+            let segments = segmented.segments.lock().unwrap();
+            let committed = segments
+                .len()
+                .checked_mul(segmented.spec.segment_bytes)
+                .ok_or_else(|| be("segmented KV committed byte count overflow"))?;
+            let end = offset
+                .checked_add(src.len())
+                .ok_or_else(|| be("upload_range offset overflow"))?;
+            if end > committed {
+                return Err(be(format!(
+                    "upload_range: byte range {offset}..{end} exceeds segmented KV committed size {committed}"
+                )));
+            }
+            let mut logical = offset;
+            let mut read = 0usize;
+            while read < src.len() {
+                let index = logical / segmented.spec.segment_bytes;
+                let within = logical % segmented.spec.segment_bytes;
+                let n = (segmented.spec.segment_bytes - within).min(src.len() - read);
+                self.upload_range(&segments[index], within, &src[read..read + n])?;
+                logical += n;
+                read += n;
+            }
+            return Ok(());
+        }
+
+        let vk_dst = as_vk_buf(dst)?;
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(|| be("upload_range offset overflow"))?;
+        check_extent("upload_range", "into", end, vk_dst.size)?;
+        if let Some(ptr) = vk_dst.mapped_ptr() {
+            copy_to_mapped(src, unsafe { ptr.add(offset) });
+            return Ok(());
+        }
+        if self.shared.weight_pb.lock().unwrap().is_some() {
+            let dst_off = vk_dst
+                .sub_offset
+                .checked_add(offset)
+                .ok_or_else(|| be("upload_range destination offset overflow"))?
+                as u64;
+            return self.upload_staged_ring(vk_dst.buffer, dst_off, src);
+        }
+        let staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_range_staging")?;
+        let stg_ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("staging buffer is not mapped"))?;
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), stg_ptr, src.len()) };
+        let stg_buf = staging.buffer;
+        let dst_buf = vk_dst.buffer;
+        let dst_off = vk_dst
+            .sub_offset
+            .checked_add(offset)
+            .ok_or_else(|| be("upload_range destination offset overflow"))?
+            as u64;
+        let size = src.len() as u64;
+        let shared = Arc::clone(&self.shared);
+        self.one_shot(move |cmd| {
+            let region = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: dst_off,
+                size,
+            };
+            unsafe {
+                shared
+                    .device
+                    .cmd_copy_buffer(cmd, stg_buf, dst_buf, &[region])
+            };
+        })?;
+        Ok(())
+    }
+
+    fn release_segmented_kv(&self, buffer: &dyn Buffer) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("release_segmented_kv received a flat or foreign buffer"))?;
+        self.with_unified_exclusive(|| {
+            let table_ptr = segmented
+                .table
+                .mapped_ptr()
+                .ok_or_else(|| be("segmented KV address table is not host-visible"))?;
+            unsafe {
+                std::ptr::write_bytes(table_ptr, 0, segmented.table.size);
+            }
+            segmented.segments.lock().unwrap().clear();
+            *segmented.reservation.lock().unwrap() = None;
+            Ok(())
+        })
+    }
+
     /// Copy `src` (host slice) into `dst` (device buffer).
     ///
     /// If `dst` is host-visible (`CpuToGpu`), writes directly through the
@@ -7772,6 +7955,40 @@ mod tests {
         assert_ne!(small_addresses[1], 0);
         assert_ne!(small_addresses[0], small_addresses[1]);
         assert_eq!(small_addresses[2], 0);
+
+        assert_eq!(
+            be.buffer_committed_bytes(virtual_kv.as_ref())
+                .expect("inspect committed bytes"),
+            2 * MIB
+        );
+        let offset = MIB - 31;
+        let payload = (0..97)
+            .map(|index| (index as u8).wrapping_mul(29))
+            .collect::<Vec<_>>();
+        be.upload_range(virtual_kv.as_ref(), offset, &payload)
+            .expect("upload across a segment boundary");
+        let mut restored = vec![0u8; payload.len()];
+        be.download_range(virtual_kv.as_ref(), offset, &mut restored)
+            .expect("download across a segment boundary");
+        assert_eq!(restored, payload);
+
+        be.release_segmented_kv(virtual_kv.as_ref())
+            .expect("release committed KV segments");
+        assert_eq!(segmented.committed(), 0);
+        assert!(addresses.iter().all(|&address| address == 0));
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::KvCache),
+            MIB
+        );
+        be.ensure_segmented_kv(virtual_kv.as_ref(), 2)
+            .expect("recommit released KV segments");
+        assert_eq!(segmented.committed(), 2);
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::KvCache),
+            3 * MIB
+        );
 
         drop(virtual_kv);
         drop(virtual_kv_small);

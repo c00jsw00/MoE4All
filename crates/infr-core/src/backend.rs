@@ -555,6 +555,59 @@ pub trait Backend: Send + Sync {
             "segmented KV is not supported by this backend",
         ))
     }
+    /// Physical bytes currently backing `buffer`. Ordinary buffers are fully committed, while a
+    /// segmented KV buffer may expose a much larger logical [`Buffer::len_bytes`] than it owns.
+    /// Session spill code uses this value so it never reads uncommitted virtual rows.
+    fn buffer_committed_bytes(&self, buffer: &dyn Buffer) -> Result<usize> {
+        Ok(buffer.len_bytes())
+    }
+    /// Read one byte range without materializing the whole buffer on the host. The default keeps
+    /// every established backend correct; backends with segmented or directly addressable storage
+    /// override it to avoid the prefix-sized temporary.
+    fn download_range(&self, src: &dyn Buffer, offset: usize, dst: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(|| crate::error::Error::backend("download_range offset overflow"))?;
+        if end > self.buffer_committed_bytes(src)? {
+            return Err(crate::error::Error::backend(format!(
+                "download_range: byte range {offset}..{end} exceeds committed buffer size"
+            )));
+        }
+        if offset == 0 {
+            return self.download(src, dst);
+        }
+        let mut prefix = vec![0u8; end];
+        self.download(src, &mut prefix)?;
+        dst.copy_from_slice(&prefix[offset..end]);
+        Ok(())
+    }
+    /// Write one byte range without replacing bytes outside it. See [`Self::download_range`].
+    /// The fallback preserves the existing prefix, patches it, then uploads that prefix; Vulkan
+    /// overrides this with an offset copy and segmented-buffer traversal.
+    fn upload_range(&self, dst: &dyn Buffer, offset: usize, src: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(|| crate::error::Error::backend("upload_range offset overflow"))?;
+        if end > self.buffer_committed_bytes(dst)? {
+            return Err(crate::error::Error::backend(format!(
+                "upload_range: byte range {offset}..{end} exceeds committed buffer size"
+            )));
+        }
+        if offset == 0 {
+            return self.upload(dst, src);
+        }
+        let mut prefix = vec![0u8; end];
+        self.download(dst, &mut prefix)?;
+        prefix[offset..end].copy_from_slice(src);
+        self.upload(dst, &prefix)
+    }
+    /// Return all physical segments owned by one lazily committed KV buffer while retaining its
+    /// logical object/address table for a later restore. Non-segmented backends reject the call.
+    fn release_segmented_kv(&self, _buffer: &dyn Buffer) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV release is not supported by this backend",
+        ))
+    }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
     /// Emit the one-shot KV-cache placement summary for a VRAM-first spill backend (the Vulkan
