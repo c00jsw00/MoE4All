@@ -10,7 +10,7 @@ use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
 use infr_core::graph::{
     Activation, AttnMask, Dsv4CacheFormat, Graph, MoePrefetchHint, Op, TensorKind,
-    EXPERT_PREFETCH_CANDIDATES, QSA_MAX_TOP_BLOCKS,
+    QSA_MAX_TOP_BLOCKS,
 };
 use infr_core::shutdown::shutdown_requested;
 use infr_core::{Backend, TensorId};
@@ -6412,6 +6412,16 @@ const PREFETCH_WINDOW_NUMERATOR: u64 = 4;
 const PREFETCH_WINDOW_DENOMINATOR: u64 = 5;
 const PREFETCH_TRANSFER_GUARD_NS: u64 = 40_000;
 const PREFETCH_INITIAL_NS_PER_MIB: u64 = 60_000;
+const PREFETCH_GDN_RANK_LIMIT: usize = 1;
+const PREFETCH_QSA_RANK_LIMIT: usize = 0;
+
+fn decode_prefetch_rank_limit(target_qsa: bool) -> usize {
+    if target_qsa {
+        PREFETCH_QSA_RANK_LIMIT
+    } else {
+        PREFETCH_GDN_RANK_LIMIT
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct DecodePrefetchWindowKey {
@@ -6775,7 +6785,12 @@ fn run_decode_prefetch_worker(
         let deadline = job.control.started + std::time::Duration::from_nanos(budget_ns);
         let mut pending_ssd = None;
         let profile = infr_core::pager_profile::active();
-        for expert in job.predicted_ids {
+        // Do not skip resident high-confidence predictions and then search deep into the ranking
+        // for any cold expert. That selection bias admitted low-confidence blocks, displaced useful
+        // cache entries and more than doubled H2D traffic on Qwen3.8. The measured FATE trace only
+        // justifies the first GDN prediction; QSA cold predictions did not clear break-even.
+        let rank_limit = decode_prefetch_rank_limit(job.control.window_key.qsa);
+        for expert in job.predicted_ids.into_iter().take(rank_limit) {
             if job.control.cancel.load(Ordering::Acquire) {
                 break;
             }
@@ -8458,19 +8473,25 @@ fn execute_paged_moe<'a>(
                 .copied()
         })
         .flatten();
-    let prefetch_gpu: Option<(MoePrefetchHint, ScratchKey, Vec<usize>)> =
-        if let Some(hint) = prefetch_hint {
-            if rows != 1
-                || hint.target_n_expert as usize != n_expert
-                || has_bias
-                || hash
-                || *n_expert_groups > 1
-                || !matches!(gating, infr_core::graph::MoeGating::Softmax)
-            {
-                return Err(be(
+    let prefetch_gpu: Option<(MoePrefetchHint, ScratchKey, Vec<usize>)> = if let Some(hint) =
+        prefetch_hint
+    {
+        if rows != 1
+            || hint.target_n_expert as usize != n_expert
+            || has_bias
+            || hash
+            || *n_expert_groups > 1
+            || !matches!(gating, infr_core::graph::MoeGating::Softmax)
+        {
+            return Err(be(
                 "vulkan adapter: expert prefetch only supports single-row uniform softmax Qwen MoE",
             ));
-            }
+        }
+        let target_n_expert = hint.target_n_expert as usize;
+        let predicted = decode_prefetch_rank_limit(hint.target_qsa).min(target_n_expert);
+        if predicted == 0 {
+            None
+        } else {
             let target_gate_id = buffer_identity(r(hint.target_gate_exps)?);
             let target_up_id = buffer_identity(r(hint.target_up_exps)?);
             let target_down_id = buffer_identity(r(hint.target_down_exps)?);
@@ -8484,13 +8505,11 @@ fn execute_paged_moe<'a>(
                 let session = guard.as_ref().expect("paged execution requires a session");
                 role_buf_ids
                     .iter()
-                    .all(|&buf_id| session.all_resident(buf_id, hint.target_n_expert as usize))
+                    .all(|&buf_id| session.all_resident(buf_id, target_n_expert))
             };
             if target_all_resident {
                 None
             } else {
-                let target_n_expert = hint.target_n_expert as usize;
-                let predicted = EXPERT_PREFETCH_CANDIDATES.min(target_n_expert);
                 let next_logits = pooled(pool, be_, "moe_prefetch_logits", target_n_expert * 4)?;
                 let next_ids = pooled_usage(
                     pool,
@@ -8545,9 +8564,10 @@ fn execute_paged_moe<'a>(
                 );
                 Some((hint, next_ids, role_buf_ids))
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
     {
         let rc = rec.as_ref().expect("segment always Some between ops");
         let rxb = r(*router_x)?;
@@ -8702,7 +8722,8 @@ fn execute_paged_moe<'a>(
         }
     }
     let pending_prefetch = if let Some((hint, ids_key, role_buf_ids)) = prefetch_gpu {
-        let predicted = EXPERT_PREFETCH_CANDIDATES.min(hint.target_n_expert as usize);
+        let predicted =
+            decode_prefetch_rank_limit(hint.target_qsa).min(hint.target_n_expert as usize);
         let mut id_bytes = vec![0u8; predicted * 4];
         be_.download(pool[&ids_key].as_ref(), &mut id_bytes)
             .map_err(|e| be(e.to_string()))?;
@@ -9577,6 +9598,12 @@ mod tests {
         );
         observe_ram_prefetch(1 << 20, std::time::Duration::from_micros(100), &estimate);
         assert_eq!(estimate.load(Ordering::Relaxed), 70_000);
+    }
+
+    #[test]
+    fn decode_prefetch_admits_only_measured_profitable_ranks() {
+        assert_eq!(decode_prefetch_rank_limit(false), 1);
+        assert_eq!(decode_prefetch_rank_limit(true), 0);
     }
 
     #[test]
