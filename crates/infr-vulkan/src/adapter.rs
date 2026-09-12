@@ -346,6 +346,27 @@ fn resolve<'a>(
     }
 }
 
+fn resolve_rows<'a>(
+    bindings: &'a Bindings,
+    id: TensorId,
+    rows: usize,
+) -> Result<&'a [&'a dyn Buffer]> {
+    let bufs = bindings.get_rows(id).ok_or_else(|| {
+        be(format!(
+            "vulkan adapter: tensor {} has no independent-row bindings",
+            id.0
+        ))
+    })?;
+    if bufs.len() != rows {
+        return Err(be(format!(
+            "vulkan adapter: tensor {} has {} row bindings, expected {rows}",
+            id.0,
+            bufs.len()
+        )));
+    }
+    Ok(bufs)
+}
+
 /// Allocate the `Internal` scratch (activations) for `graph`. The leading (row) dim is padded to a
 /// multiple of 64 so the prefill GEMM / flash kernels — which write ceil(rows/64)*64 output rows —
 /// write DIRECTLY into these buffers (no padded temp + copy). Padding rows are never read (downstream
@@ -2812,12 +2833,77 @@ fn lower_op(
         } => {
             let (rows, rs, pos) = (*rows as usize, *row_stride as usize, *pos as usize);
             let n = rows * rs;
-            let (s, c) = (r(*src)?, r(*cache)?);
+            let s = r(*src)?;
             // Q8_0 cache: quantize the row(s) into 34 B/32-elem blocks. For a Q8 cache the K-rope
             // peephole is disabled, so the K WriteKv (f16 staging) reaches here alongside the f32 V.
             let cache_dt = graph.desc(*cache).dtype;
             let cache_q8 = matches!(cache_dt, infr_core::DType::Q8_0);
             let src_f16 = matches!(graph.desc(*src).dtype, infr_core::DType::F16);
+            // Planar scales region begins at byte `cap` = total cache elements.
+            let cap = graph.desc(*cache).numel();
+            if graph.independent_rows {
+                if !matches!(mode, RopeMode::Static(_)) {
+                    return Err(be(
+                        "independent-row KV writes require the static Vulkan path",
+                    ));
+                }
+                let caches = resolve_rows(bindings, *cache, rows)?;
+                let cap_rows = cap / rs.max(1);
+                let dst_row = if cap_rows > 0 { pos % cap_rows } else { pos };
+                for (row, &cache_buf) in caches.iter().enumerate() {
+                    let src_off = row * rs;
+                    if let Some((table, segment_shift)) = segmented_kv_view(cache_buf) {
+                        let off = pos * rs;
+                        if cache_q8 {
+                            rec.store_q8_segmented(
+                                s,
+                                table,
+                                rs,
+                                off,
+                                src_f16,
+                                src_off,
+                                segment_shift,
+                            );
+                        } else if cache_dt == infr_core::DType::F16 {
+                            rec.store_f16_off_segmented(
+                                s,
+                                table,
+                                rs,
+                                off,
+                                src_off,
+                                segment_shift,
+                                src_f16,
+                            );
+                        } else {
+                            return Err(be(format!(
+                                "independent-row segmented KV write does not support {cache_dt:?} cache"
+                            )));
+                        }
+                        continue;
+                    }
+                    if cache_q8 {
+                        rec.store_q8(s, cache_buf, rs, dst_row * rs, cap, src_f16, src_off);
+                    } else if cache_dt == infr_core::DType::F16 {
+                        match graph.desc(*src).dtype {
+                            infr_core::DType::F16 => {
+                                rec.copy(s, src_off * 2, cache_buf, dst_row * rs * 2, rs * 2)
+                            }
+                            _ => match cache_buf.device_addr() {
+                                Some(a) => {
+                                    rec.store_f16_off_at(s, cache_buf, a, rs, dst_row * rs, src_off)
+                                }
+                                None => rec.store_f16_off(s, cache_buf, rs, dst_row * rs, src_off),
+                            },
+                        }
+                    } else {
+                        return Err(be(format!(
+                            "independent-row KV write does not support {cache_dt:?} cache"
+                        )));
+                    }
+                }
+                return Ok(());
+            }
+            let c = r(*cache)?;
             if let Some((table, segment_shift)) = segmented_kv_view(c) {
                 if !matches!(mode, RopeMode::Static(_)) {
                     return Err(be(
@@ -2836,8 +2922,6 @@ fn lower_op(
                 }
                 return Ok(());
             }
-            // Planar scales region begins at byte `cap` = total cache elements.
-            let cap = graph.desc(*cache).numel();
             // SWA ring cache: the write for position p lands at row p % cap_rows — the ring only
             // recycles rows whose positions the window mask already excludes (see the runner's
             // ring sizing). A batched prefill write crossing the wrap splits into two contiguous
@@ -3099,6 +3183,59 @@ fn lower_op(
             } else {
                 None
             };
+            if graph.independent_rows {
+                if positions4.is_some() {
+                    return Err(be(
+                        "independent-row QSA does not support multimodal positions",
+                    ));
+                }
+                let row_count = *rows as usize;
+                let raw = resolve_rows(bindings, *k_cache, row_count)?;
+                let compressed = resolve_rows(bindings, *block_cache, row_count)?;
+                let q_row_bytes = *n_head as usize * *head_dim as usize * 2;
+                let dst_row_bytes = *top_blocks as usize * 4;
+                for row in 0..row_count {
+                    let (raw_binding, block_binding, segment_shifts) = match (
+                        segmented_kv_view(raw[row]),
+                        segmented_kv_view(compressed[row]),
+                    ) {
+                        (Some((raw_table, raw_shift)), Some((block_table, block_shift))) => {
+                            (raw_table, block_table, Some((raw_shift, block_shift)))
+                        }
+                        (None, None) => (raw[row], compressed[row], None),
+                        _ => {
+                            return Err(be(
+                                "vulkan independent-row QSA raw and block caches must both be segmented or both be flat",
+                            ));
+                        }
+                    };
+                    rec.qsa_indexer_off(
+                        r(*q)?,
+                        raw_binding,
+                        block_binding,
+                        r(*k_norm)?,
+                        pool[&sk].as_ref(),
+                        None,
+                        r(*dst)?,
+                        1,
+                        *kv_len,
+                        *compress_from,
+                        *n_head,
+                        *head_dim,
+                        *top_blocks,
+                        *ratio,
+                        *rope_dim,
+                        *theta,
+                        *eps,
+                        *scale,
+                        segment_shifts,
+                        None,
+                        row * q_row_bytes,
+                        row * dst_row_bytes,
+                    );
+                }
+                return Ok(());
+            }
             let raw_cache = r(*k_cache)?;
             let block_cache = r(*block_cache)?;
             let (raw_binding, block_binding, segment_shifts) = match (
@@ -3253,6 +3390,61 @@ fn lower_op(
                      k_dtype={kdt:?} v_dtype={vdt:?}"
                 )));
             }
+            if graph.independent_rows {
+                let row_count = *rows as usize;
+                let k_rows = resolve_rows(bindings, *k_cache, row_count)?;
+                let v_rows = resolve_rows(bindings, *v_cache, row_count)?;
+                let q_row_bytes = *n_head as usize * *head_dim as usize * 2;
+                let idx_row_bytes = *top_blocks as usize * 4;
+                let dst_row_bytes = *n_head as usize * *head_dim as usize * 4;
+                for row in 0..row_count {
+                    let (k_binding, v_binding, segment_shift) = match (
+                        segmented_kv_view(k_rows[row]),
+                        segmented_kv_view(v_rows[row]),
+                    ) {
+                        (Some((k_table, k_shift)), Some((v_table, v_shift)))
+                            if k_shift == v_shift =>
+                        {
+                            (k_table, v_table, Some(k_shift))
+                        }
+                        (Some(_), Some(_)) => {
+                            return Err(be(
+                                "vulkan independent-row QSA K/V segment geometry differs",
+                            ));
+                        }
+                        (None, None) => (k_rows[row], v_rows[row], None),
+                        _ => {
+                            return Err(be(
+                                "vulkan independent-row QSA K/V caches must both be segmented or both be flat",
+                            ));
+                        }
+                    };
+                    rec.qsa_attention_batch_off(
+                        r(*q)?,
+                        k_binding,
+                        v_binding,
+                        r(*indices)?,
+                        r(*dst)?,
+                        1,
+                        *kv_len,
+                        *n_head,
+                        *n_kv,
+                        *head_dim,
+                        *top_blocks,
+                        *ratio,
+                        *scale,
+                        kdt == infr_core::DType::Q8_0,
+                        vdt == infr_core::DType::Q8_0,
+                        graph.desc(*k_cache).numel() as u32,
+                        graph.desc(*v_cache).numel() as u32,
+                        segment_shift,
+                        row * q_row_bytes,
+                        row * idx_row_bytes,
+                        row * dst_row_bytes,
+                    );
+                }
+                return Ok(());
+            }
             let k_cache_buf = r(*k_cache)?;
             let v_cache_buf = r(*v_cache)?;
             let (k_binding, v_binding, segment_shift) = match (
@@ -3392,6 +3584,54 @@ fn lower_op(
             // see `kv_write_peephole`); `kcap` is the fused cache's row capacity for the DYNAMIC
             // path, where the row must be derived from the live params pos in-kernel (the ring
             // modulo rides the same params channel as the pos itself — never a baked constant).
+            if graph.independent_rows {
+                let RopeMode::Static(rope_pos) = mode else {
+                    return Err(be("independent-row RoPE requires the static Vulkan path"));
+                };
+                let ff = match freq_factors {
+                    Some(f) => Some(r(*f)?),
+                    None => None,
+                };
+                let row_elems = *n_head as usize * *head_dim as usize;
+                for row in 0..*rows as usize {
+                    if *x_stride > 0 && ff.is_none() {
+                        rec.qk_norm_rope_interleaved_off(
+                            r(*x)?,
+                            r(*weight)?,
+                            r(*dst)?,
+                            1,
+                            *n_head as usize,
+                            *head_dim as usize,
+                            *rope_dim as usize,
+                            *theta,
+                            rope_pos[&positions.0],
+                            0,
+                            *eps,
+                            *x_stride as usize,
+                            row * *x_stride as usize * 4,
+                            row * row_elems * 2,
+                        );
+                    } else {
+                        rec.qk_norm_rope_off(
+                            r(*x)?,
+                            r(*weight)?,
+                            r(*dst)?,
+                            1,
+                            *n_head as usize,
+                            *head_dim as usize,
+                            *rope_dim as usize,
+                            *theta,
+                            rope_pos[&positions.0],
+                            0,
+                            *eps,
+                            ff,
+                            row * row_elems * 4,
+                            row * row_elems * 2,
+                        );
+                    }
+                }
+                return Ok(());
+            }
             let (out_buf, fused, kcap) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
                 let row = (*n_head as usize) * (*head_dim as usize);
                 (r(cache)?, Some(pos), graph.desc(cache).numel() / row.max(1))
@@ -3771,8 +4011,16 @@ fn lower_op(
             let kv_q8 = k_q8 && v_q8; // coupled (the Dynamic-branch kernels' q8 variant)
                                       // Planar Q8 scales region base = total cache elements (K and V caches share numel).
             let cap = graph.desc(*k_cache).numel();
-            let k_segmented = segmented_kv_view(r(*k_cache)?);
-            let v_segmented = segmented_kv_view(r(*v_cache)?);
+            let k_segmented = if graph.independent_rows {
+                None
+            } else {
+                segmented_kv_view(r(*k_cache)?)
+            };
+            let v_segmented = if graph.independent_rows {
+                None
+            } else {
+                segmented_kv_view(r(*v_cache)?)
+            };
             let segmented_cache = match (k_segmented, v_segmented) {
                 (None, None) => false,
                 (Some((_, ks)), Some((_, vs))) if ks == vs => true,
@@ -3795,6 +4043,127 @@ fn lower_op(
             // kv_len (padded, for nonfa's 256-row tiles) outruns the rows actually present. On a
             // full-context cache kv_len <= att_cap_rows always, so none of these gates move.
             let att_cap_rows = cap / (nkv * hd).max(1);
+            if graph.independent_rows {
+                if !matches!(mode, RopeMode::Static(_)) {
+                    return Err(be(
+                        "independent-row attention requires the static Vulkan path",
+                    ));
+                }
+                if !matches!(graph.desc(*q).dtype, infr_core::DType::F16)
+                    || !matches!(graph.desc(*dst).dtype, infr_core::DType::F32)
+                {
+                    return Err(be(
+                        "independent-row attention requires f16 queries and f32 output",
+                    ));
+                }
+                if sinks.is_some() {
+                    return Err(be("independent-row attention does not support sinks"));
+                }
+                let window = match mask {
+                    AttnMask::Causal => 0,
+                    AttnMask::SlidingWindow(window) => *window,
+                    AttnMask::Canvas { .. } => {
+                        return Err(be(
+                            "independent-row attention does not support a canvas mask",
+                        ));
+                    }
+                };
+                let k_rows = resolve_rows(bindings, *k_cache, rows)?;
+                let v_rows = resolve_rows(bindings, *v_cache, rows)?;
+                let span_start = if window > 0 {
+                    (pos + 1).saturating_sub(window)
+                } else {
+                    0
+                };
+                let span = kv_len.saturating_sub(span_start);
+                if span == 0 {
+                    return Err(be("independent-row attention has an empty KV span"));
+                }
+                let chunk = split_k_chunk_count_cap(
+                    span,
+                    infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT),
+                );
+                let n_chunks = span.div_ceil(chunk);
+                let pm = pooled(pool, be_, "independent_split_pm", nh * n_chunks * 4)?;
+                let pl = pooled(pool, be_, "independent_split_pl", nh * n_chunks * 4)?;
+                let pacc = pooled(pool, be_, "independent_split_pacc", nh * n_chunks * hd * 4)?;
+                let q_row_bytes = nh * hd * 2;
+                let o_row_bytes = nh * hd * 4;
+                for row in 0..rows {
+                    let kb = k_rows[row];
+                    let vb = v_rows[row];
+                    match (segmented_kv_view(kb), segmented_kv_view(vb)) {
+                        (Some((kt, ks)), Some((vt, vs))) if ks == vs => {
+                            rec.attention_kv_split_segmented_off(
+                                r(*q)?,
+                                row * q_row_bytes,
+                                kt,
+                                vt,
+                                r(*dst)?,
+                                row * o_row_bytes,
+                                pool[&pm].as_ref(),
+                                pool[&pl].as_ref(),
+                                pool[&pacc].as_ref(),
+                                pos,
+                                kv_len,
+                                nh,
+                                nkv,
+                                hd,
+                                chunk,
+                                n_chunks,
+                                *scale,
+                                window,
+                                k_q8,
+                                v_q8,
+                                ks,
+                            );
+                        }
+                        (Some(_), Some(_)) => {
+                            return Err(be(
+                                "independent-row attention K/V segment geometry differs",
+                            ));
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
+                            return Err(be(
+                                "independent-row attention cannot mix segmented and flat K/V",
+                            ));
+                        }
+                        (None, None) => match (kb.device_addr(), vb.device_addr()) {
+                            (Some(ka), Some(va)) => rec.attention_kv_split_at_off(
+                                r(*q)?,
+                                row * q_row_bytes,
+                                kb,
+                                vb,
+                                ka,
+                                va,
+                                r(*dst)?,
+                                row * o_row_bytes,
+                                pool[&pm].as_ref(),
+                                pool[&pl].as_ref(),
+                                pool[&pacc].as_ref(),
+                                pos,
+                                kv_len,
+                                nh,
+                                nkv,
+                                hd,
+                                chunk,
+                                n_chunks,
+                                *scale,
+                                window,
+                                k_q8,
+                                v_q8,
+                                cap,
+                            ),
+                            _ => {
+                                return Err(be(
+                                    "independent-row flat KV caches require device addresses",
+                                ));
+                            }
+                        },
+                    }
+                }
+                return Ok(());
+            }
             // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) live in exactly ONE
             // kernel — `attention_kv.comp`'s -DSINKS build. Nothing else in the tier ladder below
             // (flash, non-FA coopmat, split-K, the Q8/BDA/params twins) knows about them, and a
@@ -4777,6 +5146,28 @@ fn lower_op(
         } => {
             // Batch (rows ≥ kconv-1): all rows·cc outputs in parallel + a history rebuild pass,
             // instead of the token-serial history walk. Decode keeps the sequential kernel.
+            if graph.independent_rows {
+                let row_count = *rows as usize;
+                let states = resolve_rows(bindings, *state, row_count)?;
+                let weight = r(*weight)?;
+                let arena_addr = weight.device_addr().ok_or_else(|| {
+                    be("independent-row conv1d requires a device-addressable weight")
+                })?;
+                for (row, &state) in states.iter().enumerate() {
+                    rec.conv1d_silu_row_at(
+                        r(*x)?,
+                        arena_addr,
+                        state,
+                        r(*dst)?,
+                        1,
+                        *channels as usize,
+                        *kernel as usize,
+                        row * *channels as usize,
+                        row * *channels as usize,
+                    );
+                }
+                return Ok(());
+            }
             let cv = if *rows as usize >= (*kernel as usize).saturating_sub(1).max(2) {
                 Recorder::conv1d_silu_batch
             } else {
@@ -4841,6 +5232,62 @@ fn lower_op(
                 *head_k as usize,
                 *head_v as usize,
             );
+            if graph.independent_rows {
+                let states = resolve_rows(bindings, *state, rows_)?;
+                let qkv_stride = 2 * nk_ * kd_ + nv_ * vd_;
+                let strided = *q == *k && *k == *v && be_.cfg().kernels.vulkan.delta_strided;
+                for (row, &state) in states.iter().enumerate() {
+                    if strided {
+                        rec.deltanet_strided_off(
+                            r(*q)?,
+                            r(*k)?,
+                            r(*v)?,
+                            r(*b)?,
+                            r(*a)?,
+                            r(*a_coef)?,
+                            r(*dt_bias)?,
+                            state,
+                            r(*dst)?,
+                            1,
+                            nv_,
+                            nk_,
+                            kd_,
+                            vd_,
+                            *eps,
+                            qkv_stride,
+                            row * qkv_stride,
+                            row * nv_,
+                            row * nv_,
+                            row * nv_ * vd_,
+                        );
+                    } else {
+                        rec.deltanet_off(
+                            r(*q)?,
+                            r(*k)?,
+                            r(*v)?,
+                            r(*b)?,
+                            r(*a)?,
+                            r(*a_coef)?,
+                            r(*dt_bias)?,
+                            state,
+                            r(*dst)?,
+                            1,
+                            nv_,
+                            nk_,
+                            kd_,
+                            vd_,
+                            *eps,
+                            row * nk_ * kd_,
+                            row * nk_ * kd_,
+                            row * nv_ * vd_,
+                            row * nv_,
+                            row * nv_,
+                            row * nv_ * vd_,
+                        );
+                    }
+                }
+                return Ok(());
+            }
             let chunked = rows_ >= 2 && be_.cfg().kernels.vulkan.dn_chunk;
             // DEFAULT prefill path: the token-serial scan with the state column register-resident
             // (norm + gates + seq). The chunked delta rule was believed to win by doing ⌈rows/32⌉
@@ -7162,6 +7609,16 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             for idx in unfuse {
                 plan.linear_add.remove(&idx);
                 plan.skip.remove(&(idx + 1));
+            }
+        }
+    }
+    if graph.independent_rows {
+        // A fused K write targets one cache binding, while independent rows own distinct caches.
+        // Leave every WriteKv explicit so its row-aware lowering can select the right sequence.
+        plan.kv_write.clear();
+        for (idx, op) in graph.ops.iter().enumerate() {
+            if matches!(op, Op::WriteKv { .. }) {
+                plan.skip.remove(&idx);
             }
         }
     }
@@ -11678,6 +12135,137 @@ mod tests {
                     want[i]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn attention_independent_rows_match_distinct_kv_caches() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        let (rows, nh, nkv, hd, kv_len) = (3usize, 4usize, 2usize, 64usize, 96usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let group = nh / nkv;
+        let to_f16 = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|&value| half::f16::from_f32(value).to_le_bytes())
+                .collect()
+        };
+        let deq = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .chunks_exact(2)
+                .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                .collect()
+        };
+
+        let q: Vec<f32> = (0..rows * nh * hd)
+            .map(|index| (index as f32 * 0.037).sin())
+            .collect();
+        let qf = to_f16(&q);
+        let qd = deq(&qf);
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        let mut want = vec![0f32; rows * nh * hd];
+        for row in 0..rows {
+            let key: Vec<f32> = (0..kv_len * nkv * hd)
+                .map(|index| ((index + row * 29) as f32 * 0.013).cos())
+                .collect();
+            let value: Vec<f32> = (0..kv_len * nkv * hd)
+                .map(|index| ((index + row * 41) % 191) as f32 * 0.01 - 0.8)
+                .collect();
+            let key = to_f16(&key);
+            let value = to_f16(&value);
+            let kd = deq(&key);
+            let vd = deq(&value);
+            for head in 0..nh {
+                let kv_head = head / group;
+                let mut scores = vec![0f32; kv_len];
+                let mut max = f32::NEG_INFINITY;
+                for (position, score) in scores.iter_mut().enumerate() {
+                    let dot: f32 = (0..hd)
+                        .map(|dim| {
+                            qd[(row * nh + head) * hd + dim]
+                                * kd[(position * nkv + kv_head) * hd + dim]
+                        })
+                        .sum();
+                    *score = dot * scale;
+                    max = max.max(*score);
+                }
+                let sum: f32 = scores.iter().map(|score| (score - max).exp()).sum();
+                for (position, score) in scores.iter().enumerate() {
+                    let probability = (score - max).exp() / sum;
+                    for dim in 0..hd {
+                        want[(row * nh + head) * hd + dim] +=
+                            probability * vd[(position * nkv + kv_head) * hd + dim];
+                    }
+                }
+            }
+            keys.push(key);
+            values.push(value);
+        }
+
+        let mut graph = Graph::new();
+        graph.independent_rows = true;
+        let qi = graph.input(TensorDesc::new(vec![rows, nh, hd], DType::F16));
+        let ki = graph.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+        let vi = graph.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+        let yi = graph.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        graph.push(Op::Attention {
+            q: qi,
+            k_cache: ki,
+            v_cache: vi,
+            dst: yi,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Causal,
+            pos: (kv_len - 1) as u32,
+            sinks: None,
+        });
+        let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
+        let yb = be_
+            .alloc(rows * nh * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        be_.upload(qb.as_ref(), &qf).unwrap();
+        let mut key_buffers = Vec::new();
+        let mut value_buffers = Vec::new();
+        for row in 0..rows {
+            let kb = be_.alloc(keys[row].len(), BufferUsage::KvCache).unwrap();
+            let vb = be_.alloc(values[row].len(), BufferUsage::KvCache).unwrap();
+            be_.upload(kb.as_ref(), &keys[row]).unwrap();
+            be_.upload(vb.as_ref(), &values[row]).unwrap();
+            key_buffers.push(kb);
+            value_buffers.push(vb);
+        }
+        let plan = be_.compile(&graph).unwrap();
+        let mut bindings = Bindings::new();
+        bindings.bind(qi, qb.as_ref());
+        bindings.bind_rows(
+            ki,
+            key_buffers.iter().map(|buffer| buffer.as_ref()).collect(),
+        );
+        bindings.bind_rows(
+            vi,
+            value_buffers.iter().map(|buffer| buffer.as_ref()).collect(),
+        );
+        bindings.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bindings).unwrap();
+        let mut got = vec![0f32; rows * nh * hd];
+        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for index in 0..got.len() {
+            assert!(
+                (got[index] - want[index]).abs() < 2e-2,
+                "independent attention mismatch at row {}, head {}: got {} want {}",
+                index / (nh * hd),
+                (index / hd) % nh,
+                got[index],
+                want[index]
+            );
         }
     }
 

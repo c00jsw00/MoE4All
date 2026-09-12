@@ -468,11 +468,16 @@ impl Plan for GraphPlan {
 /// not a `HashMap` — `bind`/`get` are then hash-free O(1), which matters because decode rebinds
 /// every step. `bind`/`get` semantics are identical to the old map: `get` on an unbound (or
 /// never-grown-to) id returns `None`, and re-binding an id overwrites.
+enum BoundBuffer<'a> {
+    Single(&'a dyn Buffer),
+    Rows(Vec<&'a dyn Buffer>),
+}
+
 #[derive(Default)]
 pub struct Bindings<'a> {
     /// `slots[id.0] = Some(buf)` for a bound handle, `None` for unbound. Grows on demand to the
     /// highest id bound (bounded by the graph's tensor count).
-    slots: Vec<Option<&'a dyn Buffer>>,
+    slots: Vec<Option<BoundBuffer<'a>>>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -485,15 +490,37 @@ impl<'a> Bindings<'a> {
     pub fn bind(&mut self, id: TensorId, buf: &'a dyn Buffer) -> &mut Self {
         let i = id.0 as usize;
         if i >= self.slots.len() {
-            self.slots.resize(i + 1, None);
+            self.slots.resize_with(i + 1, || None);
         }
-        self.slots[i] = Some(buf);
+        self.slots[i] = Some(BoundBuffer::Single(buf));
+        self
+    }
+
+    /// Bind one persistent buffer per independent graph row. Ordinary graphs never use this;
+    /// layer-synchronous batching uses it while keeping stateless activations row-major.
+    pub fn bind_rows(&mut self, id: TensorId, bufs: Vec<&'a dyn Buffer>) -> &mut Self {
+        let i = id.0 as usize;
+        if i >= self.slots.len() {
+            self.slots.resize_with(i + 1, || None);
+        }
+        self.slots[i] = Some(BoundBuffer::Rows(bufs));
         self
     }
 
     /// Look up a bound buffer (backend uses this while executing).
     pub fn get(&self, id: TensorId) -> Option<&'a dyn Buffer> {
-        self.slots.get(id.0 as usize).copied().flatten()
+        match self.slots.get(id.0 as usize)?.as_ref()? {
+            BoundBuffer::Single(buf) => Some(*buf),
+            BoundBuffer::Rows(_) => None,
+        }
+    }
+
+    /// Look up the per-row binding of a stateful tensor in an independent-row graph.
+    pub fn get_rows(&self, id: TensorId) -> Option<&[&'a dyn Buffer]> {
+        match self.slots.get(id.0 as usize)?.as_ref()? {
+            BoundBuffer::Rows(bufs) => Some(bufs),
+            BoundBuffer::Single(_) => None,
+        }
     }
 }
 
@@ -983,6 +1010,25 @@ mod tests {
         // Re-binding an id overwrites (identical to the old HashMap::insert semantics).
         binds.bind(TensorId(5), &c);
         assert_eq!(binds.get(TensorId(5)).unwrap().len_bytes(), 16);
+    }
+
+    #[test]
+    fn bindings_keep_single_and_independent_row_buffers_distinct() {
+        let a = MockBuffer(std::sync::Mutex::new(vec![0u8; 4]));
+        let b = MockBuffer(std::sync::Mutex::new(vec![0u8; 8]));
+        let c = MockBuffer(std::sync::Mutex::new(vec![0u8; 16]));
+        let mut binds = Bindings::new();
+
+        binds.bind_rows(TensorId(3), vec![&a, &b]);
+        assert!(binds.get(TensorId(3)).is_none());
+        let rows = binds.get_rows(TensorId(3)).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len_bytes(), 4);
+        assert_eq!(rows[1].len_bytes(), 8);
+
+        binds.bind(TensorId(3), &c);
+        assert_eq!(binds.get(TensorId(3)).unwrap().len_bytes(), 16);
+        assert!(binds.get_rows(TensorId(3)).is_none());
     }
 
     #[test]

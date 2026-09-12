@@ -182,6 +182,112 @@ fn bind_layer_io<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn bind_parallel_layer_io<'a>(
+    b: &mut Bindings<'a>,
+    h: &DecodeHandles,
+    n_layer: usize,
+    rf_buf: &'a Option<(Box<dyn Buffer>, usize)>,
+    yff_buf: &'a Option<(Box<dyn Buffer>, usize)>,
+    kbufs: &'a [Box<dyn Buffer>],
+    vbufs: &'a [Box<dyn Buffer>],
+    qsa_kbufs: &'a [Option<Box<dyn Buffer>>],
+    qsa_cbufs: &'a [Option<Box<dyn Buffer>>],
+    mrope_history_buf: &'a Option<Box<dyn Buffer>>,
+    wbufs: &'a [Box<dyn Buffer>],
+    primary_wide: &'a Option<Box<dyn Buffer>>,
+    primary_ple_embd: &'a Option<Box<dyn Buffer>>,
+    primary_ple_state: &'a Option<Box<dyn Buffer>>,
+    wide: &'a dyn Buffer,
+    ple_embd: Option<&'a dyn Buffer>,
+    peers: &'a [SeamKv],
+) {
+    bind_layer_io(
+        b,
+        h,
+        n_layer,
+        rf_buf,
+        yff_buf,
+        kbufs,
+        vbufs,
+        qsa_kbufs,
+        qsa_cbufs,
+        mrope_history_buf,
+        wbufs,
+        primary_wide,
+        primary_ple_embd,
+        primary_ple_state,
+    );
+    if let Some(id) = h.qwen_wide {
+        b.bind(id, wide);
+    }
+    if let (Some(id), Some(buf)) = (h.ple_embd, ple_embd) {
+        b.bind(id, buf);
+    }
+    let lanes = peers.len() + 1;
+    for layer in 0..n_layer {
+        let mut k_rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes);
+        let mut v_rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes);
+        k_rows.push(kbufs[layer].as_ref());
+        v_rows.push(vbufs[layer].as_ref());
+        for slot in peers {
+            k_rows.push(slot.kbufs[layer].as_ref());
+            v_rows.push(slot.vbufs[layer].as_ref());
+        }
+        b.bind_rows(h.k_cache[layer], k_rows);
+        b.bind_rows(h.v_cache[layer], v_rows);
+
+        if let Some(id) = h.qsa_k_cache[layer] {
+            let mut rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes);
+            rows.push(
+                qsa_kbufs[layer]
+                    .as_deref()
+                    .expect("QSA handle requires primary raw cache"),
+            );
+            for slot in peers {
+                rows.push(
+                    slot.qsa_kbufs[layer]
+                        .as_deref()
+                        .expect("QSA handle requires peer raw cache"),
+                );
+            }
+            b.bind_rows(id, rows);
+        }
+        if let Some(id) = h.qsa_block_cache[layer] {
+            let mut rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes);
+            rows.push(
+                qsa_cbufs[layer]
+                    .as_deref()
+                    .expect("QSA handle requires primary block cache"),
+            );
+            for slot in peers {
+                rows.push(
+                    slot.qsa_cbufs[layer]
+                        .as_deref()
+                        .expect("QSA handle requires peer block cache"),
+                );
+            }
+            b.bind_rows(id, rows);
+        }
+    }
+    if let Some(id) = h.ple_state {
+        let mut rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes);
+        rows.push(
+            primary_ple_state
+                .as_deref()
+                .expect("PLE handle requires primary state"),
+        );
+        for slot in peers {
+            rows.push(
+                slot.ple_state_buf
+                    .as_deref()
+                    .expect("PLE handle requires peer state"),
+            );
+        }
+        b.bind_rows(id, rows);
+    }
+}
+
 /// Compute the [`SessionStable`] derivations — the per-layer tensor scans + real `load_tensor_dequant`s
 /// that are pure in `(backend caps, gguf, config, env)`. Run ONCE at cold session init (the result
 /// is stashed in `SeamKv` and reused via `Arc` on warm calls / forks) instead of every request.
@@ -685,9 +791,136 @@ fn finish_pending_seam_slot(
     })
 }
 
+struct ParallelDecodeRequest<'a> {
+    prompts: &'a [Vec<u32>],
+    peers: &'a mut [SeamKv],
+    peer_outputs: &'a mut Vec<Vec<u32>>,
+    samplers: &'a mut [crate::sampling::ParallelSampler],
+    on_token: &'a mut dyn FnMut(usize, u32) -> bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    constraint: Option<&mut crate::grammar::Constraint>,
+    verify: Option<&mut Vec<f32>>,
+    verify_ids: Option<&mut Vec<u32>>,
+    logits_out: Option<&mut Vec<f32>>,
+    h_out: Option<&mut Vec<f32>>,
+    denoise_req: Option<DenoiseReq>,
+    turn_checkpoint: Option<TurnCheckpoint>,
+    req: Option<&crate::sampling::RequestCtx>,
+    finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
+    mm: Option<&crate::seam::MropePlan>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend_inner(
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        state,
+        want_ctx,
+        constraint,
+        verify,
+        verify_ids,
+        logits_out,
+        h_out,
+        denoise_req,
+        turn_checkpoint,
+        req,
+        finish_fixed_allocations,
+        mm,
+        None,
+    )
+}
+
+/// Decode equal-depth Qwen3.8 slots in one layer-synchronous graph while retaining independent
+/// KV, QSA, PLE and sampler state for every row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend_parallel_sampled(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompts: &[Vec<u32>],
+    max_new: usize,
+    primary: &mut Option<SeamKv>,
+    peers: &mut [SeamKv],
+    want_ctx: usize,
+    samplers: &mut [crate::sampling::ParallelSampler],
+    on_token: &mut dyn FnMut(usize, u32) -> bool,
+    req: Option<&crate::sampling::RequestCtx>,
+) -> AResult<(Vec<Vec<u32>>, GenStats)> {
+    if prompts.len() != peers.len() + 1 || samplers.len() != prompts.len() {
+        return Err(anyhow!(
+            "parallel decode has {} prompts, {} slots and {} samplers",
+            prompts.len(),
+            peers.len() + 1,
+            samplers.len()
+        ));
+    }
+    let mut peer_outputs = Vec::new();
+    let mut parallel = ParallelDecodeRequest {
+        prompts,
+        peers,
+        peer_outputs: &mut peer_outputs,
+        samplers,
+        on_token,
+    };
+    let (first, stats) = generate_dense_backend_inner(
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        &prompts[0],
+        max_new,
+        |_| {},
+        primary,
+        want_ctx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        req,
+        None,
+        None,
+        Some(&mut parallel),
+    )?;
+    let mut outputs = Vec::with_capacity(prompts.len());
+    outputs.push(first);
+    outputs.append(&mut peer_outputs);
+    Ok((outputs, stats))
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn generate_dense_backend(
+fn generate_dense_backend_inner(
     be: &dyn Backend,
     bind_weight: &BindWeight,
     g: &Gguf,
@@ -749,6 +982,7 @@ pub(crate) fn generate_dense_backend(
     finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
     // Vision request plan. `None` keeps every existing text-only graph and upload unchanged.
     mm: Option<&crate::seam::MropePlan>,
+    mut parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let state_trace = ec.debug.state_trace;
@@ -2436,6 +2670,9 @@ pub(crate) fn generate_dense_backend(
                  // speculative-VERIFY call site below (this fn's `verify` param is `Some`);
                  // `false` from every other caller (decode loop, batched prefill, DG denoise).
                  mtp_verify: bool,
+                 // Decode batch whose rows are independent sequences. Stateful handles are bound
+                 // per row; stateless activations and MoE routing remain aggregated.
+                 independent_rows: bool,
                  // LAYER SPAN: emit the ops for `span` only, and carry the residual stream in a
                  // caller-owned buffer instead of graph scratch — `hidden` becomes an `Input` the
                  // caller binds and the ops mutate in place, so a span that is not the whole model
@@ -2477,6 +2714,7 @@ pub(crate) fn generate_dense_backend(
         );
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
+        g.independent_rows = independent_rows;
         // DiffusionGemma: force the per-execute STATIC path for every graph of this model (see
         // `Graph::no_decode_replay`). The record-once replay's `_dyn` kernels agree with the
         // static recording only to float-reassociation noise; the entropy-bound denoise loop
@@ -6555,6 +6793,7 @@ pub(crate) fn generate_dense_backend(
                 false, // gpu_sample: same
                 false, // use_ids: the canvas rows are soft-embeds, not token ids
                 false, // mtp_verify: DG denoise is never an MTP-verify batch
+                false, // independent_rows: one session with several sequence rows
                 None,  // span: the whole model in one graph
             );
             let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
@@ -6860,8 +7099,9 @@ pub(crate) fn generate_dense_backend(
             gpu_verify_ids,
             false,
             false,
-            true, // mtp_verify: this IS the speculative-VERIFY batched forward
-            None, // span: the whole model in one graph
+            true,  // mtp_verify: this IS the speculative-VERIFY batched forward
+            false, // independent_rows: one speculative sequence
+            None,  // span: the whole model in one graph
         );
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
         let t_vcompile0 = std::time::Instant::now();
@@ -6961,6 +7201,274 @@ pub(crate) fn generate_dense_backend(
     }
 
     // ── drive ───────────────────────────────────────────────────────────────────────
+    if let Some(parallel) = parallel_decode.as_deref_mut() {
+        if !c.qwen4exp {
+            return Err(anyhow!("parallel decode currently supports qwen4exp only"));
+        }
+        if mm.is_some() {
+            return Err(anyhow!(
+                "parallel decode does not yet support multimodal position rows"
+            ));
+        }
+        if !gpu_embed {
+            return Err(anyhow!("parallel decode requires Vulkan GPU embedding"));
+        }
+        let lanes = parallel.prompts.len();
+        if !(1..=8).contains(&lanes) || parallel.peers.len() + 1 != lanes {
+            return Err(anyhow!("parallel decode requires 1..=8 slots; got {lanes}"));
+        }
+        if parallel.samplers.len() != lanes {
+            return Err(anyhow!(
+                "parallel decode has {lanes} lanes but {} samplers",
+                parallel.samplers.len()
+            ));
+        }
+        let batch_argmax = caps.argmax_rows
+            && ec.spec.gpu_argmax
+            && parallel
+                .samplers
+                .iter()
+                .all(crate::sampling::ParallelSampler::can_gpu_argmax);
+        if prompt.len() != start + 1 {
+            return Err(anyhow!(
+                "parallel decode accepts an already-prefilled slot plus one frontier token; primary cached={start}, prompt={}",
+                prompt.len()
+            ));
+        }
+        for (lane, (slot, lane_prompt)) in parallel
+            .peers
+            .iter()
+            .zip(&parallel.prompts[1..])
+            .enumerate()
+        {
+            if slot.cached.len() != start
+                || lane_prompt.len() != start + 1
+                || !lane_prompt.starts_with(&slot.cached)
+            {
+                return Err(anyhow!(
+                    "parallel decode lane {} is not at the shared depth {start} with one frontier token",
+                    lane + 1
+                ));
+            }
+            if lane_prompt.len() + max_new > slot.max_ctx {
+                return Err(anyhow!(
+                    "parallel decode lane {} exceeds its KV capacity {}",
+                    lane + 1,
+                    slot.max_ctx
+                ));
+            }
+        }
+
+        let ple_heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
+        let ple_row = ple_heads * c.ple_head_dim;
+        let (ids_buf, pos_batch, hidden_batch, logits_batch, ids_out, wide_batch, ple_batch) = {
+            let _gp = req.and_then(|request| request.gate_pass());
+            (
+                be.alloc(lanes * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(lanes * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc_uninit(lanes * ne * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc_uninit(lanes * c.vocab * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(lanes * 4, BufferUsage::Readback)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc_uninit(lanes * c.hc_mult * ne * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(lanes * ple_row * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        };
+
+        let mut curs = parallel.prompts.to_vec();
+        let mut generated = vec![Vec::<u32>::with_capacity(max_new); lanes];
+        let mut last_written = None;
+        let t0 = std::time::Instant::now();
+        for step in 0..max_new {
+            let _gp = req.and_then(|request| request.gate_pass());
+            let pos = start + step;
+            ensure_kv_depth!(pos + 1);
+            for peer in parallel.peers.iter_mut() {
+                peer.ensure_segmented_depth(be, c, pos + 1)?;
+            }
+            let ids: Vec<i32> = curs.iter().map(|tokens| tokens[pos] as i32).collect();
+            let positions = vec![pos as i32; lanes];
+            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&positions))
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let worker = ple_worker
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
+            let mut tickets = Vec::with_capacity(lanes);
+            for tokens in &curs {
+                tickets.push(worker.submit(tokens, pos, c.ple_ngram_size)?);
+            }
+
+            let (g0, h0) = build(
+                lanes,
+                pos,
+                0,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                Some(0..1),
+            );
+            let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+            let mut b0 = Bindings::new();
+            b0.bind(
+                h0.tok_ids.expect("GPU embedding needs ids"),
+                ids_buf.as_ref(),
+            );
+            b0.bind(h0.hidden, hidden_batch.as_ref());
+            b0.bind(h0.positions, pos_batch.as_ref());
+            bind_parallel_layer_io(
+                &mut b0,
+                &h0,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+                wide_batch.as_ref(),
+                None,
+                &*parallel.peers,
+            );
+            be.execute(plan0.as_ref(), &b0)
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let mut ple_rows = Vec::with_capacity(lanes * ple_row);
+            for ticket in tickets {
+                let row = ticket.wait()?;
+                if row.len() != ple_row {
+                    return Err(anyhow!(
+                        "parallel PLE produced {} values, expected {ple_row}",
+                        row.len()
+                    ));
+                }
+                ple_rows.extend_from_slice(row.as_slice());
+            }
+            be.upload(ple_batch.as_ref(), bytemuck::cast_slice(&ple_rows))
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let (g1, h1) = build(
+                lanes,
+                pos,
+                lanes,
+                false,
+                None,
+                false,
+                false,
+                batch_argmax,
+                false,
+                false,
+                false,
+                true,
+                Some(1..c.n_layer),
+            );
+            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
+            let mut b1 = Bindings::new();
+            b1.bind(h1.hidden, hidden_batch.as_ref());
+            b1.bind(h1.positions, pos_batch.as_ref());
+            bind_parallel_layer_io(
+                &mut b1,
+                &h1,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+                wide_batch.as_ref(),
+                Some(ple_batch.as_ref()),
+                &*parallel.peers,
+            );
+            b1.bind(
+                h1.logits.expect("parallel decode build has logits"),
+                logits_batch.as_ref(),
+            );
+            if batch_argmax {
+                b1.bind(
+                    h1.tok_id.expect("parallel greedy decode has ids"),
+                    ids_out.as_ref(),
+                );
+            }
+            be.execute(plan1.as_ref(), &b1)
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let mut next = vec![0u32; lanes];
+            if batch_argmax {
+                be.download(ids_out.as_ref(), bytemuck::cast_slice_mut(&mut next))
+                    .map_err(|e| anyhow!("{e}"))?;
+            } else {
+                let mut logits = vec![0f32; lanes * c.vocab];
+                be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                    .map_err(|e| anyhow!("{e}"))?;
+                for lane in 0..lanes {
+                    next[lane] = parallel.samplers[lane]
+                        .sample(&mut logits[lane * c.vocab..(lane + 1) * c.vocab]);
+                }
+            }
+            last_written = Some(pos);
+            let mut stop_batch = false;
+            for lane in 0..lanes {
+                generated[lane].push(next[lane]);
+                let is_eos = !ec.sampling.ignore_eos
+                    && (c.eos_ids.contains(&next[lane]) || next[lane] == c.eos);
+                let keep_going = !is_eos && (parallel.on_token)(lane, next[lane]);
+                if keep_going {
+                    curs[lane].push(next[lane]);
+                } else {
+                    stop_batch = true;
+                }
+            }
+            if stop_batch {
+                break;
+            }
+        }
+
+        let decode_secs = t0.elapsed().as_secs_f64();
+        *cached = resident_after_gen(&curs[0], last_written);
+        for (slot, tokens) in parallel.peers.iter_mut().zip(&curs[1..]) {
+            slot.cached = resident_after_gen(tokens, last_written);
+        }
+        let total_generated = generated.iter().map(Vec::len).sum();
+        parallel
+            .peer_outputs
+            .extend(generated.iter().skip(1).cloned());
+        return Ok((
+            generated.remove(0),
+            GenStats {
+                n_prompt: 0,
+                n_cached: start,
+                prompt_secs: 0.0,
+                n_gen: total_generated,
+                decode_secs,
+            },
+        ));
+    }
+
     // The per-call decode IO buffers. These are `be.alloc`s, and on Vulkan an `alloc` zero-fills
     // through a one-shot command buffer — i.e. it RECORDS, so it needs the baton exactly like a
     // step does (see `StepGate`: the command pool is externally synchronised, and the backend hands
@@ -7479,6 +7987,7 @@ pub(crate) fn generate_dense_backend(
                             // stack; a later span reads the residual stream that one left behind.
                             ch.gpu_embed && span.start == 0,
                             false, // mtp_verify: ordinary chunked prefill, not MTP verify
+                            false, // independent_rows: one contiguous prompt chunk
                             Some(span.clone()),
                         );
                         let t_build = pf_t0.elapsed();
@@ -7667,6 +8176,7 @@ pub(crate) fn generate_dense_backend(
         let (g, h) = build(
             1, 0, 1, false, None, false, false, gpu_argmax, gpu_sample, gpu_embed,
             false, // mtp_verify: ordinary per-token decode, not MTP verify
+            false, // independent_rows: ordinary single-session decode
             None,  // span: the whole model in one graph
         );
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
@@ -7984,6 +8494,7 @@ pub(crate) fn generate_dense_backend(
                 false,
                 gpu_embed_tok,
                 false,
+                false,
                 Some(0..1),
             );
             let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
@@ -8050,6 +8561,7 @@ pub(crate) fn generate_dense_backend(
                 gpu_sample,
                 false,
                 false,
+                false,
                 Some(1..c.n_layer),
             );
             let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
@@ -8098,6 +8610,7 @@ pub(crate) fn generate_dense_backend(
             let (g, h) = build(
                 1, pos, 1, false, None, false, want_h, gpu_argmax, gpu_sample, gpu_embed,
                 false, // mtp_verify: ordinary per-token decode, not MTP verify
+                false, // independent_rows: ordinary single-session decode
                 None,  // span: the whole model in one graph
             );
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;

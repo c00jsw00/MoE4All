@@ -891,6 +891,28 @@ impl SeamKv {
         self.invalidate_turn_checkpoint();
     }
 
+    /// Commit this slot's segmented planes through `tokens`. The ordinary runner invokes the same
+    /// state method through its local macro; layer-synchronous decode needs it once per lane.
+    pub(super) fn ensure_segmented_depth(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        tokens: usize,
+    ) -> AResult<()> {
+        self.segmented_kv.ensure_depth(
+            be,
+            cfg,
+            self.max_ctx,
+            self.k_fmt,
+            self.v_fmt,
+            &self.kbufs,
+            &self.vbufs,
+            &self.qsa_kbufs,
+            &self.qsa_cbufs,
+            tokens,
+        )
+    }
+
     /// Benchmark-only synthetic context: mark the first `tokens.len()` positions as resident without
     /// running the model over them. KV buffers are zero-initialized at allocation; for qwen35's
     /// fixed recurrent state, clear the small state buffers here so repeated synthetic reps start

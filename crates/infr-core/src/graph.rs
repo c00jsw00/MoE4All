@@ -1731,6 +1731,9 @@ pub struct Graph {
     pub inputs: Vec<TensorId>,
     pub weights: Vec<TensorId>,
     pub outputs: Vec<TensorId>,
+    /// Each logical row is an independent sequence with its own persistent state bindings.
+    /// Stateless activations remain one ordinary row-major batch.
+    pub independent_rows: bool,
     /// Decode-only scheduling hints. Empty for models without a validated next-layer predictor.
     pub moe_prefetch_hints: Vec<MoePrefetchHint>,
     /// Producer-set opt-out of the Vulkan record-once decode replay: `true` forces the

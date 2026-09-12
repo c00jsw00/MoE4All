@@ -1696,16 +1696,33 @@ impl<'a> Recorder<'a> {
     /// buffer, keeping the no-chunk fast path byte-identical. Never called on a resident-BDA weight
     /// sub-tensor (those are read by 64-bit address, not bound).
     fn vkb_off(b: &dyn Buffer, elem_off: usize) -> vk::DescriptorBufferInfo {
+        Self::vkb_byte_off(b, elem_off * 4)
+    }
+
+    /// Descriptor view beginning at `byte_off` within an activation buffer. Independent decode
+    /// rows use this to run one-row stateful kernels over shared row-major activations. Unified
+    /// arena buffers need both offsets: `sub_offset` locates the tensor and `byte_off` its row.
+    fn vkb_byte_off(b: &dyn Buffer, byte_off: usize) -> vk::DescriptorBufferInfo {
         let vb = Self::vk_of(b);
         debug_assert!(
-            !matches!(vb.backing, Backing::BdaSub(_) | Backing::UnifiedSub(_)),
-            "vkb_off is for ordinary activation buffers, not resident-BDA weight sub-tensors"
+            !matches!(vb.backing, Backing::BdaSub(_)),
+            "vkb_byte_off is for activation buffers, not resident-BDA weight sub-tensors"
         );
-        vk::DescriptorBufferInfo {
-            buffer: vb.buffer,
-            offset: (elem_off as u64) * 4,
-            range: vk::WHOLE_SIZE,
+        debug_assert!(
+            byte_off.is_multiple_of(256),
+            "descriptor row offset must satisfy Vulkan's worst-case 256-byte alignment"
+        );
+        assert!(
+            byte_off <= vb.size,
+            "descriptor row offset ({byte_off}) exceeds logical buffer size ({})",
+            vb.size
+        );
+        let mut info = Self::vkb(b);
+        info.offset += byte_off as u64;
+        if info.range != vk::WHOLE_SIZE {
+            info.range -= byte_off as u64;
         }
+        info
     }
 
     /// Chunked twin of one `dispatch_wide` GEMV: when a `[out_f, in_f]` dense weight (lm_head /
@@ -6743,6 +6760,42 @@ impl<'a> Recorder<'a> {
         // RoPE (qwen3 / gemma3 / gemma4 SWA layers).
         freq_factors: Option<&dyn Buffer>,
     ) {
+        self.qk_norm_rope_off(
+            x,
+            nw,
+            y,
+            rows,
+            nheads,
+            hd,
+            rope_dim,
+            theta,
+            rope_pos,
+            out_base,
+            eps,
+            freq_factors,
+            0,
+            0,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qk_norm_rope_off(
+        &self,
+        x: &dyn Buffer,
+        nw: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        rope_pos: usize,
+        out_base: usize,
+        eps: f32,
+        freq_factors: Option<&dyn Buffer>,
+        x_byte_off: usize,
+        y_byte_off: usize,
+    ) {
         // 36 bytes: the trailing `kcap` (ring row capacity) is dyn-only and stays 0 here — the
         // STATIC fused-K cache write pre-mods its baked `out_base` row in the adapter instead.
         let mut push = [0u8; 36];
@@ -6761,7 +6814,12 @@ impl<'a> Recorder<'a> {
                         .kernel("qk_norm_rope_ff", crate::gemm::qk_norm_rope_ff_spv(), 4, 36);
                 self.dispatch(
                     k,
-                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(ff), Self::vkb(y)],
+                    &[
+                        Self::vkb_byte_off(x, x_byte_off),
+                        Self::vkb(nw),
+                        Self::vkb(ff),
+                        Self::vkb_byte_off(y, y_byte_off),
+                    ],
                     1,
                     &push,
                     (rows * nheads) as u32,
@@ -6773,7 +6831,11 @@ impl<'a> Recorder<'a> {
                     .kernel("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 36);
                 self.dispatch(
                     k,
-                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
+                    &[
+                        Self::vkb_byte_off(x, x_byte_off),
+                        Self::vkb(nw),
+                        Self::vkb_byte_off(y, y_byte_off),
+                    ],
                     1,
                     &push,
                     (rows * nheads) as u32,
@@ -6847,6 +6909,29 @@ impl<'a> Recorder<'a> {
         eps: f32,
         src_stride: usize, // per-row stride in the qg buffer = nh*2*hd
     ) {
+        self.qk_norm_rope_interleaved_off(
+            qg, nw, y, rows, nheads, hd, rope_dim, theta, rope_pos, out_base, eps, src_stride, 0, 0,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qk_norm_rope_interleaved_off(
+        &self,
+        qg: &dyn Buffer,
+        nw: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        rope_pos: usize,
+        out_base: usize,
+        eps: f32,
+        src_stride: usize,
+        qg_byte_off: usize,
+        y_byte_off: usize,
+    ) {
         let k = self.be.kernel(
             "qk_norm_rope_interleaved",
             crate::gemm::qk_norm_rope_interleaved_spv(),
@@ -6865,7 +6950,11 @@ impl<'a> Recorder<'a> {
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         self.dispatch(
             k,
-            &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
+            &[
+                Self::vkb_byte_off(qg, qg_byte_off),
+                Self::vkb(nw),
+                Self::vkb_byte_off(y, y_byte_off),
+            ],
             1,
             &push,
             (rows * nheads) as u32,
@@ -6953,7 +7042,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.attention_kv_split_impl(
             q, kc, vc, o, pm, pl, pacc, rows, pos, kv_len, nh, nkv, hd, chunk, n_chunks, scale,
-            window, canvas_lo, k_q8, v_q8, cap, batched, None, None, None,
+            window, canvas_lo, k_q8, v_q8, cap, batched, None, None, None, None,
         );
     }
 
@@ -7021,6 +7110,7 @@ impl<'a> Recorder<'a> {
             Some((k_addr, v_addr)),
             kv_ml,
             None,
+            None,
         );
     }
 
@@ -7076,6 +7166,123 @@ impl<'a> Recorder<'a> {
             None,
             None,
             Some(segment_shift),
+            None,
+        );
+    }
+
+    /// One independent decode row over a flat device-addressed KV cache. Descriptor offsets select
+    /// this lane inside shared batch activations; K/V and partial scratch are lane-local.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_kv_split_at_off(
+        &self,
+        q: &dyn Buffer,
+        q_byte_off: usize,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        k_addr: u64,
+        v_addr: u64,
+        o: &dyn Buffer,
+        o_byte_off: usize,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        pos: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
+        k_q8: bool,
+        v_q8: bool,
+        cap: usize,
+    ) {
+        self.attention_kv_split_impl(
+            q,
+            kc,
+            vc,
+            o,
+            pm,
+            pl,
+            pacc,
+            1,
+            pos,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            window,
+            None,
+            k_q8,
+            v_q8,
+            cap,
+            false,
+            Some((k_addr, v_addr)),
+            None,
+            None,
+            Some((q_byte_off, o_byte_off)),
+        );
+    }
+
+    /// Segmented-KV twin of [`Self::attention_kv_split_at_off`]. K/V bindings are address tables;
+    /// only the shared activation row needs a descriptor offset.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_kv_split_segmented_off(
+        &self,
+        q: &dyn Buffer,
+        q_byte_off: usize,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        o_byte_off: usize,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        pos: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
+        k_q8: bool,
+        v_q8: bool,
+        segment_shift: u32,
+    ) {
+        self.attention_kv_split_impl(
+            q,
+            kc,
+            vc,
+            o,
+            pm,
+            pl,
+            pacc,
+            1,
+            pos,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            window,
+            None,
+            k_q8,
+            v_q8,
+            segment_shift as usize,
+            false,
+            None,
+            None,
+            Some(segment_shift),
+            Some((q_byte_off, o_byte_off)),
         );
     }
 
@@ -7131,6 +7338,8 @@ impl<'a> Recorder<'a> {
         // Lazily committed cache: bindings 1/2 are address tables and `cap` carries this shift.
         // Kept separate from a zero BDA base so no existing flat-cache state changes meaning.
         kv_segment_shift: Option<u32>,
+        // Independent-row lowering binds lane-sized views into shared q/output activations.
+        io_byte_offsets: Option<(usize, usize)>,
     ) {
         let segmented = kv_segment_shift.is_some();
         debug_assert!(!(segmented && (kv_addr.is_some() || kv_ml.is_some() || batched)));
@@ -7334,10 +7543,14 @@ impl<'a> Recorder<'a> {
         }
         // Batched: workgroup y = 4-row group; per-row: y = row.
         let gy = if batched { rows.div_ceil(4) } else { rows };
+        let q_binding = io_byte_offsets.map_or_else(
+            || Self::vkb(q),
+            |(q_byte_off, _)| Self::vkb_byte_off(q, q_byte_off),
+        );
         self.dispatch3(
             k1,
             &[
-                Self::vkb(q),
+                q_binding,
                 Self::vkb(kc),
                 Self::vkb(vc),
                 Self::vkb(pm),
@@ -7395,9 +7608,13 @@ impl<'a> Recorder<'a> {
         p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());
         p2[8..12].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
         p2[12..16].copy_from_slice(&ntile.to_ne_bytes());
+        let o_binding = io_byte_offsets.map_or_else(
+            || Self::vkb(o),
+            |(_, o_byte_off)| Self::vkb_byte_off(o, o_byte_off),
+        );
         self.dispatch(
             k2,
-            &[Self::vkb(pm), Self::vkb(pl), Self::vkb(pacc), Self::vkb(o)],
+            &[Self::vkb(pm), Self::vkb(pl), Self::vkb(pacc), o_binding],
             1,
             &p2,
             (rows * nh) as u32 * ntile,
@@ -8547,6 +8764,39 @@ impl<'a> Recorder<'a> {
         vd: usize,
         eps: f32,
     ) {
+        self.deltanet_off(
+            q, k, v, blog, alpha, acoef, dtbias, state, out, rows, nv, nk, kd, vd, eps, 0, 0, 0, 0,
+            0, 0,
+        );
+    }
+
+    /// One-row DeltaNet over row views of batched activations. Offsets are f32 elements; weights
+    /// and the persistent state remain whole bindings.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn deltanet_off(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+        q_off: usize,
+        k_off: usize,
+        v_off: usize,
+        blog_off: usize,
+        alpha_off: usize,
+        out_off: usize,
+    ) {
         // The shader caches each column block's state [kd, 32] in shared memory (`ss[128*32]`), so kd
         // must be ≤ 128. qwen35 uses kd=128; assert so a larger head_k_dim fails loudly instead of
         // corrupting LDS.
@@ -8570,15 +8820,15 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[
-                Self::vkb(q),
-                Self::vkb(k),
-                Self::vkb(v),
-                Self::vkb(blog),
-                Self::vkb(alpha),
+                Self::vkb_off(q, q_off),
+                Self::vkb_off(k, k_off),
+                Self::vkb_off(v, v_off),
+                Self::vkb_off(blog, blog_off),
+                Self::vkb_off(alpha, alpha_off),
                 Self::vkb(acoef),
                 Self::vkb(dtbias),
                 Self::vkb(state),
-                Self::vkb(out),
+                Self::vkb_off(out, out_off),
             ],
             2, // state (in/out) + out
             &push,
@@ -8833,6 +9083,60 @@ impl<'a> Recorder<'a> {
         segment_shifts: Option<(u32, u32)>,
         mrope: Option<(&dyn Buffer, [u32; 4])>,
     ) {
+        self.qsa_indexer_off(
+            q,
+            k_cache,
+            block_cache,
+            k_norm,
+            scores,
+            topk_work,
+            dst,
+            rows,
+            kv_len,
+            compress_from,
+            n_head,
+            head_dim,
+            top_blocks,
+            ratio,
+            rope_dim,
+            theta,
+            eps,
+            scale,
+            segment_shifts,
+            mrope,
+            0,
+            0,
+        );
+    }
+
+    /// QSA indexer over row views of the query and destination tensors. Persistent cache bindings
+    /// remain whole and belong to one independent sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qsa_indexer_off(
+        &self,
+        q: &dyn Buffer,
+        k_cache: &dyn Buffer,
+        block_cache: &dyn Buffer,
+        k_norm: &dyn Buffer,
+        scores: &dyn Buffer,
+        topk_work: Option<&dyn Buffer>,
+        dst: &dyn Buffer,
+        rows: u32,
+        kv_len: u32,
+        compress_from: u32,
+        n_head: u32,
+        head_dim: u32,
+        top_blocks: u32,
+        ratio: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        scale: f32,
+        segment_shifts: Option<(u32, u32)>,
+        mrope: Option<(&dyn Buffer, [u32; 4])>,
+        q_byte_off: usize,
+        dst_byte_off: usize,
+    ) {
         let blocks = kv_len / ratio;
         let first_new = compress_from.min(blocks);
         let new_blocks = blocks - first_new;
@@ -8956,7 +9260,11 @@ impl<'a> Recorder<'a> {
         }
         self.dispatch3(
             score_k,
-            &[Self::vkb(q), Self::vkb(block_cache), Self::vkb(scores)],
+            &[
+                Self::vkb_byte_off(q, q_byte_off),
+                Self::vkb(block_cache),
+                Self::vkb(scores),
+            ],
             1,
             &push[..score_push_bytes as usize],
             blocks.div_ceil(block_tile),
@@ -9008,7 +9316,11 @@ impl<'a> Recorder<'a> {
             collect_push[8..12].copy_from_slice(&state_base.to_ne_bytes());
             self.dispatch(
                 collect_k,
-                &[Self::vkb(scores), Self::vkb(work), Self::vkb(dst)],
+                &[
+                    Self::vkb(scores),
+                    Self::vkb(work),
+                    Self::vkb_byte_off(dst, dst_byte_off),
+                ],
                 1,
                 &collect_push,
                 1,
@@ -9028,7 +9340,7 @@ impl<'a> Recorder<'a> {
             topk_push[16..20].copy_from_slice(&ratio.to_ne_bytes());
             self.dispatch(
                 topk_k,
-                &[Self::vkb(scores), Self::vkb(dst)],
+                &[Self::vkb(scores), Self::vkb_byte_off(dst, dst_byte_off)],
                 1,
                 &topk_push,
                 rows,
@@ -9057,6 +9369,57 @@ impl<'a> Recorder<'a> {
         kcap: u32,
         vcap: u32,
         segment_shift: Option<u32>,
+    ) {
+        self.qsa_attention_batch_off(
+            q,
+            k,
+            v,
+            indices,
+            dst,
+            rows,
+            kv_len,
+            n_head,
+            n_kv,
+            head_dim,
+            top_blocks,
+            ratio,
+            scale,
+            k_q8,
+            v_q8,
+            kcap,
+            vcap,
+            segment_shift,
+            0,
+            0,
+            0,
+        );
+    }
+
+    /// QSA attention over one row view of shared q/indices/output activations.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qsa_attention_batch_off(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        indices: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        kv_len: u32,
+        n_head: u32,
+        n_kv: u32,
+        head_dim: u32,
+        top_blocks: u32,
+        ratio: u32,
+        scale: f32,
+        k_q8: bool,
+        v_q8: bool,
+        kcap: u32,
+        vcap: u32,
+        segment_shift: Option<u32>,
+        q_byte_off: usize,
+        indices_byte_off: usize,
+        dst_byte_off: usize,
     ) {
         let segmented = segment_shift.is_some();
         let (name, spv) = match (k_q8, v_q8, segmented) {
@@ -9119,11 +9482,11 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(
             kernel,
             &[
-                Self::vkb(q),
+                Self::vkb_byte_off(q, q_byte_off),
                 Self::vkb(k),
                 Self::vkb(v),
-                Self::vkb(indices),
-                Self::vkb(dst),
+                Self::vkb_byte_off(indices, indices_byte_off),
+                Self::vkb_byte_off(dst, dst_byte_off),
             ],
             1,
             &push[..push_bytes as usize],
@@ -9215,6 +9578,37 @@ impl<'a> Recorder<'a> {
         eps: f32,
         src_stride: usize,
     ) {
+        self.deltanet_strided_off(
+            q, k, v, blog, alpha, acoef, dtbias, state, out, rows, nv, nk, kd, vd, eps, src_stride,
+            0, 0, 0, 0,
+        );
+    }
+
+    /// Strided DeltaNet over one row view of a larger activation batch. Offsets are f32 elements.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn deltanet_strided_off(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+        src_stride: usize,
+        qkv_off: usize,
+        blog_off: usize,
+        alpha_off: usize,
+        out_off: usize,
+    ) {
         debug_assert!(kd <= 128);
         let kern = self.be.kernel(
             "deltanet_strided",
@@ -9235,15 +9629,15 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[
-                Self::vkb(q),
-                Self::vkb(k),
-                Self::vkb(v),
-                Self::vkb(blog),
-                Self::vkb(alpha),
+                Self::vkb_off(q, qkv_off),
+                Self::vkb_off(k, qkv_off),
+                Self::vkb_off(v, qkv_off),
+                Self::vkb_off(blog, blog_off),
+                Self::vkb_off(alpha, alpha_off),
                 Self::vkb(acoef),
                 Self::vkb(dtbias),
                 Self::vkb(state),
-                Self::vkb(out),
+                Self::vkb_off(out, out_off),
             ],
             2,
             &push,
@@ -9610,6 +10004,24 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
+        self.conv1d_silu_row_at(qkv, arena_addr, state, out, rows, cc, kconv, 0, 0);
+    }
+
+    /// Sequential convolution over a row view of batched qkv/output activations. Offsets are f32
+    /// elements; each sequence supplies its own persistent history buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn conv1d_silu_row_at(
+        &self,
+        qkv: &dyn Buffer,
+        arena_addr: u64,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+        qkv_off: usize,
+        out_off: usize,
+    ) {
         let kern = self
             .be
             .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 20);
@@ -9622,10 +10034,10 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[
-                Self::vkb(qkv),
-                Self::vkb(qkv),
+                Self::vkb_off(qkv, qkv_off),
+                Self::vkb_off(qkv, qkv_off),
                 Self::vkb(state),
-                Self::vkb(out),
+                Self::vkb_off(out, out_off),
             ],
             2, // state (in/out) + out
             &push,

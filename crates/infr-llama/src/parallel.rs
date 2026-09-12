@@ -2,25 +2,17 @@
 //!
 //! # What this is (and what it is not)
 //!
-//! It is **interleaved concurrent generation**: N sequences are in flight at once, each on its own
-//! thread with its own KV slot, and they take turns on the GPU at TOKEN granularity via a fair
-//! round-robin baton ([`crate::sampling::StepGate`]). A request is never head-of-line blocked
-//! behind another request's whole generation — only behind one step of it.
+//! It is a hybrid concurrent engine. Every sequence owns one KV slot and prefill work takes fair
+//! token/chunk-grained turns through [`crate::sampling::StepGate`]. Ready, equal-depth Qwen3.8
+//! decode requests are additionally gathered into one layer-synchronous forward at
+//! `m = n_active`, so stateless work and paged expert traffic are shared while every row retains
+//! its own KV/recurrent state and sampler. Other architectures and incompatible depths keep the
+//! established interleaved path.
 //!
-//! It is **not** continuous batching. llama.cpp gathers the N active sequences' next tokens into
-//! ONE forward at `m = n_active`, which amortises the weight traffic across them and makes
-//! aggregate throughput RISE with concurrency. We cannot express that today: [`infr_core::Op`]'s
-//! `Attention` binds exactly one `k_cache`/`v_cache`, one `kv_len` and one `pos` for all its query
-//! rows, so N rows cannot attend to N different KV caches in one dispatch. Getting there needs a
-//! per-row `(cache, kv_len, pos)` indirection (a block table) plumbed through ~8 recorder attention
-//! entry points and ~12 Vulkan shaders, plus the CPU/Metal backends, plus inverting this crate's
-//! monolithic `generate_dense_backend` into a per-step API. That is a real project, and it is the
-//! ONLY thing standing between this engine and the mrow-kernel throughput win.
-//!
-//! So: aggregate throughput here is roughly FLAT in N (each sequence still re-streams the whole
-//! weight matrix for its own decode step). What N buys is *fairness and latency* — 4 agent tool
-//! calls finish in ~the time of the slowest, not the sum. That is the difference between usable and
-//! unusable for a fan-out coding agent, and it is an honest fraction of the win.
+//! This is not general continuous batching: a decode cohort is fixed when its worker starts, and
+//! a request arriving after that point waits for the next cohort rather than being inserted into
+//! an in-flight graph. The worker still releases the GPU baton after every aggregated token, so
+//! an unrelated prefill or fallback decode is never blocked behind the cohort's whole response.
 //!
 //! # VRAM: how `-np` interacts with `--ctx`
 //!
@@ -39,17 +31,22 @@
 //! When `kv.session_cache_dir` is explicitly set, a background worker streams idle dynamic Q8 KV
 //! state to checksummed files and releases its physical 32K segments. A later prefix match restores
 //! that state into any free resident slot. This extends the number of retained conversations; it
-//! does not alter the token-granular GPU scheduling described above.
+//! does not alter the decode cohort or fallback scheduling described above.
 
-use crate::sampling::{RequestCtx, StepGate};
+use crate::sampling::{ParallelSampler, RequestCtx, StepGate};
 use crate::seam::SeamKv;
 use crate::session_cache::SessionCache;
 use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Context, Result};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+const DECODE_BATCH_WAIT: Duration = Duration::from_secs(1);
+const MAX_DECODE_BATCH: usize = 8;
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
@@ -166,6 +163,15 @@ fn pick_continuation(
         .map(|(idx, _, _)| idx)
 }
 
+fn merge_stats(mut total: GenStats, tail: GenStats) -> GenStats {
+    total.n_prompt += tail.n_prompt;
+    total.n_cached += tail.n_cached;
+    total.prompt_secs += tail.prompt_secs;
+    total.n_gen += tail.n_gen;
+    total.decode_secs += tail.decode_secs;
+    total
+}
+
 /// One KV slot: its cache (moved OUT while a request holds it, so the generation gets the
 /// `&mut Option<SeamKv>` the runner wants without holding the pool lock), plus the bookkeeping the
 /// prefix-match/LRU policy needs.
@@ -191,14 +197,132 @@ struct Pool {
 
 /// A checked-out slot. Returns its KV to the pool on drop — including on error or panic, so a
 /// failed request can never permanently burn a slot.
+enum BatchEvent {
+    Token(u32),
+    Complete {
+        kv: SeamKv,
+        stats: GenStats,
+    },
+    Fallback {
+        kv: SeamKv,
+        prompt: Vec<u32>,
+        max_new: usize,
+        stats: GenStats,
+    },
+    Failed {
+        kv: SeamKv,
+        error: String,
+    },
+}
+
+impl BatchEvent {
+    fn into_kv(self) -> Option<SeamKv> {
+        match self {
+            Self::Token(_) => None,
+            Self::Complete { kv, .. } | Self::Fallback { kv, .. } | Self::Failed { kv, .. } => {
+                Some(kv)
+            }
+        }
+    }
+}
+
+struct BatchWork {
+    slot: usize,
+    kv: Option<SeamKv>,
+    prompt: Vec<u32>,
+    max_new: usize,
+    generated: usize,
+    stats: GenStats,
+    sampler: Option<ParallelSampler>,
+    channels: Option<BatchChannels>,
+}
+
+struct BatchChannels {
+    events: SyncSender<BatchEvent>,
+    acknowledgements: Receiver<bool>,
+}
+
+#[derive(Default)]
+struct DecodeBatchQueue {
+    running: bool,
+    /// Batch-eligible requests registered before checkout/prefill but not yet ready for decode.
+    prefilling: usize,
+    waiting: VecDeque<BatchWork>,
+}
+
+fn should_wait_for_decode_peers(prefilling: usize, ready_peers: usize) -> bool {
+    prefilling > 0 && ready_peers + 1 < MAX_DECODE_BATCH
+}
+
+struct BatchPrefillRegistration<'a> {
+    engine: &'a ParallelSeam,
+    active: bool,
+}
+
+impl<'a> BatchPrefillRegistration<'a> {
+    fn new(engine: &'a ParallelSeam) -> Self {
+        engine
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned")
+            .prefilling += 1;
+        Self {
+            engine,
+            active: true,
+        }
+    }
+
+    fn arrive(&mut self, queue: &mut DecodeBatchQueue) {
+        debug_assert!(self.active);
+        queue.prefilling = queue.prefilling.saturating_sub(1);
+        self.active = false;
+    }
+}
+
+impl Drop for BatchPrefillRegistration<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut queue = match self.engine.decode_batch.lock() {
+            Ok(queue) => queue,
+            Err(error) => error.into_inner(),
+        };
+        queue.prefilling = queue.prefilling.saturating_sub(1);
+        drop(queue);
+        self.engine.decode_ready.notify_all();
+    }
+}
+
 struct SlotGuard<'a> {
     engine: &'a ParallelSeam,
     idx: usize,
     kv: Option<SeamKv>,
+    detached: bool,
+}
+
+impl SlotGuard<'_> {
+    fn detach(&mut self) -> SeamKv {
+        self.detached = true;
+        self.kv.take().expect("checked-out slot has KV")
+    }
+
+    fn reattach(&mut self, kv: SeamKv) {
+        self.kv = Some(kv);
+        self.detached = false;
+    }
+
+    fn abandon_detached(&mut self) {
+        self.kv = None;
+        self.detached = false;
+    }
 }
 
 impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
         let mut p = match self.engine.pool.lock() {
             Ok(p) => p,
             Err(e) => e.into_inner(),
@@ -349,6 +473,9 @@ pub struct ParallelSeam {
     pool: Arc<Mutex<Pool>>,
     /// Signalled when a slot is returned — a queued request waits here.
     freed: Arc<Condvar>,
+    decode_batch: Mutex<DecodeBatchQueue>,
+    /// Wakes a cohort leader when a registered request reaches (or abandons) decode.
+    decode_ready: Condvar,
     /// The GPU baton. `None` when `n_slots == 1`: a lone sequence must not pay even a mutex per
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
@@ -427,6 +554,8 @@ impl ParallelSeam {
                 tick: 0,
             })),
             freed: Arc::new(Condvar::new()),
+            decode_batch: Mutex::new(DecodeBatchQueue::default()),
+            decode_ready: Condvar::new(),
             // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
@@ -772,6 +901,7 @@ impl ParallelSeam {
                 engine: self,
                 idx: target,
                 kv,
+                detached: false,
             });
         }
     }
@@ -898,6 +1028,7 @@ impl ParallelSeam {
                 engine: self,
                 idx: target,
                 kv: target_kv,
+                detached: false,
             });
         }
     }
@@ -929,6 +1060,7 @@ impl ParallelSeam {
                     engine: self,
                     idx: target,
                     kv,
+                    detached: false,
                 };
             }
             pool = self.freed.wait(pool).expect("pool poisoned");
@@ -974,6 +1106,7 @@ impl ParallelSeam {
                     engine: self,
                     idx: target,
                     kv,
+                    detached: false,
                 };
             }
             pool = self.freed.wait(pool).expect("pool poisoned");
@@ -981,6 +1114,369 @@ impl ParallelSeam {
     }
 
     /// Render an OpenAI conversation through the model's own chat template.
+    /// Return a KV whose request thread no longer owns it while a decode cohort is active.
+    fn return_detached_slot(&self, index: usize, kv: SeamKv) {
+        let mut pool = match self.pool.lock() {
+            Ok(pool) => pool,
+            Err(error) => error.into_inner(),
+        };
+        pool.tick += 1;
+        let tick = pool.tick;
+        let Some(slot) = pool.slots.get_mut(index) else {
+            tracing::error!(slot = index, "decode batch returned an unknown KV slot");
+            return;
+        };
+        if !slot.busy || slot.kv.is_some() {
+            tracing::error!(
+                slot = index,
+                busy = slot.busy,
+                has_kv = slot.kv.is_some(),
+                "decode batch found an inconsistent detached KV slot"
+            );
+            return;
+        }
+        slot.kv = Some(kv);
+        slot.busy = false;
+        slot.tick = tick;
+        if self.session_cache.is_some() {
+            slot.idle_since = Some(Instant::now());
+        }
+        drop(pool);
+        if self.session_cache.is_some() {
+            self.freed.notify_all();
+        } else {
+            self.freed.notify_one();
+        }
+    }
+
+    fn deliver_batch_state(&self, slot: usize, tx: SyncSender<BatchEvent>, event: BatchEvent) {
+        if let Err(mpsc::SendError(event)) = tx.send(event) {
+            if let Some(kv) = event.into_kv() {
+                self.return_detached_slot(slot, kv);
+            }
+        }
+    }
+
+    fn fallback_batch_work(&self, mut work: BatchWork) {
+        let kv = work.kv.take().expect("queued decode work owns a KV slot");
+        let Some(channels) = work.channels.take() else {
+            self.return_detached_slot(work.slot, kv);
+            return;
+        };
+        self.deliver_batch_state(
+            work.slot,
+            channels.events,
+            BatchEvent::Fallback {
+                kv,
+                prompt: work.prompt,
+                max_new: work.max_new,
+                stats: work.stats,
+            },
+        );
+    }
+
+    fn fail_batch_work(&self, mut work: BatchWork, error: &str) {
+        let kv = work.kv.take().expect("active decode work owns a KV slot");
+        let Some(channels) = work.channels.take() else {
+            self.return_detached_slot(work.slot, kv);
+            return;
+        };
+        self.deliver_batch_state(
+            work.slot,
+            channels.events,
+            BatchEvent::Failed {
+                kv,
+                error: error.to_owned(),
+            },
+        );
+    }
+
+    fn complete_batch_work(&self, mut work: BatchWork) {
+        let kv = work
+            .kv
+            .take()
+            .expect("completed decode work owns a KV slot");
+        let Some(channels) = work.channels.take() else {
+            self.return_detached_slot(work.slot, kv);
+            return;
+        };
+        self.deliver_batch_state(
+            work.slot,
+            channels.events,
+            BatchEvent::Complete {
+                kv,
+                stats: work.stats,
+            },
+        );
+    }
+
+    /// End this cohort and release requests that arrived after its depth was fixed.
+    fn close_decode_batch(&self) {
+        let waiting = {
+            let mut queue = self
+                .decode_batch
+                .lock()
+                .expect("decode batch queue poisoned");
+            queue.running = false;
+            queue.waiting.drain(..).collect::<Vec<_>>()
+        };
+        for work in waiting {
+            self.fallback_batch_work(work);
+        }
+    }
+
+    fn batch_depth_ready(&self, kv: &SeamKv, prompt: &[u32]) -> bool {
+        self.model.config().qwen4exp && kv.cached_len() + 1 == prompt.len()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn continue_after_prefill<F: FnMut(&str)>(
+        &self,
+        guard: &mut SlotGuard<'_>,
+        prompt: &[u32],
+        max_new: usize,
+        req: &RequestCtx,
+        acc: &mut Vec<u32>,
+        printed: &mut usize,
+        on_piece: &mut F,
+        stats: GenStats,
+    ) -> Result<GenStats> {
+        if max_new == 0 || crate::sampling::abort_requested(Some(req)) {
+            return Ok(stats);
+        }
+        let (_, tail) = crate::seam::generate_dense_vulkan_session(
+            self.vk.as_ref(),
+            self.model.gguf(),
+            self.model.config(),
+            self.model.engine_cfg(),
+            self.model.embd(),
+            self.model.per_layer_embd(),
+            prompt,
+            max_new,
+            |id| crate::stream_token(self.model.tokenizer(), acc, printed, id, on_piece),
+            &mut guard.kv,
+            self.max_ctx,
+            None,
+            None,
+            Some(req),
+            None,
+        )?;
+        Ok(merge_stats(stats, tail))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wait_for_decode_batch<F: FnMut(&str)>(
+        &self,
+        guard: &mut SlotGuard<'_>,
+        events: Receiver<BatchEvent>,
+        acknowledgements: SyncSender<bool>,
+        req: &RequestCtx,
+        acc: &mut Vec<u32>,
+        printed: &mut usize,
+        on_piece: &mut F,
+    ) -> Result<GenStats> {
+        loop {
+            let event = match events.recv() {
+                Ok(event) => event,
+                Err(_) => {
+                    guard.abandon_detached();
+                    return Err(anyhow!(
+                        "parallel decode worker stopped before returning its KV"
+                    ));
+                }
+            };
+            match event {
+                BatchEvent::Token(id) => {
+                    let keep_going = if crate::sampling::abort_requested(Some(req)) {
+                        false
+                    } else {
+                        crate::stream_token(self.model.tokenizer(), acc, printed, id, on_piece);
+                        !crate::sampling::abort_requested(Some(req))
+                    };
+                    let _ = acknowledgements.send(keep_going);
+                }
+                BatchEvent::Complete { kv, stats } => {
+                    guard.reattach(kv);
+                    return Ok(stats);
+                }
+                BatchEvent::Fallback {
+                    kv,
+                    prompt,
+                    max_new,
+                    stats,
+                } => {
+                    guard.reattach(kv);
+                    return self.continue_after_prefill(
+                        guard, &prompt, max_new, req, acc, printed, on_piece, stats,
+                    );
+                }
+                BatchEvent::Failed { kv, error } => {
+                    guard.reattach(kv);
+                    return Err(anyhow!(error));
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_decode_batch(
+        &self,
+        leader: BatchWork,
+        peers: Vec<BatchWork>,
+        leader_guard: &mut SlotGuard<'_>,
+        req: &RequestCtx,
+        leader_on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<GenStats> {
+        let mut active = Vec::with_capacity(1 + peers.len());
+        active.push(leader);
+        active.extend(peers);
+        let mut leader_result = None;
+
+        while !active.is_empty() {
+            let steps = active
+                .iter()
+                .map(|work| work.max_new.saturating_sub(work.generated))
+                .min()
+                .unwrap_or(0);
+            if steps == 0 {
+                return Err(anyhow!("parallel decode cohort contains exhausted work"));
+            }
+            let lanes = active.len();
+            let prompts = active
+                .iter()
+                .map(|work| work.prompt.clone())
+                .collect::<Vec<_>>();
+            let mut primary = active[0].kv.take();
+            let mut peer_kv = active
+                .iter_mut()
+                .skip(1)
+                .map(|work| work.kv.take().expect("active lane owns a KV slot"))
+                .collect::<Vec<_>>();
+            let mut samplers = active
+                .iter_mut()
+                .map(|work| work.sampler.take().expect("active lane owns a sampler"))
+                .collect::<Vec<_>>();
+            let mut lane_io = active
+                .iter_mut()
+                .map(|work| work.channels.take())
+                .collect::<Vec<_>>();
+            let mut accepted = vec![true; lanes];
+            let mut stream = |lane: usize, id: u32| {
+                let keep_going = match lane_io.get_mut(lane) {
+                    Some(None) => leader_on_token(id),
+                    Some(Some(channels)) => {
+                        channels.events.send(BatchEvent::Token(id)).is_ok()
+                            && channels.acknowledgements.recv().unwrap_or(false)
+                    }
+                    None => false,
+                };
+                if let Some(accepted) = accepted.get_mut(lane) {
+                    *accepted = keep_going;
+                }
+                keep_going
+            };
+            let decoded = crate::seam::generate_dense_vulkan_parallel_sampled_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &prompts,
+                steps,
+                &mut primary,
+                &mut peer_kv,
+                self.max_ctx,
+                &mut samplers,
+                &mut stream,
+                Some(req),
+            );
+
+            active[0].kv = primary;
+            for (work, kv) in active.iter_mut().skip(1).zip(peer_kv) {
+                work.kv = Some(kv);
+            }
+            for (work, sampler) in active.iter_mut().zip(samplers) {
+                work.sampler = Some(sampler);
+            }
+            for (work, io) in active.iter_mut().zip(lane_io) {
+                if let Some(channels) = io {
+                    work.channels = Some(channels);
+                }
+            }
+
+            let (outputs, batch_stats) = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    let message = error.to_string();
+                    for mut work in std::mem::take(&mut active) {
+                        if work.channels.is_none() {
+                            leader_guard
+                                .reattach(work.kv.take().expect("failed leader owns a KV slot"));
+                        } else {
+                            self.fail_batch_work(work, &message);
+                        }
+                    }
+                    if let Some(stats) = leader_result {
+                        tracing::warn!(%error, "decode batch failed after the leader completed");
+                        return Ok(stats);
+                    }
+                    return Err(error);
+                }
+            };
+            if outputs.len() != lanes || outputs.iter().any(Vec::is_empty) {
+                let message = format!(
+                    "parallel decode returned {} output lanes for {lanes} active lanes",
+                    outputs.len()
+                );
+                for mut work in std::mem::take(&mut active) {
+                    if work.channels.is_none() {
+                        leader_guard.reattach(
+                            work.kv
+                                .take()
+                                .expect("invalid leader output owns a KV slot"),
+                        );
+                    } else {
+                        self.fail_batch_work(work, &message);
+                    }
+                }
+                return Err(anyhow!(message));
+            }
+
+            let cfg = self.model.config();
+            let mut next = Vec::with_capacity(lanes);
+            for (lane, (mut work, output)) in std::mem::take(&mut active)
+                .into_iter()
+                .zip(outputs)
+                .enumerate()
+            {
+                work.generated += output.len();
+                work.stats.n_gen += output.len();
+                work.stats.decode_secs += batch_stats.decode_secs;
+                work.prompt.extend_from_slice(&output);
+                let eos = output.last().is_some_and(|token| {
+                    !self.model.engine_cfg().sampling.ignore_eos
+                        && (cfg.eos_ids.contains(token) || *token == cfg.eos)
+                });
+                let done = eos || !accepted[lane] || work.generated >= work.max_new;
+                if done {
+                    if work.channels.is_none() {
+                        leader_guard
+                            .reattach(work.kv.take().expect("completed leader owns a KV slot"));
+                        leader_result = Some(work.stats);
+                    } else {
+                        self.complete_batch_work(work);
+                    }
+                } else {
+                    next.push(work);
+                }
+            }
+            active = next;
+        }
+
+        leader_result.ok_or_else(|| anyhow!("parallel decode completed without a leader result"))
+    }
+
     pub fn render_chat_messages(&self, messages: &[(&str, &str)]) -> Result<String> {
         self.model.render_chat_messages(messages)
     }
@@ -1011,43 +1507,219 @@ impl ParallelSeam {
     ) -> Result<GenStats> {
         let prompt_tokens = self.model.encode(prompt)?;
         let turn_checkpoint = self.model.turn_checkpoint(&prompt_tokens, stable_prefix)?;
-        let mut guard = self.checkout(&prompt_tokens, req)?;
         // Cap the reply to the context actually left in THIS slot (a per-slot ctx is smaller than
         // the model's trained window under `-np N`), mirroring the sequential session path: a
         // generation ceiling is a default, not a demand. An over-long PROMPT still errors cleanly
         // in the runner.
         let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let batch_candidate = self.model.config().qwen4exp
+            && constraint.is_none()
+            && self.gate.is_some()
+            && max_new > 0;
+        // Register before checkout: a peer already at the frontier should know that another
+        // eligible request is on its way through restore/prefill.
+        let mut batch_prefill = batch_candidate.then(|| BatchPrefillRegistration::new(self));
+        let mut guard = self.checkout(&prompt_tokens, req)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS engine's pins for the decode (warm calls
         // must agree with the buffers placement sized). Concurrent requests share the one cell.
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
-        let (_ids, stats) = crate::seam::generate_dense_vulkan_session(
-            &self.vk,
+        if !batch_candidate {
+            let (_ids, stats) = crate::seam::generate_dense_vulkan_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &prompt_tokens,
+                max_new,
+                |id| {
+                    crate::stream_token(
+                        self.model.tokenizer(),
+                        &mut acc,
+                        &mut printed,
+                        id,
+                        &mut on_piece,
+                    )
+                },
+                &mut guard.kv,
+                self.max_ctx,
+                turn_checkpoint,
+                constraint,
+                Some(req),
+                None,
+            )?;
+            return Ok(stats);
+        }
+
+        // Establish prompt state independently. Only equal-depth frontier decode is aggregated.
+        let (_ids, prefill_stats) = crate::seam::generate_dense_vulkan_session(
+            self.vk.as_ref(),
             self.model.gguf(),
             self.model.config(),
             self.model.engine_cfg(),
             self.model.embd(),
             self.model.per_layer_embd(),
             &prompt_tokens,
-            max_new,
-            |id| {
-                crate::stream_token(
-                    self.model.tokenizer(),
-                    &mut acc,
-                    &mut printed,
-                    id,
-                    &mut on_piece,
-                )
-            },
+            0,
+            |_| {},
             &mut guard.kv,
             self.max_ctx,
             turn_checkpoint,
-            constraint,
+            None,
             Some(req),
-            None, // multimodal plan
+            None,
         )?;
-        Ok(stats)
+        if crate::sampling::abort_requested(Some(req))
+            || !guard
+                .kv
+                .as_ref()
+                .is_some_and(|kv| self.batch_depth_ready(kv, &prompt_tokens))
+        {
+            drop(batch_prefill.take());
+            return self.continue_after_prefill(
+                &mut guard,
+                &prompt_tokens,
+                max_new,
+                req,
+                &mut acc,
+                &mut printed,
+                &mut on_piece,
+                prefill_stats,
+            );
+        }
+
+        let sampler = ParallelSampler::new(req, &self.model.engine_cfg().sampling);
+        let mut queue = self
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned");
+        batch_prefill
+            .as_mut()
+            .expect("batch candidate registered before prefill")
+            .arrive(&mut queue);
+        drop(batch_prefill.take());
+        if queue.running {
+            let (event_tx, event_rx) = mpsc::sync_channel(0);
+            let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+            let slot = guard.idx;
+            let kv = guard.detach();
+            queue.waiting.push_back(BatchWork {
+                slot,
+                kv: Some(kv),
+                prompt: prompt_tokens,
+                max_new,
+                generated: 0,
+                stats: prefill_stats,
+                sampler: Some(sampler),
+                channels: Some(BatchChannels {
+                    events: event_tx,
+                    acknowledgements: ack_rx,
+                }),
+            });
+            self.decode_ready.notify_all();
+            drop(queue);
+            return self.wait_for_decode_batch(
+                &mut guard,
+                event_rx,
+                ack_tx,
+                req,
+                &mut acc,
+                &mut printed,
+                &mut on_piece,
+            );
+        }
+
+        // The first ready request leads this cohort. It only waits while registered work is truly
+        // still reaching the frontier, so a lone request pays no unconditional batching delay.
+        queue.running = true;
+        let (mut queue, _) = self
+            .decode_ready
+            .wait_timeout_while(queue, DECODE_BATCH_WAIT, |queue| {
+                should_wait_for_decode_peers(queue.prefilling, queue.waiting.len())
+            })
+            .expect("decode batch queue poisoned");
+
+        let depth = guard
+            .kv
+            .as_ref()
+            .expect("checked-out leader has a KV slot")
+            .cached_len();
+        let (peers, fallback) = {
+            let mut peers = Vec::new();
+            let mut fallback = Vec::new();
+            for work in queue.waiting.drain(..) {
+                let compatible = peers.len() + 1 < MAX_DECODE_BATCH
+                    && work.kv.as_ref().is_some_and(|kv| {
+                        kv.cached_len() == depth && self.batch_depth_ready(kv, &work.prompt)
+                    });
+                if compatible {
+                    peers.push(work);
+                } else {
+                    fallback.push(work);
+                }
+            }
+            if peers.is_empty() {
+                queue.running = false;
+            }
+            (peers, fallback)
+        };
+        drop(queue);
+        for work in fallback {
+            self.fallback_batch_work(work);
+        }
+        tracing::debug!(
+            depth,
+            lanes = peers.len() + 1,
+            "collected parallel decode cohort"
+        );
+        if peers.is_empty() || crate::sampling::abort_requested(Some(req)) {
+            if !peers.is_empty() {
+                self.close_decode_batch();
+                for work in peers {
+                    self.fallback_batch_work(work);
+                }
+            }
+            return self.continue_after_prefill(
+                &mut guard,
+                &prompt_tokens,
+                max_new,
+                req,
+                &mut acc,
+                &mut printed,
+                &mut on_piece,
+                prefill_stats,
+            );
+        }
+
+        let leader = BatchWork {
+            slot: guard.idx,
+            kv: Some(guard.detach()),
+            prompt: prompt_tokens,
+            max_new,
+            generated: 0,
+            stats: prefill_stats,
+            sampler: Some(sampler),
+            channels: None,
+        };
+        let mut leader_stream = |id| {
+            if crate::sampling::abort_requested(Some(req)) {
+                return false;
+            }
+            crate::stream_token(
+                self.model.tokenizer(),
+                &mut acc,
+                &mut printed,
+                id,
+                &mut on_piece,
+            );
+            !crate::sampling::abort_requested(Some(req))
+        };
+        let result = self.run_decode_batch(leader, peers, &mut guard, req, &mut leader_stream);
+        self.close_decode_batch();
+        result
     }
 
     /// Generate one Qwen3.8 vision turn. Projector execution is completed by the caller before
@@ -1140,7 +1812,17 @@ impl ParallelSeam {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_multimodal_prompt, pick_continuation, MultimodalEmbedding};
+    use super::{
+        expand_multimodal_prompt, pick_continuation, should_wait_for_decode_peers,
+        MultimodalEmbedding, MAX_DECODE_BATCH,
+    };
+
+    #[test]
+    fn decode_cohort_waits_only_for_registered_capacity() {
+        assert!(!should_wait_for_decode_peers(0, 0));
+        assert!(should_wait_for_decode_peers(1, 0));
+        assert!(!should_wait_for_decode_peers(1, MAX_DECODE_BATCH - 1));
+    }
 
     #[test]
     fn continuation_picks_longest_prefix_not_first() {

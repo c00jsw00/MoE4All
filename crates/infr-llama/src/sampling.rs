@@ -440,6 +440,39 @@ impl Penalties {
     }
 }
 
+/// Sampling state owned by one lane of a layer-synchronous decode batch. It reuses the ordinary
+/// sampler, RNG and penalties so batching changes graph shape, not token-selection semantics.
+pub(crate) struct ParallelSampler {
+    sampler: Sampler,
+    rng: u64,
+    penalties: Option<Penalties>,
+}
+
+impl ParallelSampler {
+    pub(crate) fn new(req: &RequestCtx, cfg: &infr_core::config::SamplingCfg) -> Self {
+        Self {
+            sampler: Sampler::resolve(Some(req), cfg),
+            rng: resolve_seed(Some(req), cfg),
+            penalties: Penalties::resolve(Some(req)),
+        }
+    }
+
+    pub(crate) fn can_gpu_argmax(&self) -> bool {
+        (self.sampler.temp <= 0.0 || self.sampler.top_k == 1) && self.penalties.is_none()
+    }
+
+    pub(crate) fn sample(&mut self, logits: &mut [f32]) -> u32 {
+        if let Some(penalties) = self.penalties.as_ref() {
+            penalties.apply(logits);
+        }
+        let token = sample_logits(logits, self.sampler, &mut self.rng);
+        if let Some(penalties) = self.penalties.as_mut() {
+            penalties.observe(token);
+        }
+        token
+    }
+}
+
 /// RNG seed for a generation's sampling draws (unused under greedy). `sampling.seed`
 /// (`INFR_SEED`) pins it for distribution-identity testing (chained vs per-token temp sampling must
 /// draw the same stream given the same seed); unset falls back to a wall-clock seed.
@@ -884,6 +917,34 @@ mod tests {
             alone, interleaved,
             "a seeded sequence must draw the same tokens whether or not it shares the engine"
         );
+    }
+
+    #[test]
+    fn parallel_sampler_matches_the_ordinary_host_sampler() {
+        let request = RequestCtx::new(RequestSampling {
+            temp: Some(0.8),
+            top_k: Some(12),
+            top_p: Some(0.9),
+            seed: Some(42),
+            ..Default::default()
+        });
+        let config = scfg();
+        let sampler = Sampler::resolve(Some(&request), &config);
+        let mut rng = resolve_seed(Some(&request), &config);
+        let mut parallel = ParallelSampler::new(&request, &config);
+        let logits: Vec<f32> = (0..96)
+            .map(|index| (index as f32 * 0.173).sin() * 3.0)
+            .collect();
+
+        for step in 0..32 {
+            let expected = sample_logits(&logits, sampler, &mut rng);
+            let mut row = logits.clone();
+            assert_eq!(
+                parallel.sample(&mut row),
+                expected,
+                "batched lane diverged from the ordinary sampler at step {step}"
+            );
+        }
     }
 
     /// Penalties are per-sequence state (their token history is), and a sequence that sets none must
