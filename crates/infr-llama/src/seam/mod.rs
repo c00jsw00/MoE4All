@@ -754,6 +754,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     want_ctx: usize,
     samplers: &mut [crate::sampling::ParallelSampler],
     on_token: &mut dyn FnMut(usize, u32) -> bool,
+    yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<Vec<u32>>, GenStats)> {
     if primary.is_none() {
@@ -765,8 +766,22 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
         Err(anyhow!("warm parallel session must not re-bind {name}"))
     });
     let out = runner::generate_dense_backend_parallel_sampled(
-        vk, &*bind, g, cfg, ec, token_embd, ple, prompts, max_new, primary, peers, want_ctx,
-        samplers, on_token, req,
+        vk,
+        &*bind,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompts,
+        max_new,
+        primary,
+        peers,
+        want_ctx,
+        samplers,
+        on_token,
+        yield_requested,
+        req,
     )?;
     vk.print_moe_pager_stats();
     vk.print_dense_pager_stats();
@@ -786,8 +801,9 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
     peers: &mut [SeamKv],
     want_ctx: usize,
     turn_checkpoints: &[Option<TurnCheckpoint>],
+    samplers: &mut [crate::sampling::ParallelSampler],
     req: Option<&crate::sampling::RequestCtx>,
-) -> AResult<Vec<GenStats>> {
+) -> AResult<(Vec<GenStats>, Vec<Option<u32>>)> {
     if primary.is_none() {
         return Err(anyhow!(
             "parallel Vulkan prefill requires an initialized primary session"
@@ -809,6 +825,7 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
         peers,
         want_ctx,
         turn_checkpoints,
+        samplers,
         req,
     );
     if out.is_err() {
