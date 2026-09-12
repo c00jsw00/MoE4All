@@ -179,6 +179,13 @@ const MOE_SMALL_M: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
     max: 64,
 };
 
+// `native_gemv_id_multi{,_sg}.comp`: 0 uses the common push-constant mask; 1/2 select
+// the per-row hit/miss masks appended after the flattened router ids. Keeping both banks immutable
+// lets the hit submit read one while the host prepares/enqueues miss promotion for the next submit.
+const MOE_ROW_MASK_NONE: u32 = 0;
+const MOE_ROW_MASK_HITS: u32 = 1;
+const MOE_ROW_MASK_MISSES: u32 = 2;
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn moe_small_m_threshold(be_: &VulkanBackend) -> usize {
     MOE_SMALL_M.clamped(be_.cfg().kernels.vulkan.moe_small_m)
@@ -9023,9 +9030,9 @@ fn linear_paged_maybe_shared(
     out_f: usize,
     rows: usize,
     active_mask: u32,
+    row_mask_bank: u32,
 ) {
     if let Some(shared) = shared {
-        debug_assert_eq!(rows, 1);
         rec.linear_native_id_multi_paged_shared(
             dtype,
             arena_addr,
@@ -9040,7 +9047,9 @@ fn linear_paged_maybe_shared(
             y,
             in_f,
             out_f,
+            rows,
             active_mask,
+            row_mask_bank,
         );
     } else {
         rec.linear_native_id_multi_paged(
@@ -9058,6 +9067,7 @@ fn linear_paged_maybe_shared(
             out_f,
             rows,
             active_mask,
+            row_mask_bank,
         );
     }
 }
@@ -9128,6 +9138,10 @@ fn execute_paged_moe<'a>(
     );
     let rows = graph.desc(*x).numel() / ne;
     let n_slots = rows * n_used;
+    let parallel_decode = rows > 1
+        && graph.independent_rows
+        && graph.sequence_spans.len() == rows
+        && graph.sequence_spans.iter().all(|span| span.rows == 1);
     let physical_used = n_used + usize::from(shared.is_some());
     let physical_slots = rows * physical_used;
     let routed_mask = if n_used == u32::BITS as usize {
@@ -9168,7 +9182,7 @@ fn execute_paged_moe<'a>(
         pool,
         be_,
         "moe_paged_ids",
-        n_slots * 4,
+        (n_slots + usize::from(parallel_decode) * 2 * rows) * 4,
         BufferUsage::Staging,
     )?;
     let wts = pooled(pool, be_, "moe_paged_wts", n_slots * 4)?;
@@ -9455,7 +9469,8 @@ fn execute_paged_moe<'a>(
     } else {
         matches!(act, Activation::Silu)
     };
-    let use_paged_mmq = rows > moe_small_m_threshold(be_)
+    let use_paged_mmq = !parallel_decode
+        && rows > moe_small_m_threshold(be_)
         && be_.caps().i8_dot
         && paged_mmq_act_ok
         && paged_mmq_ok(gdt)
@@ -9499,37 +9514,60 @@ fn execute_paged_moe<'a>(
         })
     };
     let mut active_mask = all_active_mask;
+    let mut row_mask_bank = MOE_ROW_MASK_NONE;
     let mut role_batches_preopened = false;
     let mut promotion_probe = None;
-    // Decode-only hit-first schedule: launch complete resident Gate/Up/Down triplets together with
-    // the shared expert while every missing triplet is promoted. The original slot order is
-    // retained through a kernel mask, so router weights and final accumulation stay byte-for-byte
-    // in their ordinary layout. Keep the pager epoch open across both halves: miss insertion may
-    // then use any cold slot except the hit weights still being read by the GPU.
+    // Decode-only hit-first schedule: launch complete resident Gate/Up/Down triplets while every
+    // missing triplet is promoted. A scalar decode uses the original push-constant mask; an
+    // independent-row decode cohort appends one mask per row for each half to the immutable ids
+    // buffer. The original slot order is retained, so router weights and final accumulation stay
+    // byte-for-byte in their ordinary layout. Keep the pager epoch open across both halves: miss
+    // insertion may then use any cold slot except the hit weights still being read by the GPU.
     if !layer_stream
-        && rows == 1
+        && (rows == 1 || parallel_decode)
         && !*fused_gate_up
         && !*weight_before
-        && stage_ids.len() == n_used
+        && stage_ids.len() == n_slots
         && n_used <= u32::BITS as usize
     {
-        let hit_mask = {
+        let hit_masks = {
             let guard = be_.moe_pager().lock().unwrap();
             let sess = guard.as_ref().expect("paged execution requires a session");
-            sess.routed_roles_resident_mask(&[gate_id, up_id, down_id], stage_ids.as_slice())?
+            stage_ids
+                .chunks_exact(n_used)
+                .map(|ids| sess.routed_roles_resident_mask(&[gate_id, up_id, down_id], ids))
+                .collect::<Result<Vec<_>>>()?
         };
-        let miss_mask = routed_mask ^ hit_mask;
+        let miss_masks = hit_masks
+            .iter()
+            .map(|&hit_mask| routed_mask ^ hit_mask)
+            .collect::<Vec<_>>();
+        let any_hit = hit_masks.iter().any(|&mask| mask != 0);
+        let any_miss = miss_masks.iter().any(|&mask| mask != 0);
         // Without a shared expert, an empty hit set still has no useful first-stage work. With
         // one, shared-only is useful work and overlaps the all-miss host promotion as requested.
-        if miss_mask != 0 && (hit_mask != 0 || shared.is_some()) {
-            let mut hit_ids = Vec::with_capacity(n_used);
-            let mut miss_ids = Vec::with_capacity(n_used);
-            for (slot, &expert) in stage_ids.iter().enumerate() {
-                if hit_mask & (1u32 << slot) != 0 {
+        if any_miss && (any_hit || shared.is_some()) {
+            let mut hit_ids = Vec::with_capacity(n_slots);
+            let mut miss_ids = Vec::with_capacity(n_slots);
+            for (flat_slot, &expert) in stage_ids.iter().enumerate() {
+                let row = flat_slot / n_used;
+                let slot = flat_slot % n_used;
+                if hit_masks[row] & (1u32 << slot) != 0 {
                     hit_ids.push(expert);
                 } else {
                     miss_ids.push(expert);
                 }
+            }
+            if parallel_decode {
+                let mut ids_and_masks = Vec::with_capacity(n_slots + 2 * rows);
+                ids_and_masks.extend_from_slice(stage_ids.as_slice());
+                ids_and_masks.extend(hit_masks.iter().map(|&mask| mask | shared_mask));
+                ids_and_masks.extend_from_slice(miss_masks.as_slice());
+                be_.upload(
+                    pool[&ids_key].as_ref(),
+                    bytemuck::cast_slice(ids_and_masks.as_slice()),
+                )
+                .map_err(|e| be(e.to_string()))?;
             }
             let (role_batches_open, hit_push) = {
                 let mut guard = be_.moe_pager().lock().unwrap();
@@ -9578,7 +9616,16 @@ fn execute_paged_moe<'a>(
                 rec2.zero(pool[&ybuf].as_ref(), physical_slots * ne);
                 rec2.arena_stream_barrier();
                 let xb = r(*x)?;
-                let first_mask = hit_mask | shared_mask;
+                let first_mask = if parallel_decode {
+                    0
+                } else {
+                    hit_masks[0] | shared_mask
+                };
+                let first_row_mask_bank = if parallel_decode {
+                    MOE_ROW_MASK_HITS
+                } else {
+                    MOE_ROW_MASK_NONE
+                };
                 {
                     let guard = be_.moe_pager().lock().unwrap();
                     let sess = guard.as_ref().expect("checked above");
@@ -9599,6 +9646,7 @@ fn execute_paged_moe<'a>(
                         gu_width,
                         rows,
                         first_mask,
+                        first_row_mask_bank,
                     );
                     linear_paged_maybe_shared(
                         rec2,
@@ -9617,6 +9665,7 @@ fn execute_paged_moe<'a>(
                         nff,
                         rows,
                         first_mask,
+                        first_row_mask_bank,
                     );
                 }
                 let n_act = physical_slots * nff;
@@ -9670,6 +9719,7 @@ fn execute_paged_moe<'a>(
                         ne,
                         rows,
                         first_mask,
+                        first_row_mask_bank,
                     );
                 }
                 promotion_probe = Some(submit_prefill_compute(rec, ps)?);
@@ -9678,7 +9728,12 @@ fn execute_paged_moe<'a>(
                 fresh.arena_stream_barrier();
                 *rec = Some(fresh);
                 stage_ids = miss_ids;
-                active_mask = miss_mask;
+                active_mask = if parallel_decode { 0 } else { miss_masks[0] };
+                row_mask_bank = if parallel_decode {
+                    MOE_ROW_MASK_MISSES
+                } else {
+                    MOE_ROW_MASK_NONE
+                };
                 role_batches_preopened = true;
             }
         }
@@ -10094,6 +10149,7 @@ fn execute_paged_moe<'a>(
                 gu_width,
                 rows,
                 active_mask,
+                row_mask_bank,
             );
             if let Some(ubuf) = &ubuf {
                 linear_paged_maybe_shared(
@@ -10113,6 +10169,7 @@ fn execute_paged_moe<'a>(
                     nff,
                     rows,
                     active_mask,
+                    row_mask_bank,
                 );
             }
         }
@@ -10200,6 +10257,7 @@ fn execute_paged_moe<'a>(
             ne,
             rows,
             active_mask,
+            row_mask_bank,
         );
     }
     let dstb = match shared {
