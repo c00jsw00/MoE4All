@@ -1723,6 +1723,17 @@ pub struct MoePrefetchHint {
     pub context_tokens: u32,
 }
 
+/// A contiguous sequence inside a shared activation batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequenceSpan {
+    /// First row of this sequence in the shared activation batch.
+    pub row_start: u32,
+    /// Number of consecutive rows belonging to this sequence.
+    pub rows: u32,
+    /// Absolute model position of the first row.
+    pub start_pos: u32,
+}
+
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].
 #[derive(Clone, Default)]
 pub struct Graph {
@@ -1734,6 +1745,10 @@ pub struct Graph {
     /// Each logical row is an independent sequence with its own persistent state bindings.
     /// Stateless activations remain one ordinary row-major batch.
     pub independent_rows: bool,
+    /// Contiguous sequence ranges inside an independent activation batch. Decode has one row per
+    /// span; concurrent prefill has several rows per span. Empty on ordinary single-sequence
+    /// graphs. The ranges must partition every stateful op's row domain in ascending order.
+    pub sequence_spans: Vec<SequenceSpan>,
     /// Decode-only scheduling hints. Empty for models without a validated next-layer predictor.
     pub moe_prefetch_hints: Vec<MoePrefetchHint>,
     /// Producer-set opt-out of the Vulkan record-once decode replay: `true` forces the

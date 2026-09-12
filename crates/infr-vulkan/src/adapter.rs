@@ -9,7 +9,7 @@ use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
 use infr_core::graph::{
-    Activation, AttnMask, Dsv4CacheFormat, Graph, MoePrefetchHint, Op, TensorKind,
+    Activation, AttnMask, Dsv4CacheFormat, Graph, MoePrefetchHint, Op, SequenceSpan, TensorKind,
     QSA_MAX_TOP_BLOCKS,
 };
 use infr_core::shutdown::shutdown_requested;
@@ -365,6 +365,36 @@ fn resolve_rows<'a>(
         )));
     }
     Ok(bufs)
+}
+
+fn sequence_spans(graph: &Graph, rows: usize) -> Result<&[SequenceSpan]> {
+    if !graph.independent_rows || graph.sequence_spans.is_empty() {
+        return Err(be(
+            "vulkan adapter: an independent-row graph needs explicit sequence spans",
+        ));
+    }
+    let mut next = 0usize;
+    for (lane, span) in graph.sequence_spans.iter().enumerate() {
+        let start = span.row_start as usize;
+        let len = span.rows as usize;
+        if len == 0 || start != next {
+            return Err(be(format!(
+                "vulkan adapter: sequence span {lane} starts at row {start} with {len} rows; expected a non-empty span at {next}"
+            )));
+        }
+        next = next
+            .checked_add(len)
+            .ok_or_else(|| be("vulkan adapter: sequence row range overflow"))?;
+        span.start_pos
+            .checked_add(span.rows)
+            .ok_or_else(|| be("vulkan adapter: sequence position range overflow"))?;
+    }
+    if next != rows {
+        return Err(be(format!(
+            "vulkan adapter: sequence spans cover {next} rows, expected {rows}"
+        )));
+    }
+    Ok(&graph.sequence_spans)
 }
 
 /// Allocate the `Internal` scratch (activations) for `graph`. The leading (row) dim is padded to a
@@ -2847,18 +2877,21 @@ fn lower_op(
                         "independent-row KV writes require the static Vulkan path",
                     ));
                 }
-                let caches = resolve_rows(bindings, *cache, rows)?;
+                let spans = sequence_spans(graph, rows)?;
+                let caches = resolve_rows(bindings, *cache, spans.len())?;
                 let cap_rows = cap / rs.max(1);
-                let dst_row = if cap_rows > 0 { pos % cap_rows } else { pos };
-                for (row, &cache_buf) in caches.iter().enumerate() {
-                    let src_off = row * rs;
+                for (span, &cache_buf) in spans.iter().zip(caches) {
+                    let span_rows = span.rows as usize;
+                    let span_pos = span.start_pos as usize;
+                    let src_row = span.row_start as usize;
+                    let src_off = src_row * rs;
                     if let Some((table, segment_shift)) = segmented_kv_view(cache_buf) {
-                        let off = pos * rs;
+                        let off = span_pos * rs;
                         if cache_q8 {
                             rec.store_q8_segmented(
                                 s,
                                 table,
-                                rs,
+                                span_rows * rs,
                                 off,
                                 src_f16,
                                 src_off,
@@ -2868,7 +2901,7 @@ fn lower_op(
                             rec.store_f16_off_segmented(
                                 s,
                                 table,
-                                rs,
+                                span_rows * rs,
                                 off,
                                 src_off,
                                 segment_shift,
@@ -2881,24 +2914,42 @@ fn lower_op(
                         }
                         continue;
                     }
-                    if cache_q8 {
-                        rec.store_q8(s, cache_buf, rs, dst_row * rs, cap, src_f16, src_off);
-                    } else if cache_dt == infr_core::DType::F16 {
-                        match graph.desc(*src).dtype {
-                            infr_core::DType::F16 => {
-                                rec.copy(s, src_off * 2, cache_buf, dst_row * rs * 2, rs * 2)
-                            }
-                            _ => match cache_buf.device_addr() {
-                                Some(a) => {
-                                    rec.store_f16_off_at(s, cache_buf, a, rs, dst_row * rs, src_off)
-                                }
-                                None => rec.store_f16_off(s, cache_buf, rs, dst_row * rs, src_off),
-                            },
-                        }
+                    let dst_row = if cap_rows > 0 {
+                        span_pos % cap_rows
                     } else {
-                        return Err(be(format!(
-                            "independent-row KV write does not support {cache_dt:?} cache"
-                        )));
+                        span_pos
+                    };
+                    let segments = if cap_rows > 0 && dst_row + span_rows > cap_rows {
+                        let first = cap_rows - dst_row;
+                        [(0usize, dst_row, first), (first, 0, span_rows - first)]
+                    } else {
+                        [(0usize, dst_row, span_rows), (0, 0, 0)]
+                    };
+                    for &(source_row, target_row, segment_rows) in
+                        segments.iter().filter(|&&(_, _, count)| count > 0)
+                    {
+                        let source = src_off + source_row * rs;
+                        let target = target_row * rs;
+                        let elems = segment_rows * rs;
+                        if cache_q8 {
+                            rec.store_q8(s, cache_buf, elems, target, cap, src_f16, source);
+                        } else if cache_dt == infr_core::DType::F16 {
+                            match graph.desc(*src).dtype {
+                                infr_core::DType::F16 => {
+                                    rec.copy(s, source * 2, cache_buf, target * 2, elems * 2)
+                                }
+                                _ => match cache_buf.device_addr() {
+                                    Some(a) => {
+                                        rec.store_f16_off_at(s, cache_buf, a, elems, target, source)
+                                    }
+                                    None => rec.store_f16_off(s, cache_buf, elems, target, source),
+                                },
+                            }
+                        } else {
+                            return Err(be(format!(
+                                "independent-row KV write does not support {cache_dt:?} cache"
+                            )));
+                        }
                     }
                 }
                 return Ok(());
@@ -3141,12 +3192,29 @@ fn lower_op(
             scale,
             sections,
         } => {
-            let blocks = *kv_len / *ratio.max(&1);
+            let independent_spans = graph
+                .independent_rows
+                .then(|| sequence_spans(graph, *rows as usize))
+                .transpose()?;
+            let ratio_safe = *ratio.max(&1);
+            let blocks = independent_spans.map_or(*kv_len / ratio_safe, |spans| {
+                spans
+                    .iter()
+                    .map(|span| (span.start_pos + span.rows) / ratio_safe)
+                    .max()
+                    .unwrap_or(0)
+            });
             let first_visible = kv_len.saturating_sub(*rows).saturating_add(1);
-            let first_blocks = first_visible / *ratio.max(&1);
+            let first_blocks = independent_spans.map_or(first_visible / ratio_safe, |spans| {
+                spans
+                    .iter()
+                    .map(|span| span.start_pos.saturating_add(1) / ratio_safe)
+                    .min()
+                    .unwrap_or(0)
+            });
+            let invalid_rows = independent_spans.is_none() && (*rows == 0 || *rows > *kv_len);
             if *head_dim != 128
-                || *rows == 0
-                || *rows > *kv_len
+                || invalid_rows
                 || *n_head == 0
                 || *n_head > 4
                 || *ratio == 0
@@ -3189,20 +3257,20 @@ fn lower_op(
                         "independent-row QSA does not support multimodal positions",
                     ));
                 }
-                let row_count = *rows as usize;
-                let raw = resolve_rows(bindings, *k_cache, row_count)?;
-                let compressed = resolve_rows(bindings, *block_cache, row_count)?;
+                let spans = independent_spans.expect("independent spans were validated");
+                let raw = resolve_rows(bindings, *k_cache, spans.len())?;
+                let compressed = resolve_rows(bindings, *block_cache, spans.len())?;
                 let q_row_bytes = *n_head as usize * *head_dim as usize * 2;
                 let dst_row_bytes = *top_blocks as usize * 4;
-                for row in 0..row_count {
+                for (lane, span) in spans.iter().enumerate() {
                     let (raw_binding, block_binding, segment_shifts) = match (
-                        segmented_kv_view(raw[row]),
-                        segmented_kv_view(compressed[row]),
+                        segmented_kv_view(raw[lane]),
+                        segmented_kv_view(compressed[lane]),
                     ) {
                         (Some((raw_table, raw_shift)), Some((block_table, block_shift))) => {
                             (raw_table, block_table, Some((raw_shift, block_shift)))
                         }
-                        (None, None) => (raw[row], compressed[row], None),
+                        (None, None) => (raw[lane], compressed[lane], None),
                         _ => {
                             return Err(be(
                                 "vulkan independent-row QSA raw and block caches must both be segmented or both be flat",
@@ -3217,9 +3285,9 @@ fn lower_op(
                         pool[&sk].as_ref(),
                         None,
                         r(*dst)?,
-                        1,
-                        *kv_len,
-                        *compress_from,
+                        span.rows,
+                        span.start_pos + span.rows,
+                        span.start_pos / *ratio,
                         *n_head,
                         *head_dim,
                         *top_blocks,
@@ -3230,8 +3298,8 @@ fn lower_op(
                         *scale,
                         segment_shifts,
                         None,
-                        row * q_row_bytes,
-                        row * dst_row_bytes,
+                        span.row_start as usize * q_row_bytes,
+                        span.row_start as usize * dst_row_bytes,
                     );
                 }
                 return Ok(());
@@ -3362,13 +3430,23 @@ fn lower_op(
             ratio,
             scale,
         } => {
+            let independent_spans = graph
+                .independent_rows
+                .then(|| sequence_spans(graph, *rows as usize))
+                .transpose()?;
             let first_visible = kv_len.saturating_sub(*rows).saturating_add(1);
-            let first_blocks = first_visible / *ratio.max(&1);
+            let ratio_safe = *ratio.max(&1);
+            let first_blocks = independent_spans.map_or(first_visible / ratio_safe, |spans| {
+                spans
+                    .iter()
+                    .map(|span| span.start_pos.saturating_add(1) / ratio_safe)
+                    .min()
+                    .unwrap_or(0)
+            });
             let kdt = graph.desc(*k_cache).dtype;
             let vdt = graph.desc(*v_cache).dtype;
             let supported = |dt| matches!(dt, infr_core::DType::F16 | infr_core::DType::Q8_0);
-            if *rows == 0
-                || *rows > *kv_len
+            if (independent_spans.is_none() && (*rows == 0 || *rows > *kv_len))
                 || *n_head == 0
                 || *n_kv == 0
                 || !n_head.is_multiple_of(*n_kv)
@@ -3391,16 +3469,16 @@ fn lower_op(
                 )));
             }
             if graph.independent_rows {
-                let row_count = *rows as usize;
-                let k_rows = resolve_rows(bindings, *k_cache, row_count)?;
-                let v_rows = resolve_rows(bindings, *v_cache, row_count)?;
+                let spans = independent_spans.expect("independent spans were validated");
+                let k_rows = resolve_rows(bindings, *k_cache, spans.len())?;
+                let v_rows = resolve_rows(bindings, *v_cache, spans.len())?;
                 let q_row_bytes = *n_head as usize * *head_dim as usize * 2;
                 let idx_row_bytes = *top_blocks as usize * 4;
                 let dst_row_bytes = *n_head as usize * *head_dim as usize * 4;
-                for row in 0..row_count {
+                for (lane, span) in spans.iter().enumerate() {
                     let (k_binding, v_binding, segment_shift) = match (
-                        segmented_kv_view(k_rows[row]),
-                        segmented_kv_view(v_rows[row]),
+                        segmented_kv_view(k_rows[lane]),
+                        segmented_kv_view(v_rows[lane]),
                     ) {
                         (Some((k_table, k_shift)), Some((v_table, v_shift)))
                             if k_shift == v_shift =>
@@ -3412,7 +3490,7 @@ fn lower_op(
                                 "vulkan independent-row QSA K/V segment geometry differs",
                             ));
                         }
-                        (None, None) => (k_rows[row], v_rows[row], None),
+                        (None, None) => (k_rows[lane], v_rows[lane], None),
                         _ => {
                             return Err(be(
                                 "vulkan independent-row QSA K/V caches must both be segmented or both be flat",
@@ -3425,8 +3503,8 @@ fn lower_op(
                         v_binding,
                         r(*indices)?,
                         r(*dst)?,
-                        1,
-                        *kv_len,
+                        span.rows,
+                        span.start_pos + span.rows,
                         *n_head,
                         *n_kv,
                         *head_dim,
@@ -3438,9 +3516,9 @@ fn lower_op(
                         graph.desc(*k_cache).numel() as u32,
                         graph.desc(*v_cache).numel() as u32,
                         segment_shift,
-                        row * q_row_bytes,
-                        row * idx_row_bytes,
-                        row * dst_row_bytes,
+                        span.row_start as usize * q_row_bytes,
+                        span.row_start as usize * idx_row_bytes,
+                        span.row_start as usize * dst_row_bytes,
                     );
                 }
                 return Ok(());
@@ -3585,26 +3663,29 @@ fn lower_op(
             // path, where the row must be derived from the live params pos in-kernel (the ring
             // modulo rides the same params channel as the pos itself — never a baked constant).
             if graph.independent_rows {
-                let RopeMode::Static(rope_pos) = mode else {
+                let RopeMode::Static(_) = mode else {
                     return Err(be("independent-row RoPE requires the static Vulkan path"));
                 };
+                let spans = sequence_spans(graph, *rows as usize)?;
                 let ff = match freq_factors {
                     Some(f) => Some(r(*f)?),
                     None => None,
                 };
                 let row_elems = *n_head as usize * *head_dim as usize;
-                for row in 0..*rows as usize {
+                for span in spans {
+                    let row = span.row_start as usize;
+                    let span_rows = span.rows as usize;
                     if *x_stride > 0 && ff.is_none() {
                         rec.qk_norm_rope_interleaved_off(
                             r(*x)?,
                             r(*weight)?,
                             r(*dst)?,
-                            1,
+                            span_rows,
                             *n_head as usize,
                             *head_dim as usize,
                             *rope_dim as usize,
                             *theta,
-                            rope_pos[&positions.0],
+                            span.start_pos as usize,
                             0,
                             *eps,
                             *x_stride as usize,
@@ -3616,12 +3697,12 @@ fn lower_op(
                             r(*x)?,
                             r(*weight)?,
                             r(*dst)?,
-                            1,
+                            span_rows,
                             *n_head as usize,
                             *head_dim as usize,
                             *rope_dim as usize,
                             *theta,
-                            rope_pos[&positions.0],
+                            span.start_pos as usize,
                             0,
                             *eps,
                             ff,
@@ -4068,30 +4149,43 @@ fn lower_op(
                         ));
                     }
                 };
-                let k_rows = resolve_rows(bindings, *k_cache, rows)?;
-                let v_rows = resolve_rows(bindings, *v_cache, rows)?;
-                let span_start = if window > 0 {
-                    (pos + 1).saturating_sub(window)
-                } else {
-                    0
-                };
-                let span = kv_len.saturating_sub(span_start);
-                if span == 0 {
-                    return Err(be("independent-row attention has an empty KV span"));
+                let spans = sequence_spans(graph, rows)?;
+                let k_rows = resolve_rows(bindings, *k_cache, spans.len())?;
+                let v_rows = resolve_rows(bindings, *v_cache, spans.len())?;
+                let mut geometries = Vec::with_capacity(spans.len());
+                let mut max_partials = 0usize;
+                for sequence in spans {
+                    let sequence_pos = sequence.start_pos as usize;
+                    let sequence_rows = sequence.rows as usize;
+                    let sequence_kv_len = sequence_pos + sequence_rows;
+                    let span_start = if window > 0 {
+                        (sequence_pos + 1).saturating_sub(window)
+                    } else {
+                        0
+                    };
+                    let visible = sequence_kv_len.saturating_sub(span_start);
+                    if visible == 0 {
+                        return Err(be("independent-row attention has an empty KV span"));
+                    }
+                    let chunk = split_k_chunk_count_cap(
+                        visible,
+                        infr_core::tier::adaptive_chunk(visible, &ATTN_SPLIT),
+                    );
+                    let n_chunks = visible.div_ceil(chunk);
+                    max_partials = max_partials.max(sequence_rows * nh * n_chunks);
+                    geometries.push((sequence_pos, sequence_kv_len, chunk, n_chunks));
                 }
-                let chunk = split_k_chunk_count_cap(
-                    span,
-                    infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT),
-                );
-                let n_chunks = span.div_ceil(chunk);
-                let pm = pooled(pool, be_, "independent_split_pm", nh * n_chunks * 4)?;
-                let pl = pooled(pool, be_, "independent_split_pl", nh * n_chunks * 4)?;
-                let pacc = pooled(pool, be_, "independent_split_pacc", nh * n_chunks * hd * 4)?;
+                let pm = pooled(pool, be_, "independent_split_pm", max_partials * 4)?;
+                let pl = pooled(pool, be_, "independent_split_pl", max_partials * 4)?;
+                let pacc = pooled(pool, be_, "independent_split_pacc", max_partials * hd * 4)?;
                 let q_row_bytes = nh * hd * 2;
                 let o_row_bytes = nh * hd * 4;
-                for row in 0..rows {
-                    let kb = k_rows[row];
-                    let vb = v_rows[row];
+                for (lane, sequence) in spans.iter().enumerate() {
+                    let row = sequence.row_start as usize;
+                    let sequence_rows = sequence.rows as usize;
+                    let (sequence_pos, sequence_kv_len, chunk, n_chunks) = geometries[lane];
+                    let kb = k_rows[lane];
+                    let vb = v_rows[lane];
                     match (segmented_kv_view(kb), segmented_kv_view(vb)) {
                         (Some((kt, ks)), Some((vt, vs))) if ks == vs => {
                             rec.attention_kv_split_segmented_off(
@@ -4104,8 +4198,9 @@ fn lower_op(
                                 pool[&pm].as_ref(),
                                 pool[&pl].as_ref(),
                                 pool[&pacc].as_ref(),
-                                pos,
-                                kv_len,
+                                sequence_rows,
+                                sequence_pos,
+                                sequence_kv_len,
                                 nh,
                                 nkv,
                                 hd,
@@ -4141,8 +4236,9 @@ fn lower_op(
                                 pool[&pm].as_ref(),
                                 pool[&pl].as_ref(),
                                 pool[&pacc].as_ref(),
-                                pos,
-                                kv_len,
+                                sequence_rows,
+                                sequence_pos,
+                                sequence_kv_len,
                                 nh,
                                 nkv,
                                 hd,
@@ -5147,24 +5243,40 @@ fn lower_op(
             // Batch (rows ≥ kconv-1): all rows·cc outputs in parallel + a history rebuild pass,
             // instead of the token-serial history walk. Decode keeps the sequential kernel.
             if graph.independent_rows {
-                let row_count = *rows as usize;
-                let states = resolve_rows(bindings, *state, row_count)?;
+                let spans = sequence_spans(graph, *rows as usize)?;
+                let states = resolve_rows(bindings, *state, spans.len())?;
                 let weight = r(*weight)?;
                 let arena_addr = weight.device_addr().ok_or_else(|| {
                     be("independent-row conv1d requires a device-addressable weight")
                 })?;
-                for (row, &state) in states.iter().enumerate() {
-                    rec.conv1d_silu_row_at(
-                        r(*x)?,
-                        arena_addr,
-                        state,
-                        r(*dst)?,
-                        1,
-                        *channels as usize,
-                        *kernel as usize,
-                        row * *channels as usize,
-                        row * *channels as usize,
-                    );
+                for (span, &state) in spans.iter().zip(states) {
+                    let span_rows = span.rows as usize;
+                    let offset = span.row_start as usize * *channels as usize;
+                    if span_rows >= (*kernel as usize).saturating_sub(1).max(2) {
+                        rec.conv1d_silu_batch_at_off(
+                            r(*x)?,
+                            arena_addr,
+                            state,
+                            r(*dst)?,
+                            span_rows,
+                            *channels as usize,
+                            *kernel as usize,
+                            offset,
+                            offset,
+                        );
+                    } else {
+                        rec.conv1d_silu_row_at(
+                            r(*x)?,
+                            arena_addr,
+                            state,
+                            r(*dst)?,
+                            span_rows,
+                            *channels as usize,
+                            *kernel as usize,
+                            offset,
+                            offset,
+                        );
+                    }
                 }
                 return Ok(());
             }
@@ -5233,11 +5345,126 @@ fn lower_op(
                 *head_v as usize,
             );
             if graph.independent_rows {
-                let states = resolve_rows(bindings, *state, rows_)?;
+                let spans = sequence_spans(graph, rows_)?;
+                let states = resolve_rows(bindings, *state, spans.len())?;
                 let qkv_stride = 2 * nk_ * kd_ + nv_ * vd_;
                 let strided = *q == *k && *k == *v && be_.cfg().kernels.vulkan.delta_strided;
-                for (row, &state) in states.iter().enumerate() {
-                    if strided {
+                let max_span_rows = spans
+                    .iter()
+                    .map(|span| span.rows as usize)
+                    .max()
+                    .unwrap_or(1);
+                let seq_split = be_.cfg().kernels.vulkan.dn_chunk
+                    && kd_ == 128
+                    && vd_.is_multiple_of(crate::recorder::DN_SEQ_NCOL)
+                    && be_.cfg().kernels.vulkan.dn_chunk_scan
+                    && be_.cfg().kernels.vulkan.dn_split;
+                let chunk_split = be_.cfg().kernels.vulkan.dn_chunk
+                    && !seq_split
+                    && be_.caps().f16_coopmat()
+                    && be_.cfg().kernels.vulkan.dn_split;
+                let seq_scratch = if seq_split && max_span_rows >= 2 {
+                    Some((
+                        pooled(pool, be_, "dn_seq_kn", max_span_rows * nk_ * kd_ * 4)?,
+                        pooled(pool, be_, "dn_seq_qn", max_span_rows * nk_ * kd_ * 4)?,
+                        pooled(pool, be_, "dn_seq_bet", max_span_rows * nv_ * 4)?,
+                        pooled(pool, be_, "dn_seq_dec", max_span_rows * nv_ * 4)?,
+                    ))
+                } else {
+                    None
+                };
+                let chunk_scratch = if chunk_split && max_span_rows >= 2 {
+                    let nchunk = max_span_rows.div_ceil(32);
+                    Some((
+                        pooled(pool, be_, "dn_split_kn", max_span_rows * nk_ * kd_ * 4)?,
+                        pooled(pool, be_, "dn_split_qn", max_span_rows * nk_ * kd_ * 4)?,
+                        pooled(pool, be_, "dn_split_dk", nchunk * nk_ * 1024 * 4)?,
+                        pooled(pool, be_, "dn_split_dq", nchunk * nk_ * 1024 * 4)?,
+                        pooled(pool, be_, "dn_split_bg", nchunk * nv_ * 32 * 4)?,
+                        pooled(pool, be_, "dn_split_gg", nchunk * nv_ * 32 * 4)?,
+                    ))
+                } else {
+                    None
+                };
+                for (span, &state) in spans.iter().zip(states) {
+                    let row = span.row_start as usize;
+                    let span_rows = span.rows as usize;
+                    let q_off = if strided {
+                        row * qkv_stride
+                    } else {
+                        row * nk_ * kd_
+                    };
+                    let k_off = q_off;
+                    let v_off = if strided { q_off } else { row * nv_ * vd_ };
+                    let blog_off = row * nv_;
+                    let alpha_off = row * nv_;
+                    let out_off = row * nv_ * vd_;
+                    let chunked = span_rows >= 2 && be_.cfg().kernels.vulkan.dn_chunk;
+                    if chunked && seq_split {
+                        let (kn, qn, bet, dec) = seq_scratch
+                            .as_ref()
+                            .expect("multi-row seq split allocated scratch");
+                        rec.deltanet_seq_split_off(
+                            r(*q)?,
+                            r(*k)?,
+                            r(*v)?,
+                            r(*b)?,
+                            r(*a)?,
+                            r(*a_coef)?,
+                            r(*dt_bias)?,
+                            state,
+                            r(*dst)?,
+                            pool[kn].as_ref(),
+                            pool[qn].as_ref(),
+                            pool[bet].as_ref(),
+                            pool[dec].as_ref(),
+                            span_rows,
+                            nv_,
+                            nk_,
+                            kd_,
+                            vd_,
+                            *eps,
+                            q_off,
+                            k_off,
+                            v_off,
+                            blog_off,
+                            alpha_off,
+                            out_off,
+                        );
+                    } else if chunked && chunk_split {
+                        let (kn, qn, dk, dq, bg, gg) = chunk_scratch
+                            .as_ref()
+                            .expect("multi-row chunk split allocated scratch");
+                        rec.deltanet_chunked_split_off(
+                            r(*q)?,
+                            r(*k)?,
+                            r(*v)?,
+                            r(*b)?,
+                            r(*a)?,
+                            r(*a_coef)?,
+                            r(*dt_bias)?,
+                            state,
+                            r(*dst)?,
+                            pool[kn].as_ref(),
+                            pool[qn].as_ref(),
+                            pool[dk].as_ref(),
+                            pool[dq].as_ref(),
+                            pool[bg].as_ref(),
+                            pool[gg].as_ref(),
+                            span_rows,
+                            nv_,
+                            nk_,
+                            kd_,
+                            vd_,
+                            *eps,
+                            q_off,
+                            k_off,
+                            v_off,
+                            blog_off,
+                            alpha_off,
+                            out_off,
+                        );
+                    } else if strided {
                         rec.deltanet_strided_off(
                             r(*q)?,
                             r(*k)?,
@@ -5248,17 +5475,41 @@ fn lower_op(
                             r(*dt_bias)?,
                             state,
                             r(*dst)?,
-                            1,
+                            span_rows,
                             nv_,
                             nk_,
                             kd_,
                             vd_,
                             *eps,
                             qkv_stride,
-                            row * qkv_stride,
-                            row * nv_,
-                            row * nv_,
-                            row * nv_ * vd_,
+                            q_off,
+                            blog_off,
+                            alpha_off,
+                            out_off,
+                        );
+                    } else if chunked {
+                        rec.deltanet_chunked_off(
+                            r(*q)?,
+                            r(*k)?,
+                            r(*v)?,
+                            r(*b)?,
+                            r(*a)?,
+                            r(*a_coef)?,
+                            r(*dt_bias)?,
+                            state,
+                            r(*dst)?,
+                            span_rows,
+                            nv_,
+                            nk_,
+                            kd_,
+                            vd_,
+                            *eps,
+                            q_off,
+                            k_off,
+                            v_off,
+                            blog_off,
+                            alpha_off,
+                            out_off,
                         );
                     } else {
                         rec.deltanet_off(
@@ -5271,18 +5522,18 @@ fn lower_op(
                             r(*dt_bias)?,
                             state,
                             r(*dst)?,
-                            1,
+                            span_rows,
                             nv_,
                             nk_,
                             kd_,
                             vd_,
                             *eps,
-                            row * nk_ * kd_,
-                            row * nk_ * kd_,
-                            row * nv_ * vd_,
-                            row * nv_,
-                            row * nv_,
-                            row * nv_ * vd_,
+                            q_off,
+                            k_off,
+                            v_off,
+                            blog_off,
+                            alpha_off,
+                            out_off,
                         );
                     }
                 }
@@ -12207,6 +12458,13 @@ mod tests {
 
         let mut graph = Graph::new();
         graph.independent_rows = true;
+        graph.sequence_spans = (0..rows)
+            .map(|row| SequenceSpan {
+                row_start: row as u32,
+                rows: 1,
+                start_pos: (kv_len - 1) as u32,
+            })
+            .collect();
         let qi = graph.input(TensorDesc::new(vec![rows, nh, hd], DType::F16));
         let ki = graph.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
         let vi = graph.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
@@ -12261,6 +12519,157 @@ mod tests {
             assert!(
                 (got[index] - want[index]).abs() < 2e-2,
                 "independent attention mismatch at row {}, head {}: got {} want {}",
+                index / (nh * hd),
+                (index / hd) % nh,
+                got[index],
+                want[index]
+            );
+        }
+    }
+
+    #[test]
+    fn attention_sequence_spans_keep_causal_histories_isolated() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        let (rows, nh, nkv, hd, cap) = (5usize, 4usize, 2usize, 64usize, 40usize);
+        let spans = [
+            SequenceSpan {
+                row_start: 0,
+                rows: 2,
+                start_pos: 7,
+            },
+            SequenceSpan {
+                row_start: 2,
+                rows: 3,
+                start_pos: 17,
+            },
+        ];
+        let positions = [7usize, 8, 17, 18, 19];
+        let scale = 1.0 / (hd as f32).sqrt();
+        let group = nh / nkv;
+        let to_f16 = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|&value| half::f16::from_f32(value).to_le_bytes())
+                .collect()
+        };
+        let deq = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .chunks_exact(2)
+                .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                .collect()
+        };
+
+        let q = (0..rows * nh * hd)
+            .map(|index| (index as f32 * 0.031).sin())
+            .collect::<Vec<_>>();
+        let qf = to_f16(&q);
+        let qd = deq(&qf);
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        for lane in 0..spans.len() {
+            keys.push(to_f16(
+                &(0..cap * nkv * hd)
+                    .map(|index| ((index + lane * 37) as f32 * 0.017).cos())
+                    .collect::<Vec<_>>(),
+            ));
+            values.push(to_f16(
+                &(0..cap * nkv * hd)
+                    .map(|index| ((index + lane * 53) % 211) as f32 * 0.009 - 0.7)
+                    .collect::<Vec<_>>(),
+            ));
+        }
+
+        let mut want = vec![0f32; rows * nh * hd];
+        for row in 0..rows {
+            let lane = usize::from(row >= spans[0].rows as usize);
+            let kd = deq(&keys[lane]);
+            let vd = deq(&values[lane]);
+            for head in 0..nh {
+                let kv_head = head / group;
+                let visible = positions[row] + 1;
+                let mut scores = vec![0f32; visible];
+                let mut max = f32::NEG_INFINITY;
+                for (position, score) in scores.iter_mut().enumerate() {
+                    let dot = (0..hd)
+                        .map(|dim| {
+                            qd[(row * nh + head) * hd + dim]
+                                * kd[(position * nkv + kv_head) * hd + dim]
+                        })
+                        .sum::<f32>();
+                    *score = dot * scale;
+                    max = max.max(*score);
+                }
+                let sum = scores.iter().map(|score| (score - max).exp()).sum::<f32>();
+                for (position, score) in scores.iter().enumerate() {
+                    let probability = (score - max).exp() / sum;
+                    for dim in 0..hd {
+                        want[(row * nh + head) * hd + dim] +=
+                            probability * vd[(position * nkv + kv_head) * hd + dim];
+                    }
+                }
+            }
+        }
+
+        let mut graph = Graph::new();
+        graph.independent_rows = true;
+        graph.sequence_spans = spans.to_vec();
+        let qi = graph.input(TensorDesc::new(vec![rows, nh, hd], DType::F16));
+        let ki = graph.input(TensorDesc::new(vec![cap, nkv, hd], DType::F16));
+        let vi = graph.input(TensorDesc::new(vec![cap, nkv, hd], DType::F16));
+        let yi = graph.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        graph.push(Op::Attention {
+            q: qi,
+            k_cache: ki,
+            v_cache: vi,
+            dst: yi,
+            rows: rows as u32,
+            kv_len: (positions[rows - 1] + 1) as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Causal,
+            pos: positions[0] as u32,
+            sinks: None,
+        });
+
+        let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
+        let yb = be_
+            .alloc(rows * nh * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        be_.upload(qb.as_ref(), &qf).unwrap();
+        let mut key_buffers = Vec::new();
+        let mut value_buffers = Vec::new();
+        for lane in 0..spans.len() {
+            let kb = be_.alloc(keys[lane].len(), BufferUsage::KvCache).unwrap();
+            let vb = be_.alloc(values[lane].len(), BufferUsage::KvCache).unwrap();
+            be_.upload(kb.as_ref(), &keys[lane]).unwrap();
+            be_.upload(vb.as_ref(), &values[lane]).unwrap();
+            key_buffers.push(kb);
+            value_buffers.push(vb);
+        }
+        let plan = be_.compile(&graph).unwrap();
+        let mut bindings = Bindings::new();
+        bindings.bind(qi, qb.as_ref());
+        bindings.bind_rows(
+            ki,
+            key_buffers.iter().map(|buffer| buffer.as_ref()).collect(),
+        );
+        bindings.bind_rows(
+            vi,
+            value_buffers.iter().map(|buffer| buffer.as_ref()).collect(),
+        );
+        bindings.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bindings).unwrap();
+        let mut got = vec![0f32; rows * nh * hd];
+        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for index in 0..got.len() {
+            assert!(
+                (got[index] - want[index]).abs() < 2e-2,
+                "sequence-span attention mismatch at row {}, head {}: got {} want {}",
                 index / (nh * hd),
                 (index / hd) % nh,
                 got[index],

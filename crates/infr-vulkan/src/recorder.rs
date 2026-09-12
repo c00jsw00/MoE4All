@@ -7170,8 +7170,8 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// One independent decode row over a flat device-addressed KV cache. Descriptor offsets select
-    /// this lane inside shared batch activations; K/V and partial scratch are lane-local.
+    /// One independent sequence over a flat device-addressed KV cache. Descriptor offsets select
+    /// its contiguous rows inside shared batch activations; K/V and partial scratch are lane-local.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_kv_split_at_off(
         &self,
@@ -7186,6 +7186,7 @@ impl<'a> Recorder<'a> {
         pm: &dyn Buffer,
         pl: &dyn Buffer,
         pacc: &dyn Buffer,
+        rows: usize,
         pos: usize,
         kv_len: usize,
         nh: usize,
@@ -7207,7 +7208,7 @@ impl<'a> Recorder<'a> {
             pm,
             pl,
             pacc,
-            1,
+            rows,
             pos,
             kv_len,
             nh,
@@ -7230,7 +7231,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// Segmented-KV twin of [`Self::attention_kv_split_at_off`]. K/V bindings are address tables;
-    /// only the shared activation row needs a descriptor offset.
+    /// only the shared activation range needs a descriptor offset.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_kv_split_segmented_off(
         &self,
@@ -7243,6 +7244,7 @@ impl<'a> Recorder<'a> {
         pm: &dyn Buffer,
         pl: &dyn Buffer,
         pacc: &dyn Buffer,
+        rows: usize,
         pos: usize,
         kv_len: usize,
         nh: usize,
@@ -7264,7 +7266,7 @@ impl<'a> Recorder<'a> {
             pm,
             pl,
             pacc,
-            1,
+            rows,
             pos,
             kv_len,
             nh,
@@ -9671,6 +9673,39 @@ impl<'a> Recorder<'a> {
         vd: usize,
         eps: f32,
     ) {
+        self.deltanet_chunked_off(
+            q, k, v, blog, alpha, acoef, dtbias, state, out, rows, nv, nk, kd, vd, eps, 0, 0, 0, 0,
+            0, 0,
+        );
+    }
+
+    /// Chunked DeltaNet over one contiguous sequence view in shared activation buffers.
+    /// Activation offsets are f32 elements; scratch and persistent state are sequence-local.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn deltanet_chunked_off(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+        q_off: usize,
+        k_off: usize,
+        v_off: usize,
+        blog_off: usize,
+        alpha_off: usize,
+        out_off: usize,
+    ) {
         debug_assert!(
             kd <= 128,
             "deltanet_chunked LDS chunk tiles assume kd ≤ 128, got {kd}"
@@ -9696,15 +9731,15 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[
-                Self::vkb(q),
-                Self::vkb(k),
-                Self::vkb(v),
-                Self::vkb(blog),
-                Self::vkb(alpha),
+                Self::vkb_off(q, q_off),
+                Self::vkb_off(k, k_off),
+                Self::vkb_off(v, v_off),
+                Self::vkb_off(blog, blog_off),
+                Self::vkb_off(alpha, alpha_off),
                 Self::vkb(acoef),
                 Self::vkb(dtbias),
                 Self::vkb(state),
-                Self::vkb(out),
+                Self::vkb_off(out, out_off),
             ],
             2, // state (in/out) + out
             &push,
@@ -9744,6 +9779,44 @@ impl<'a> Recorder<'a> {
         vd: usize,
         eps: f32,
     ) {
+        self.deltanet_chunked_split_off(
+            q, k, v, blog, alpha, acoef, dtbias, state, out, kn, qn, dk, dq, betag, gg, rows, nv,
+            nk, kd, vd, eps, 0, 0, 0, 0, 0, 0,
+        );
+    }
+
+    /// Split chunked DeltaNet over one contiguous sequence view in shared activation buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn deltanet_chunked_split_off(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        kn: &dyn Buffer,
+        qn: &dyn Buffer,
+        dk: &dyn Buffer,
+        dq: &dyn Buffer,
+        betag: &dyn Buffer,
+        gg: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+        q_off: usize,
+        k_off: usize,
+        v_off: usize,
+        blog_off: usize,
+        alpha_off: usize,
+        out_off: usize,
+    ) {
         debug_assert!(kd <= 128, "deltanet split assumes kd ≤ 128, got {kd}");
         debug_assert!(
             kd.is_multiple_of(16),
@@ -9764,8 +9837,8 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kp,
             &[
-                Self::vkb(q),
-                Self::vkb(k),
+                Self::vkb_off(q, q_off),
+                Self::vkb_off(k, k_off),
                 Self::vkb(kn),
                 Self::vkb(qn),
                 Self::vkb(dk),
@@ -9791,8 +9864,8 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kg,
             &[
-                Self::vkb(blog),
-                Self::vkb(alpha),
+                Self::vkb_off(blog, blog_off),
+                Self::vkb_off(alpha, alpha_off),
                 Self::vkb(acoef),
                 Self::vkb(dtbias),
                 Self::vkb(betag),
@@ -9816,7 +9889,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             ks,
             &[
-                Self::vkb(v),
+                Self::vkb_off(v, v_off),
                 Self::vkb(kn),
                 Self::vkb(qn),
                 Self::vkb(dk),
@@ -9824,7 +9897,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(betag),
                 Self::vkb(gg),
                 Self::vkb(state),
-                Self::vkb(out),
+                Self::vkb_off(out, out_off),
             ],
             2, // state (in/out) + out
             &p3,
@@ -9869,6 +9942,43 @@ impl<'a> Recorder<'a> {
         vd: usize,
         eps: f32,
     ) {
+        self.deltanet_seq_split_off(
+            q, k, v, blog, alpha, acoef, dtbias, state, out, kn, qn, bet, dec, rows, nv, nk, kd,
+            vd, eps, 0, 0, 0, 0, 0, 0,
+        );
+    }
+
+    /// Register-resident sequential DeltaNet scan over one contiguous sequence view in shared
+    /// activation buffers. Activation offsets are f32 elements; scratch starts at row zero.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn deltanet_seq_split_off(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        kn: &dyn Buffer,
+        qn: &dyn Buffer,
+        bet: &dyn Buffer,
+        dec: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+        q_off: usize,
+        k_off: usize,
+        v_off: usize,
+        blog_off: usize,
+        alpha_off: usize,
+        out_off: usize,
+    ) {
         debug_assert_eq!(
             kd, 128,
             "deltanet_seq assumes kd == 128 (RPL=4 register shards); caller must fall back"
@@ -9889,7 +9999,12 @@ impl<'a> Recorder<'a> {
         p1[16..20].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
         self.dispatch(
             kn_k,
-            &[Self::vkb(q), Self::vkb(k), Self::vkb(kn), Self::vkb(qn)],
+            &[
+                Self::vkb_off(q, q_off),
+                Self::vkb_off(k, k_off),
+                Self::vkb(kn),
+                Self::vkb(qn),
+            ],
             2, // kn, qn
             &p1,
             (rows * nk) as u32,
@@ -9907,8 +10022,8 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kg,
             &[
-                Self::vkb(blog),
-                Self::vkb(alpha),
+                Self::vkb_off(blog, blog_off),
+                Self::vkb_off(alpha, alpha_off),
                 Self::vkb(acoef),
                 Self::vkb(dtbias),
                 Self::vkb(bet),
@@ -9933,11 +10048,11 @@ impl<'a> Recorder<'a> {
             &[
                 Self::vkb(kn),
                 Self::vkb(qn),
-                Self::vkb(v),
+                Self::vkb_off(v, v_off),
                 Self::vkb(bet),
                 Self::vkb(dec),
                 Self::vkb(state),
-                Self::vkb(out),
+                Self::vkb_off(out, out_off),
             ],
             2, // state (in/out) + out
             &p3,
@@ -10061,6 +10176,24 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
+        self.conv1d_silu_batch_at_off(qkv, arena_addr, state, out, rows, cc, kconv, 0, 0);
+    }
+
+    /// Parallel convolution over a contiguous sequence view inside shared batch activations.
+    /// Offsets are f32 elements; the persistent history buffer belongs to this sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn conv1d_silu_batch_at_off(
+        &self,
+        qkv: &dyn Buffer,
+        arena_addr: u64,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+        qkv_off: usize,
+        out_off: usize,
+    ) {
         debug_assert!(
             rows >= kconv - 1,
             "conv1d_silu_batch_at needs rows ≥ kconv-1"
@@ -10077,10 +10210,10 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k1,
             &[
-                Self::vkb(qkv),
-                Self::vkb(qkv),
+                Self::vkb_off(qkv, qkv_off),
+                Self::vkb_off(qkv, qkv_off),
                 Self::vkb(state),
-                Self::vkb(out),
+                Self::vkb_off(out, out_off),
             ],
             1, // out only (state is read-only here)
             &push,
@@ -10095,7 +10228,7 @@ impl<'a> Recorder<'a> {
             .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12);
         self.dispatch(
             k2,
-            &[Self::vkb(qkv), Self::vkb(state)],
+            &[Self::vkb_off(qkv, qkv_off), Self::vkb(state)],
             1, // state out
             &push2,
             (((kconv - 1) * cc) as u32).div_ceil(256),

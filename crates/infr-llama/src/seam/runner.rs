@@ -20,7 +20,7 @@ use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
 use infr_core::graph::{
-    Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, MoePrefetchHint, Op,
+    Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, MoePrefetchHint, Op, SequenceSpan,
 };
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
@@ -2715,6 +2715,15 @@ fn generate_dense_backend_inner(
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
         g.independent_rows = independent_rows;
+        if independent_rows {
+            g.sequence_spans = (0..batch)
+                .map(|row| SequenceSpan {
+                    row_start: row as u32,
+                    rows: 1,
+                    start_pos: start_pos as u32,
+                })
+                .collect();
+        }
         // DiffusionGemma: force the per-execute STATIC path for every graph of this model (see
         // `Graph::no_decode_replay`). The record-once replay's `_dyn` kernels agree with the
         // static recording only to float-reassociation noise; the entropy-bound denoise loop
