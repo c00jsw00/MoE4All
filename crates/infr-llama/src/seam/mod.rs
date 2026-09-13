@@ -1033,6 +1033,38 @@ fn q8_prefill_scratch_bytes(
         .fold(0u64, u64::saturating_add)
 }
 
+/// Extra split-attention workspace used only by Qwen3.8's independent multi-session rows.
+/// Single-sequence prefill can use FlashAttention, while a parallel cohort lowers each sequence
+/// separately through `independent_split_{pm,pl,pacc}`. The dense QSA prefix is bounded by the
+/// indexer threshold; sparse QSA gathers a compact prefix and no longer takes this path.
+fn parallel_prefill_attention_scratch_bytes(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
+    if placement_slots() <= 1 || !cfg.qwen4exp || want_ctx == 0 || ubatch == 0 {
+        return 0;
+    }
+    let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
+    let ratio = cfg
+        .compress_ratios
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(4)
+        .max(1);
+    let visible = want_ctx
+        .min(cfg.indexer_top_k.saturating_add(ratio).saturating_sub(1))
+        .max(1);
+    // Keep this geometry in sync with infr-vulkan's ATTN_SPLIT policy. For the QSA dense prefix
+    // the 64-key floor is the limiting branch; spelling out the complete policy keeps this helper
+    // correct if a model exposes a larger dense threshold.
+    let chunk = (visible / 32).clamp(64, 512);
+    let chunks = visible.div_ceil(chunk) as u64;
+    let partials = rows
+        .saturating_mul(cfg.n_head as u64)
+        .saturating_mul(chunks);
+    partials
+        .saturating_mul((cfg.max_head_dim().saturating_add(2)) as u64)
+        .saturating_mul(4)
+}
+
 /// Runtime workspace priced by placement and checked against Vulkan's measured activation peak.
 /// This includes the graph's ordinary activation pools plus format-specific KV read scratch.
 pub(crate) fn runtime_reserve_at(
@@ -1044,9 +1076,13 @@ pub(crate) fn runtime_reserve_at(
     k_fmt: DType,
     v_fmt: DType,
 ) -> u64 {
-    dense_act_reserve_at(cfg, caps, want_ctx, ubatch).saturating_add(q8_prefill_scratch_bytes(
-        cfg, want_ctx, ring, ubatch, k_fmt, v_fmt,
-    ))
+    dense_act_reserve_at(cfg, caps, want_ctx, ubatch)
+        .saturating_add(q8_prefill_scratch_bytes(
+            cfg, want_ctx, ring, ubatch, k_fmt, v_fmt,
+        ))
+        .saturating_add(parallel_prefill_attention_scratch_bytes(
+            cfg, want_ctx, ubatch,
+        ))
 }
 
 /// Number of ubatches in one Qwen3.8 layer-major prefill group. Eight leaves enough same-layer
@@ -6525,6 +6561,33 @@ mod seam_helper_tests {
             2 * (half - super::QWEN4_PLAN_OVERLAP_RESERVE),
             "only the row-scaled part doubles; the retained decode plan is fixed"
         );
+    }
+
+    #[test]
+    fn parallel_qwen38_reserves_independent_attention_partials() {
+        let cfg = Config {
+            qwen4exp: true,
+            n_head: 48,
+            head_dim: 128,
+            indexer_top_k: 2048,
+            compress_ratios: vec![4],
+            ..Default::default()
+        };
+        let expected = 3072u64 * 48 * 33 * (128 + 2) * 4;
+        {
+            let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::for_slots(1)));
+            assert_eq!(
+                super::parallel_prefill_attention_scratch_bytes(&cfg, 163_840, 3072),
+                0
+            );
+        }
+        {
+            let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::for_slots(2)));
+            assert_eq!(
+                super::parallel_prefill_attention_scratch_bytes(&cfg, 163_840, 3072),
+                expected
+            );
+        }
     }
 
     #[test]

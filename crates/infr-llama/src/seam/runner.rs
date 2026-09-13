@@ -139,6 +139,34 @@ fn sampling_suffix_start(positions: &[usize], prompt_ends: &[usize]) -> AResult<
     Ok(start)
 }
 
+fn allocate_parallel_prefill_rows(available: &[usize], ubatch: usize) -> Vec<usize> {
+    let mut rows = vec![0; available.len()];
+    let mut budget = ubatch.min(available.iter().sum());
+    while budget > 0 {
+        let active = available
+            .iter()
+            .zip(&rows)
+            .filter(|&(available, used)| available > used)
+            .count();
+        if active == 0 {
+            break;
+        }
+        let share = budget.div_ceil(active);
+        let mut granted = 0;
+        for (used, &available) in rows.iter_mut().zip(available) {
+            if *used == available || granted == budget {
+                continue;
+            }
+            let take = (available - *used).min(share).min(budget - granted);
+            *used += take;
+            granted += take;
+        }
+        debug_assert!(granted > 0);
+        budget -= granted;
+    }
+    rows
+}
+
 /// Return the cached-prefix length only when a recurrent model can safely continue from its
 /// existing state. An empty token cache is deliberately NOT reusable: `SeamKv::reset()` clears
 /// the token bookkeeping but cannot synchronously clear device-side DeltaNet conv/S buffers, so
@@ -7010,10 +7038,18 @@ fn generate_dense_backend_inner(
                     begin..end
                 })
                 .collect::<Vec<_>>();
-            let share = (ubatch / prefill_lanes.len().max(1)).max(1);
+            let row_counts = allocate_parallel_prefill_rows(
+                &final_ranges
+                    .iter()
+                    .map(|range| range.len())
+                    .collect::<Vec<_>>(),
+                ubatch,
+            );
             let mut prefill_ranges = Vec::with_capacity(prefill_lanes.len());
-            for (&lane, final_range) in prefill_lanes.iter().zip(final_ranges) {
-                let end = (final_range.start + share).min(final_range.end);
+            for ((&lane, final_range), rows) in
+                prefill_lanes.iter().zip(final_ranges).zip(row_counts)
+            {
+                let end = final_range.start + rows;
                 if end <= final_range.start {
                     return Err(anyhow!(
                         "parallel prefill lane {lane} made no progress at position {}",
@@ -9695,8 +9731,23 @@ fn generate_dense_backend_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
+        allocate_parallel_prefill_rows, recurrent_extension_start, resident_after_gen,
+        sampling_suffix_start, validate_token_ids,
     };
+
+    #[test]
+    fn parallel_prefill_redistributes_unused_rows() {
+        assert_eq!(
+            allocate_parallel_prefill_rows(&[10, 2_000], 1_024),
+            [10, 1_014]
+        );
+        assert_eq!(
+            allocate_parallel_prefill_rows(&[2_000, 2_000], 1_025),
+            [513, 512]
+        );
+        assert_eq!(allocate_parallel_prefill_rows(&[10, 20], 1_024), [10, 20]);
+        assert!(allocate_parallel_prefill_rows(&[], 1_024).is_empty());
+    }
 
     #[test]
     fn token_step_samples_only_a_contiguous_suffix() {

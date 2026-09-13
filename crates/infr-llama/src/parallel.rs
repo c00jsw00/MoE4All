@@ -43,6 +43,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const DECODE_BATCH_WAIT: Duration = Duration::from_secs(1);
+const PREFILL_COHORT_WAIT: Duration = Duration::from_millis(50);
 const MAX_DECODE_BATCH: usize = 8;
 const SHORT_PREFILL_TOKENS: usize = 96;
 
@@ -1305,6 +1306,30 @@ impl ParallelSeam {
         peers
     }
 
+    fn take_prefill_cohort_peers(&self, capacity: usize) -> Vec<BatchWork> {
+        if capacity == 0 {
+            return Vec::new();
+        }
+        let queue = self
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned");
+        let timeout = if queue.arriving > 0 {
+            DECODE_BATCH_WAIT
+        } else {
+            PREFILL_COHORT_WAIT
+        };
+        let (mut queue, _) = self
+            .decode_ready
+            .wait_timeout_while(queue, timeout, |queue| queue.waiting.is_empty())
+            .expect("decode batch queue poisoned");
+        let take = capacity.min(queue.waiting.len());
+        let peers = queue.waiting.drain(..take).collect::<Vec<_>>();
+        self.batch_interrupt
+            .store(!queue.waiting.is_empty(), Ordering::Release);
+        peers
+    }
+
     /// Called only after the active set becomes empty. It either atomically hands queued work to
     /// the existing leader or marks the scheduler idle, so a racing request can never be stranded
     /// behind `running=true` with no worker.
@@ -1802,6 +1827,7 @@ impl ParallelSeam {
         active.push(leader);
         active.extend(peers);
         let mut leader_result = None;
+        let mut long_prefill_coalesced = false;
 
         loop {
             let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
@@ -1832,6 +1858,19 @@ impl ParallelSeam {
                 .iter()
                 .any(|work| work.phase == BatchPhase::LongPrefill)
             {
+                if !long_prefill_coalesced {
+                    let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
+                    let peers = self.take_prefill_cohort_peers(capacity);
+                    long_prefill_coalesced = true;
+                    if !peers.is_empty() {
+                        tracing::debug!(
+                            lanes = peers.len(),
+                            "coalescing work before the exclusive long-prefill phase"
+                        );
+                        active.extend(peers);
+                        continue;
+                    }
+                }
                 if let Err(error) = self.run_long_prefill_phase(&mut active, req) {
                     return self.fail_unified_scheduler(
                         &mut active,
@@ -1840,8 +1879,10 @@ impl ParallelSeam {
                         error,
                     );
                 }
+                long_prefill_coalesced = false;
                 continue;
             }
+            long_prefill_coalesced = false;
 
             let mut groups = [Vec::new(), Vec::new()];
             for (index, work) in active.iter().enumerate() {
