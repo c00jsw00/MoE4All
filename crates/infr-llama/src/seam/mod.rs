@@ -28,7 +28,7 @@ mod segmented_kv;
 mod session_state;
 mod weights;
 
-pub(crate) use runner::generate_dense_backend;
+pub(crate) use runner::{generate_dense_backend, PreparedParallelPrompt};
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
 pub(crate) use session_state::{SessionBuffer, SessionBufferKey, SessionStateMeta};
@@ -740,6 +740,18 @@ pub(crate) fn generate_dense_vulkan_session(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_dense_vulkan_parallel_prompt_session(
+    vk: &infr_vulkan::VulkanBackend,
+    cfg: &Config,
+    ec: &EngineConfig,
+    state: &mut SeamKv,
+    prompt: &[u32],
+    turn_checkpoint: Option<TurnCheckpoint>,
+) -> AResult<runner::PreparedParallelPrompt> {
+    runner::prepare_parallel_prompt(vk, cfg, ec, state, prompt, turn_checkpoint)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
@@ -748,7 +760,9 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompts: &[Vec<u32>],
-    max_new: usize,
+    prompt_ends: &[usize],
+    checkpoint_boundaries: &[Option<usize>],
+    max_steps: usize,
     primary: &mut Option<SeamKv>,
     peers: &mut [SeamKv],
     want_ctx: usize,
@@ -756,7 +770,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
-) -> AResult<(Vec<Vec<u32>>, GenStats)> {
+) -> AResult<(Vec<Vec<u32>>, Vec<f64>, Vec<f64>)> {
     if primary.is_none() {
         return Err(anyhow!(
             "sampled parallel Vulkan decode requires an initialized primary session"
@@ -774,7 +788,9 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
         token_embd,
         ple,
         prompts,
-        max_new,
+        prompt_ends,
+        checkpoint_boundaries,
+        max_steps,
         primary,
         peers,
         want_ctx,
@@ -800,10 +816,9 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
     primary: &mut Option<SeamKv>,
     peers: &mut [SeamKv],
     want_ctx: usize,
-    turn_checkpoints: &[Option<TurnCheckpoint>],
-    samplers: &mut [crate::sampling::ParallelSampler],
+    prepared: &[runner::PreparedParallelPrompt],
     req: Option<&crate::sampling::RequestCtx>,
-) -> AResult<(Vec<GenStats>, Vec<Option<u32>>)> {
+) -> AResult<Vec<GenStats>> {
     if primary.is_none() {
         return Err(anyhow!(
             "parallel Vulkan prefill requires an initialized primary session"
@@ -813,20 +828,7 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
         Err(anyhow!("warm parallel session must not re-bind {name}"))
     });
     let out = runner::generate_dense_backend_parallel_prefill(
-        vk,
-        &*bind,
-        g,
-        cfg,
-        ec,
-        token_embd,
-        ple,
-        prompts,
-        primary,
-        peers,
-        want_ctx,
-        turn_checkpoints,
-        samplers,
-        req,
+        vk, &*bind, g, cfg, ec, token_embd, ple, prompts, primary, peers, want_ctx, prepared, req,
     );
     if out.is_err() {
         if let Some(slot) = primary.as_mut() {

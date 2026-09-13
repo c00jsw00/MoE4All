@@ -114,6 +114,31 @@ fn resident_after_gen(cur: &[u32], last_written: Option<usize>) -> Vec<u32> {
     }
 }
 
+fn sampling_suffix_start(positions: &[usize], prompt_ends: &[usize]) -> AResult<usize> {
+    if positions.len() != prompt_ends.len() {
+        return Err(anyhow!(
+            "parallel token step has {} positions and {} prompt ends",
+            positions.len(),
+            prompt_ends.len()
+        ));
+    }
+    let start = positions
+        .iter()
+        .zip(prompt_ends)
+        .position(|(&position, &end)| position + 1 >= end)
+        .unwrap_or(positions.len());
+    if positions[start..]
+        .iter()
+        .zip(&prompt_ends[start..])
+        .any(|(&position, &end)| position + 1 < end)
+    {
+        return Err(anyhow!(
+            "parallel token sampling rows are not a contiguous suffix"
+        ));
+    }
+    Ok(start)
+}
+
 /// Return the cached-prefix length only when a recurrent model can safely continue from its
 /// existing state. An empty token cache is deliberately NOT reusable: `SeamKv::reset()` clears
 /// the token bookkeeping but cannot synchronously clear device-side DeltaNet conv/S buffers, so
@@ -126,24 +151,10 @@ fn recurrent_extension_start(cached: &[u32], prompt: &[u32]) -> Option<usize> {
     (pfx == cached.len() && pfx < prompt.len()).then_some(pfx)
 }
 
-fn should_mix_ready_decode(
-    unfinished_lanes: usize,
-    selected_prefill_lanes: usize,
-    every_range_reaches_frontier: bool,
-    final_prefill_rows: usize,
-    ready_decode_lanes: usize,
-    ubatch: usize,
-) -> bool {
-    ready_decode_lanes > 0
-        && unfinished_lanes == selected_prefill_lanes
-        && every_range_reaches_frontier
-        && final_prefill_rows + ready_decode_lanes <= ubatch
-}
-
 #[derive(Clone, Copy)]
-struct PreparedParallelPrompt {
-    start: usize,
-    checkpoint_boundary: Option<usize>,
+pub(crate) struct PreparedParallelPrompt {
+    pub(crate) start: usize,
+    pub(crate) checkpoint_boundary: Option<usize>,
 }
 
 /// Prepare one recurrent slot for a layer-synchronous prefill cohort. This mirrors the ordinary
@@ -239,6 +250,20 @@ fn prepare_parallel_prompt_state(
     })
 }
 
+/// Reconcile one checked-out Qwen3.8 slot with a new prompt before the scheduler chooses between
+/// token-step prefill and the streaming prefill ring. Keeping this transaction outside either
+/// execution primitive makes the 96-token policy depend on the real post-restore KV frontier.
+pub(crate) fn prepare_parallel_prompt(
+    be: &dyn Backend,
+    c: &Config,
+    ec: &EngineConfig,
+    kv: &mut SeamKv,
+    prompt: &[u32],
+    turn_checkpoint: Option<TurnCheckpoint>,
+) -> AResult<PreparedParallelPrompt> {
+    prepare_parallel_prompt_state(be, c, ec, kv, prompt, turn_checkpoint, None)
+}
+
 /// Bind the per-layer IO + weights shared by EVERY decode/prefill/verify/denoise execution: the
 /// gemma4 `rope_freqs` Input (when present), each layer's K/V cache pair, and the flat weight list
 /// (declaration == upload order). Extracted so the four bind sites (denoise, verify, record-once,
@@ -315,6 +340,7 @@ fn bind_parallel_layer_io<'a>(
     ple_embd: Option<&'a dyn Buffer>,
     peers: &'a [SeamKv],
     lane_indices: Option<&[usize]>,
+    independent_rows: bool,
 ) {
     bind_layer_io(
         b,
@@ -345,6 +371,13 @@ fn bind_parallel_layer_io<'a>(
         all_lanes = (0..peers.len() + 1).collect::<Vec<_>>();
         &all_lanes
     };
+    if !independent_rows {
+        assert_eq!(
+            lanes.len(),
+            1,
+            "a shared-row binding requires exactly one sequence lane"
+        );
+    }
     for layer in 0..n_layer {
         let mut k_rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
         let mut v_rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
@@ -357,8 +390,13 @@ fn bind_parallel_layer_io<'a>(
                 v_rows.push(peers[lane - 1].vbufs[layer].as_ref());
             }
         }
-        b.bind_rows(h.k_cache[layer], k_rows);
-        b.bind_rows(h.v_cache[layer], v_rows);
+        if independent_rows {
+            b.bind_rows(h.k_cache[layer], k_rows);
+            b.bind_rows(h.v_cache[layer], v_rows);
+        } else {
+            b.bind(h.k_cache[layer], k_rows[0]);
+            b.bind(h.v_cache[layer], v_rows[0]);
+        }
 
         if let Some(id) = h.qsa_k_cache[layer] {
             let mut rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
@@ -373,7 +411,11 @@ fn bind_parallel_layer_io<'a>(
                         .expect("QSA handle requires peer raw cache")
                 });
             }
-            b.bind_rows(id, rows);
+            if independent_rows {
+                b.bind_rows(id, rows);
+            } else {
+                b.bind(id, rows[0]);
+            }
         }
         if let Some(id) = h.qsa_block_cache[layer] {
             let mut rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
@@ -388,7 +430,11 @@ fn bind_parallel_layer_io<'a>(
                         .expect("QSA handle requires peer block cache")
                 });
             }
-            b.bind_rows(id, rows);
+            if independent_rows {
+                b.bind_rows(id, rows);
+            } else {
+                b.bind(id, rows[0]);
+            }
         }
     }
     if let Some(id) = h.ple_state {
@@ -405,7 +451,11 @@ fn bind_parallel_layer_io<'a>(
                     .expect("PLE handle requires peer state")
             });
         }
-        b.bind_rows(id, rows);
+        if independent_rows {
+            b.bind_rows(id, rows);
+        } else {
+            b.bind(id, rows[0]);
+        }
     }
 }
 
@@ -914,8 +964,12 @@ fn finish_pending_seam_slot(
 
 struct ParallelDecodeRequest<'a> {
     prompts: &'a [Vec<u32>],
+    prompt_ends: &'a [usize],
+    checkpoint_boundaries: &'a [Option<usize>],
     peers: &'a mut [SeamKv],
     peer_outputs: &'a mut Vec<Vec<u32>>,
+    prompt_secs: &'a mut Vec<f64>,
+    decode_secs: &'a mut Vec<f64>,
     samplers: &'a mut [crate::sampling::ParallelSampler],
     on_token: &'a mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&'a std::sync::atomic::AtomicBool>,
@@ -924,10 +978,8 @@ struct ParallelDecodeRequest<'a> {
 struct ParallelPrefillRequest<'a> {
     prompts: &'a [Vec<u32>],
     peers: &'a mut [SeamKv],
-    turn_checkpoints: &'a [Option<TurnCheckpoint>],
+    prepared: &'a [PreparedParallelPrompt],
     peer_stats: &'a mut Vec<GenStats>,
-    samplers: &'a mut [crate::sampling::ParallelSampler],
-    mixed_outputs: &'a mut Vec<Option<u32>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -995,7 +1047,9 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompts: &[Vec<u32>],
-    max_new: usize,
+    prompt_ends: &[usize],
+    checkpoint_boundaries: &[Option<usize>],
+    max_steps: usize,
     primary: &mut Option<SeamKv>,
     peers: &mut [SeamKv],
     want_ctx: usize,
@@ -1003,25 +1057,37 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     on_token: &mut dyn FnMut(usize, u32) -> bool,
     yield_requested: Option<&std::sync::atomic::AtomicBool>,
     req: Option<&crate::sampling::RequestCtx>,
-) -> AResult<(Vec<Vec<u32>>, GenStats)> {
-    if prompts.len() != peers.len() + 1 || samplers.len() != prompts.len() {
+) -> AResult<(Vec<Vec<u32>>, Vec<f64>, Vec<f64>)> {
+    if prompts.len() != peers.len() + 1
+        || prompt_ends.len() != prompts.len()
+        || checkpoint_boundaries.len() != prompts.len()
+        || samplers.len() != prompts.len()
+    {
         return Err(anyhow!(
-            "parallel decode has {} prompts, {} slots and {} samplers",
+            "parallel token step has {} prompts, {} prompt ends, {} checkpoints, {} slots and {} samplers",
             prompts.len(),
+            prompt_ends.len(),
+            checkpoint_boundaries.len(),
             peers.len() + 1,
             samplers.len()
         ));
     }
     let mut peer_outputs = Vec::new();
+    let mut prompt_secs = Vec::new();
+    let mut decode_secs = Vec::new();
     let mut parallel = ParallelDecodeRequest {
         prompts,
+        prompt_ends,
+        checkpoint_boundaries,
         peers,
         peer_outputs: &mut peer_outputs,
+        prompt_secs: &mut prompt_secs,
+        decode_secs: &mut decode_secs,
         samplers,
         on_token,
         yield_requested,
     };
-    let (first, stats) = generate_dense_backend_inner(
+    let (first, _) = generate_dense_backend_inner(
         be,
         bind_weight,
         g,
@@ -1030,7 +1096,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
         token_embd,
         ple,
         &prompts[0],
-        max_new,
+        max_steps,
         |_| {},
         primary,
         want_ctx,
@@ -1050,7 +1116,7 @@ pub(crate) fn generate_dense_backend_parallel_sampled(
     let mut outputs = Vec::with_capacity(prompts.len());
     outputs.push(first);
     outputs.append(&mut peer_outputs);
-    Ok((outputs, stats))
+    Ok((outputs, prompt_secs, decode_secs))
 }
 
 /// Prefill independent Qwen3.8 sessions in shared layer-synchronous activation batches. Each
@@ -1068,31 +1134,23 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
     primary: &mut Option<SeamKv>,
     peers: &mut [SeamKv],
     want_ctx: usize,
-    turn_checkpoints: &[Option<TurnCheckpoint>],
-    samplers: &mut [crate::sampling::ParallelSampler],
+    prepared: &[PreparedParallelPrompt],
     req: Option<&crate::sampling::RequestCtx>,
-) -> AResult<(Vec<GenStats>, Vec<Option<u32>>)> {
-    if prompts.len() != peers.len() + 1
-        || turn_checkpoints.len() != prompts.len()
-        || samplers.len() != prompts.len()
-    {
+) -> AResult<Vec<GenStats>> {
+    if prompts.len() != peers.len() + 1 || prepared.len() != prompts.len() {
         return Err(anyhow!(
-            "parallel prefill has {} prompts, {} slots, {} checkpoints and {} samplers",
+            "parallel prefill has {} prompts, {} slots and {} prepared states",
             prompts.len(),
             peers.len() + 1,
-            turn_checkpoints.len(),
-            samplers.len()
+            prepared.len()
         ));
     }
     let mut peer_stats = Vec::with_capacity(peers.len());
-    let mut mixed_outputs = vec![None; prompts.len()];
     let mut parallel = ParallelPrefillRequest {
         prompts,
         peers,
-        turn_checkpoints,
+        prepared,
         peer_stats: &mut peer_stats,
-        samplers,
-        mixed_outputs: &mut mixed_outputs,
     };
     let (_, primary_stats) = generate_dense_backend_inner(
         be,
@@ -1123,7 +1181,7 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
     let mut stats = Vec::with_capacity(prompts.len());
     stats.push(primary_stats);
     stats.append(&mut peer_stats);
-    Ok((stats, mixed_outputs))
+    Ok(stats)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2399,7 +2457,7 @@ fn generate_dense_backend_inner(
             ));
         }
         if parallel.prompts.len() != parallel.peers.len() + 1
-            || parallel.turn_checkpoints.len() != parallel.prompts.len()
+            || parallel.prepared.len() != parallel.prompts.len()
             || parallel.prompts.first().map(Vec::as_slice) != Some(prompt)
         {
             return Err(anyhow!("invalid parallel prefill request layout"));
@@ -2424,28 +2482,7 @@ fn generate_dense_backend_inner(
                 ));
             }
         }
-        let _gp = req.and_then(|request| request.gate_pass());
-        let mut prepared = Vec::with_capacity(parallel.prompts.len());
-        prepared.push(prepare_parallel_prompt_state(
-            be,
-            c,
-            ec,
-            state.as_mut().expect("seam state just initialized"),
-            &parallel.prompts[0],
-            parallel.turn_checkpoints[0],
-            None,
-        )?);
-        for ((slot, tokens), &checkpoint) in parallel
-            .peers
-            .iter_mut()
-            .zip(&parallel.prompts[1..])
-            .zip(&parallel.turn_checkpoints[1..])
-        {
-            prepared.push(prepare_parallel_prompt_state(
-                be, c, ec, slot, tokens, checkpoint, None,
-            )?);
-        }
-        Some(prepared)
+        Some(parallel.prepared.to_vec())
     } else {
         None
     };
@@ -6946,7 +6983,6 @@ fn generate_dense_backend_inner(
         let qsa_ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
         let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
         let t0 = std::time::Instant::now();
-        let mut mixed_decode_secs = vec![0.0f64; lanes];
 
         while let Some(first_lane) = (0..lanes).find(|&lane| cursors[lane] < targets[lane]) {
             if crate::sampling::abort_requested(req) {
@@ -6958,19 +6994,6 @@ fn generate_dense_backend_inner(
                     cursors[lane] < targets[lane] && (cursors[lane] + 1 > qsa_threshold) == sparse
                 })
                 .collect::<Vec<_>>();
-            let ready_lanes = (0..lanes)
-                .filter(|&lane| {
-                    cursors[lane] == targets[lane]
-                        && parallel.mixed_outputs[lane].is_none()
-                        && (cursors[lane] + 1 > qsa_threshold) == sparse
-                        && (cursors[lane] + 2 > qsa_threshold) == sparse
-                })
-                .collect::<Vec<_>>();
-            let unfinished = cursors
-                .iter()
-                .zip(&targets)
-                .filter(|(cursor, target)| cursor < target)
-                .count();
             let final_ranges = prefill_lanes
                 .iter()
                 .map(|&lane| {
@@ -6987,28 +7010,10 @@ fn generate_dense_backend_inner(
                     begin..end
                 })
                 .collect::<Vec<_>>();
-            let final_rows = final_ranges.iter().map(std::ops::Range::len).sum::<usize>();
-            let mix_decode = should_mix_ready_decode(
-                unfinished,
-                prefill_lanes.len(),
-                final_ranges
-                    .iter()
-                    .zip(&prefill_lanes)
-                    .all(|(range, &lane)| range.end == targets[lane]),
-                final_rows,
-                ready_lanes.len(),
-                ubatch,
-            );
-            let decode_lanes = if mix_decode { ready_lanes } else { Vec::new() };
-            let prefill_budget = ubatch.saturating_sub(decode_lanes.len()).max(1);
-            let share = (prefill_budget / prefill_lanes.len().max(1)).max(1);
+            let share = (ubatch / prefill_lanes.len().max(1)).max(1);
             let mut prefill_ranges = Vec::with_capacity(prefill_lanes.len());
             for (&lane, final_range) in prefill_lanes.iter().zip(final_ranges) {
-                let end = if mix_decode {
-                    final_range.end
-                } else {
-                    (final_range.start + share).min(final_range.end)
-                };
+                let end = (final_range.start + share).min(final_range.end);
                 if end <= final_range.start {
                     return Err(anyhow!(
                         "parallel prefill lane {lane} made no progress at position {}",
@@ -7017,14 +7022,8 @@ fn generate_dense_backend_inner(
                 }
                 prefill_ranges.push(final_range.start..end);
             }
-            let mut batch_lanes = prefill_lanes.clone();
-            batch_lanes.extend_from_slice(&decode_lanes);
-            let mut ranges = prefill_ranges.clone();
-            ranges.extend(
-                decode_lanes
-                    .iter()
-                    .map(|&lane| cursors[lane]..cursors[lane] + 1),
-            );
+            let batch_lanes = prefill_lanes.clone();
+            let ranges = prefill_ranges.clone();
             let mut spans = Vec::with_capacity(batch_lanes.len());
             let mut row_start = 0usize;
             for range in &ranges {
@@ -7037,8 +7036,10 @@ fn generate_dense_backend_inner(
                 row_start += rows;
             }
             let batch = row_start;
-            let round_t0 = std::time::Instant::now();
-
+            // One active lane is an ordinary contiguous sequence, even though it arrived through
+            // the parallel scheduler. Keeping it on the single-sequence graph also preserves the
+            // sparse-QSA gather path used by a final one-row prefill tail.
+            let independent_rows = batch_lanes.len() > 1;
             let _gp = req.and_then(|request| request.gate_pass());
             for (&lane, range) in batch_lanes.iter().zip(&ranges) {
                 if lane == 0 {
@@ -7084,25 +7085,6 @@ fn generate_dense_backend_inner(
             let ple_batch = be
                 .alloc(batch * ple_row * 4, BufferUsage::Staging)
                 .map_err(|error| anyhow!("{error}"))?;
-            let logits_rows = decode_lanes.len();
-            let batch_argmax = logits_rows > 0
-                && caps.argmax_rows
-                && ec.spec.gpu_argmax
-                && decode_lanes
-                    .iter()
-                    .all(|&lane| parallel.samplers[lane].can_gpu_argmax());
-            let logits_batch = (logits_rows > 0)
-                .then(|| {
-                    be.alloc_uninit(logits_rows * c.vocab * 4, BufferUsage::Activations)
-                        .map_err(|error| anyhow!("{error}"))
-                })
-                .transpose()?;
-            let ids_out = batch_argmax
-                .then(|| {
-                    be.alloc(logits_rows * 4, BufferUsage::Readback)
-                        .map_err(|error| anyhow!("{error}"))
-                })
-                .transpose()?;
             be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
                 .map_err(|error| anyhow!("{error}"))?;
             be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&positions))
@@ -7120,8 +7102,8 @@ fn generate_dense_backend_inner(
                 false,
                 true,
                 false,
-                true,
-                Some(&spans),
+                independent_rows,
+                independent_rows.then_some(spans.as_slice()),
                 Some(0..1),
             );
             let plan0 = be.compile(&g0).map_err(|error| anyhow!("{error}"))?;
@@ -7151,6 +7133,7 @@ fn generate_dense_backend_inner(
                 None,
                 &*parallel.peers,
                 Some(&batch_lanes),
+                independent_rows,
             );
             be.execute(plan0.as_ref(), &bindings0)
                 .map_err(|error| anyhow!("{error}"))?;
@@ -7173,17 +7156,17 @@ fn generate_dense_backend_inner(
             let (g1, h1) = build(
                 batch,
                 ranges[0].start,
-                logits_rows,
+                0,
                 false,
                 None,
                 false,
                 false,
-                batch_argmax,
                 false,
                 false,
                 false,
-                true,
-                Some(&spans),
+                false,
+                independent_rows,
+                independent_rows.then_some(spans.as_slice()),
                 Some(1..c.n_layer),
             );
             let plan1 = be.compile(&g1).map_err(|error| anyhow!("{error}"))?;
@@ -7209,41 +7192,10 @@ fn generate_dense_backend_inner(
                 Some(ple_batch.as_ref()),
                 &*parallel.peers,
                 Some(&batch_lanes),
+                independent_rows,
             );
-            if let Some(logits) = logits_batch.as_deref() {
-                bindings1.bind(h1.logits.expect("mixed prefill build has logits"), logits);
-            }
-            if let Some(ids) = ids_out.as_deref() {
-                bindings1.bind(h1.tok_id.expect("mixed greedy prefill has token ids"), ids);
-            }
             be.execute(plan1.as_ref(), &bindings1)
                 .map_err(|error| anyhow!("{error}"))?;
-
-            if logits_rows > 0 {
-                let mut next = vec![0u32; logits_rows];
-                if let Some(ids) = ids_out.as_deref() {
-                    be.download(ids, bytemuck::cast_slice_mut(&mut next))
-                        .map_err(|error| anyhow!("{error}"))?;
-                } else {
-                    let mut logits = vec![0f32; logits_rows * c.vocab];
-                    be.download(
-                        logits_batch
-                            .as_deref()
-                            .expect("host mixed sampling has logits"),
-                        bytemuck::cast_slice_mut(&mut logits),
-                    )
-                    .map_err(|error| anyhow!("{error}"))?;
-                    for (row, &lane) in decode_lanes.iter().enumerate() {
-                        next[row] = parallel.samplers[lane]
-                            .sample(&mut logits[row * c.vocab..(row + 1) * c.vocab]);
-                    }
-                }
-                let round_secs = round_t0.elapsed().as_secs_f64();
-                for (&lane, token) in decode_lanes.iter().zip(next) {
-                    parallel.mixed_outputs[lane] = Some(token);
-                    mixed_decode_secs[lane] += round_secs;
-                }
-            }
 
             for (&lane, range) in prefill_lanes.iter().zip(&prefill_ranges) {
                 cursors[lane] = range.end;
@@ -7277,10 +7229,8 @@ fn generate_dense_backend_inner(
                         prompt_tokens: parallel.prompts[0].len() as u64,
                         cached_prompt_tokens: starts[0] as u64,
                         prefill_tokens: cursors[0].saturating_sub(starts[0]) as u64,
-                        completion_tokens: usize::from(parallel.mixed_outputs[0].is_some()) as u64,
-                        context_tokens: cursors[0]
-                            .saturating_add(usize::from(parallel.mixed_outputs[0].is_some()))
-                            as u64,
+                        completion_tokens: 0,
+                        context_tokens: cursors[0] as u64,
                         context_limit: max_ctx as u64,
                     });
                 }
@@ -7289,19 +7239,11 @@ fn generate_dense_backend_inner(
 
         let elapsed = t0.elapsed().as_secs_f64();
         if cursors[0] == targets[0] {
-            *cached = if parallel.mixed_outputs[0].is_some() {
-                parallel.prompts[0].clone()
-            } else {
-                parallel.prompts[0][..targets[0]].to_vec()
-            };
+            *cached = parallel.prompts[0][..targets[0]].to_vec();
         }
         for lane in 1..lanes {
             if cursors[lane] == targets[lane] {
-                parallel.peers[lane - 1].cached = if parallel.mixed_outputs[lane].is_some() {
-                    parallel.prompts[lane].clone()
-                } else {
-                    parallel.prompts[lane][..targets[lane]].to_vec()
-                };
+                parallel.peers[lane - 1].cached = parallel.prompts[lane][..targets[lane]].to_vec();
             }
         }
         let stats = (0..lanes)
@@ -7309,8 +7251,8 @@ fn generate_dense_backend_inner(
                 n_prompt: parallel.prompts[lane].len() - starts[lane],
                 n_cached: starts[lane],
                 prompt_secs: elapsed,
-                n_gen: usize::from(parallel.mixed_outputs[lane].is_some()),
-                decode_secs: mixed_decode_secs[lane],
+                n_gen: 0,
+                decode_secs: 0.0,
             })
             .collect::<Vec<_>>();
         parallel.peer_stats.extend(stats.iter().skip(1).cloned());
@@ -7949,20 +7891,15 @@ fn generate_dense_backend_inner(
                 parallel.samplers.len()
             ));
         }
-        let batch_argmax = caps.argmax_rows
-            && ec.spec.gpu_argmax
-            && parallel
-                .samplers
-                .iter()
-                .all(crate::sampling::ParallelSampler::can_gpu_argmax);
-        if prompt.len() != start + 1 {
+        if parallel.prompt_ends.len() != lanes || parallel.checkpoint_boundaries.len() != lanes {
             return Err(anyhow!(
-                "parallel decode accepts an already-prefilled slot plus one frontier token; primary cached={start}, prompt={}",
-                prompt.len()
+                "parallel token step has {lanes} lanes, {} prompt ends and {} checkpoints",
+                parallel.prompt_ends.len(),
+                parallel.checkpoint_boundaries.len()
             ));
         }
         let mut lane_starts = Vec::with_capacity(lanes);
-        lane_starts.push(start);
+        lane_starts.push(cached.len());
         for (lane, (slot, lane_prompt)) in parallel
             .peers
             .iter()
@@ -7970,20 +7907,45 @@ fn generate_dense_backend_inner(
             .enumerate()
         {
             let lane_start = slot.cached.len();
-            if lane_prompt.len() != lane_start + 1 || !lane_prompt.starts_with(&slot.cached) {
+            if lane_start >= lane_prompt.len() || !lane_prompt.starts_with(&slot.cached) {
                 return Err(anyhow!(
-                    "parallel decode lane {} is not at its cached depth {lane_start} with one frontier token",
+                    "parallel token lane {} has no input at cached depth {lane_start}",
                     lane + 1,
                 ));
             }
-            if lane_prompt.len() + max_new > slot.max_ctx {
+            if lane_start + max_new > slot.max_ctx {
                 return Err(anyhow!(
-                    "parallel decode lane {} exceeds its KV capacity {}",
+                    "parallel token lane {} exceeds its KV capacity {}",
                     lane + 1,
                     slot.max_ctx
                 ));
             }
             lane_starts.push(lane_start);
+        }
+        if cached.len() >= prompt.len() || cached.len() + max_new > max_ctx {
+            return Err(anyhow!(
+                "parallel token primary has no room for {max_new} step(s) at cached depth {}",
+                cached.len()
+            ));
+        }
+        for lane in 0..lanes {
+            let end = parallel.prompt_ends[lane];
+            if end == 0 || end > parallel.prompts[lane].len() {
+                return Err(anyhow!(
+                    "parallel token lane {lane} has invalid prompt end {end} for {} tokens",
+                    parallel.prompts[lane].len()
+                ));
+            }
+        }
+        let remaining_prefill = lane_starts
+            .iter()
+            .zip(parallel.prompt_ends)
+            .map(|(&position, &end)| end.saturating_sub(1).saturating_sub(position))
+            .collect::<Vec<_>>();
+        if remaining_prefill.windows(2).any(|pair| pair[0] < pair[1]) {
+            return Err(anyhow!(
+                "parallel token lanes must be ordered by descending remaining prefill"
+            ));
         }
         let qsa_ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
         let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
@@ -7999,7 +7961,16 @@ fn generate_dense_backend_inner(
 
         let ple_heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
         let ple_row = ple_heads * c.ple_head_dim;
-        let (ids_buf, pos_batch, hidden_batch, logits_batch, ids_out, wide_batch, ple_batch) = {
+        let (
+            ids_buf,
+            pos_batch,
+            hidden_batch,
+            logits_batch,
+            ids_out,
+            sample_u,
+            wide_batch,
+            ple_batch,
+        ) = {
             let _gp = req.and_then(|request| request.gate_pass());
             (
                 be.alloc(lanes * 4, BufferUsage::Staging)
@@ -8012,6 +7983,8 @@ fn generate_dense_backend_inner(
                     .map_err(|e| anyhow!("{e}"))?,
                 be.alloc(lanes * 4, BufferUsage::Readback)
                     .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
                 be.alloc_uninit(lanes * c.hc_mult * ne * 4, BufferUsage::Activations)
                     .map_err(|e| anyhow!("{e}"))?,
                 be.alloc(lanes * ple_row * 4, BufferUsage::Staging)
@@ -8022,13 +7995,30 @@ fn generate_dense_backend_inner(
         let mut curs = parallel.prompts.to_vec();
         let mut generated = vec![Vec::<u32>::with_capacity(max_new); lanes];
         let mut last_written = vec![None; lanes];
-        let t0 = std::time::Instant::now();
+        let mut prompt_secs = vec![0.0f64; lanes];
+        let mut decode_secs = vec![0.0f64; lanes];
+        let independent_rows = lanes > 1;
         for step in 0..max_new {
+            let step_t0 = std::time::Instant::now();
             let _gp = req.and_then(|request| request.gate_pass());
             let positions = lane_starts
                 .iter()
                 .map(|&lane_start| lane_start + step)
                 .collect::<Vec<_>>();
+            let sample_from = sampling_suffix_start(&positions, parallel.prompt_ends)?;
+            let logits_rows = lanes - sample_from;
+            let batch_argmax = logits_rows > 0
+                && caps.argmax_rows
+                && ec.spec.gpu_argmax
+                && parallel.samplers[sample_from..]
+                    .iter()
+                    .all(crate::sampling::ParallelSampler::can_gpu_argmax);
+            let batch_gpu_sample = logits_rows == 1
+                && lanes == 1
+                && caps.gpu_sample
+                && ec.spec.gpu_sample
+                && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
+                && parallel.samplers[0].can_gpu_sample_with(sampler);
             ensure_kv_depth!(positions[0] + 1);
             for (peer, &position) in parallel.peers.iter_mut().zip(&positions[1..]) {
                 peer.ensure_segmented_depth(be, c, position + 1)?;
@@ -8054,15 +8044,17 @@ fn generate_dense_backend_inner(
             for (tokens, &position) in curs.iter().zip(&positions) {
                 tickets.push(worker.submit(tokens, position, c.ple_ngram_size)?);
             }
-            let sequence_spans = positions
-                .iter()
-                .enumerate()
-                .map(|(row, &position)| SequenceSpan {
-                    row_start: row as u32,
-                    rows: 1,
-                    start_pos: position as u32,
-                })
-                .collect::<Vec<_>>();
+            let sequence_spans = independent_rows.then(|| {
+                positions
+                    .iter()
+                    .enumerate()
+                    .map(|(row, &position)| SequenceSpan {
+                        row_start: row as u32,
+                        rows: 1,
+                        start_pos: position as u32,
+                    })
+                    .collect::<Vec<_>>()
+            });
 
             let (g0, h0) = build(
                 lanes,
@@ -8076,8 +8068,8 @@ fn generate_dense_backend_inner(
                 false,
                 true,
                 false,
-                true,
-                Some(&sequence_spans),
+                independent_rows,
+                sequence_spans.as_deref(),
                 Some(0..1),
             );
             let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
@@ -8107,6 +8099,7 @@ fn generate_dense_backend_inner(
                 None,
                 &*parallel.peers,
                 None,
+                independent_rows,
             );
             be.execute(plan0.as_ref(), &b0)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -8128,17 +8121,17 @@ fn generate_dense_backend_inner(
             let (g1, h1) = build(
                 lanes,
                 positions[0],
-                lanes,
+                logits_rows,
                 false,
                 None,
                 false,
                 false,
                 batch_argmax,
+                batch_gpu_sample,
                 false,
                 false,
-                false,
-                true,
-                Some(&sequence_spans),
+                independent_rows,
+                sequence_spans.as_deref(),
                 Some(1..c.n_layer),
             );
             let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
@@ -8164,44 +8157,94 @@ fn generate_dense_backend_inner(
                 Some(ple_batch.as_ref()),
                 &*parallel.peers,
                 None,
+                independent_rows,
             );
-            b1.bind(
-                h1.logits.expect("parallel decode build has logits"),
-                logits_batch.as_ref(),
-            );
+            if logits_rows > 0 {
+                b1.bind(
+                    h1.logits.expect("parallel token build has logits"),
+                    logits_batch.as_ref(),
+                );
+            }
             if batch_argmax {
                 b1.bind(
-                    h1.tok_id.expect("parallel greedy decode has ids"),
+                    h1.tok_id.expect("parallel greedy token step has ids"),
+                    ids_out.as_ref(),
+                );
+            }
+            if batch_gpu_sample {
+                let uniform = parallel.samplers[0].next_uniform();
+                be.upload(sample_u.as_ref(), bytemuck::cast_slice(&[uniform]))
+                    .map_err(|e| anyhow!("{e}"))?;
+                b1.bind(
+                    h1.u_in
+                        .expect("parallel stochastic token step has a uniform"),
+                    sample_u.as_ref(),
+                );
+                b1.bind(
+                    h1.tok_id.expect("parallel stochastic token step has an id"),
                     ids_out.as_ref(),
                 );
             }
             be.execute(plan1.as_ref(), &b1)
                 .map_err(|e| anyhow!("{e}"))?;
 
-            let mut next = vec![0u32; lanes];
-            if batch_argmax {
+            let mut next = vec![0u32; logits_rows];
+            if batch_argmax || batch_gpu_sample {
                 be.download(ids_out.as_ref(), bytemuck::cast_slice_mut(&mut next))
                     .map_err(|e| anyhow!("{e}"))?;
-            } else {
-                let mut logits = vec![0f32; lanes * c.vocab];
+            } else if logits_rows > 0 {
+                let mut logits = vec![0f32; logits_rows * c.vocab];
                 be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                     .map_err(|e| anyhow!("{e}"))?;
-                for lane in 0..lanes {
-                    next[lane] = parallel.samplers[lane]
-                        .sample(&mut logits[lane * c.vocab..(lane + 1) * c.vocab]);
+                for row in 0..logits_rows {
+                    let lane = sample_from + row;
+                    next[row] = parallel.samplers[lane]
+                        .sample(&mut logits[row * c.vocab..(row + 1) * c.vocab]);
                 }
             }
             for (written, &position) in last_written.iter_mut().zip(&positions) {
                 *written = Some(position);
             }
-            let mut stop_batch = false;
             for lane in 0..lanes {
-                generated[lane].push(next[lane]);
-                let is_eos = !ec.sampling.ignore_eos
-                    && (c.eos_ids.contains(&next[lane]) || next[lane] == c.eos);
-                let keep_going = !is_eos && (parallel.on_token)(lane, next[lane]);
+                if Some(positions[lane] + 1) == parallel.checkpoint_boundaries[lane] {
+                    if lane == 0 {
+                        if let Some(checkpoint) = turn_recurrent_ckpt.as_mut() {
+                            checkpoint.snapshot_all(
+                                be,
+                                &kbufs[..],
+                                &vbufs[..],
+                                ple_state_buf.as_deref(),
+                            )?;
+                        }
+                    } else {
+                        let slot = &mut parallel.peers[lane - 1];
+                        if let Some(checkpoint) = slot.turn_recurrent_ckpt.as_mut() {
+                            checkpoint.snapshot_all(
+                                be,
+                                &slot.kbufs,
+                                &slot.vbufs,
+                                slot.ple_state_buf.as_deref(),
+                            )?;
+                        }
+                    }
+                }
+            }
+            let step_secs = step_t0.elapsed().as_secs_f64();
+            for lane in 0..sample_from {
+                prompt_secs[lane] += step_secs;
+            }
+            for lane in sample_from..lanes {
+                decode_secs[lane] += step_secs;
+            }
+            let mut stop_batch = false;
+            for (row, &token) in next.iter().enumerate() {
+                let lane = sample_from + row;
+                generated[lane].push(token);
+                let is_eos =
+                    !ec.sampling.ignore_eos && (c.eos_ids.contains(&token) || token == c.eos);
+                let keep_going = !is_eos && (parallel.on_token)(lane, token);
                 if keep_going {
-                    curs[lane].push(next[lane]);
+                    curs[lane].push(token);
                 } else {
                     stop_batch = true;
                 }
@@ -8215,7 +8258,6 @@ fn generate_dense_backend_inner(
             }
         }
 
-        let decode_secs = t0.elapsed().as_secs_f64();
         *cached = resident_after_gen(&curs[0], last_written[0]);
         for ((slot, tokens), written) in parallel
             .peers
@@ -8229,6 +8271,8 @@ fn generate_dense_backend_inner(
         parallel
             .peer_outputs
             .extend(generated.iter().skip(1).cloned());
+        parallel.prompt_secs.extend(prompt_secs);
+        parallel.decode_secs.extend(decode_secs);
         return Ok((
             generated.remove(0),
             GenStats {
@@ -8236,7 +8280,7 @@ fn generate_dense_backend_inner(
                 n_cached: start,
                 prompt_secs: 0.0,
                 n_gen: total_generated,
-                decode_secs,
+                decode_secs: 0.0,
             },
         ));
     }
@@ -9651,16 +9695,18 @@ fn generate_dense_backend_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        recurrent_extension_start, resident_after_gen, should_mix_ready_decode, validate_token_ids,
+        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
     };
 
     #[test]
-    fn mixed_decode_uses_only_the_final_fitting_prefill_round() {
-        assert!(should_mix_ready_decode(1, 1, true, 255, 1, 256));
-        assert!(!should_mix_ready_decode(1, 1, true, 256, 1, 256));
-        assert!(!should_mix_ready_decode(2, 1, true, 32, 1, 256));
-        assert!(!should_mix_ready_decode(1, 1, false, 32, 1, 256));
-        assert!(!should_mix_ready_decode(1, 1, true, 32, 0, 256));
+    fn token_step_samples_only_a_contiguous_suffix() {
+        assert_eq!(
+            sampling_suffix_start(&[10, 20, 30], &[15, 21, 31]).unwrap(),
+            1
+        );
+        assert_eq!(sampling_suffix_start(&[10, 20], &[15, 25]).unwrap(), 2);
+        assert!(sampling_suffix_start(&[20, 10], &[21, 15]).is_err());
+        assert!(sampling_suffix_start(&[10], &[11, 12]).is_err());
     }
 
     #[test]

@@ -620,6 +620,64 @@ impl ScratchPool {
         Ok(key)
     }
 
+    /// Acquire one related workspace as a single allocator transaction. The unified allocator
+    /// packs the largest ranges first, avoiding shard-tail fragmentation when a large buffer is
+    /// otherwise requested after several small siblings.
+    fn acquire_batch(
+        &mut self,
+        requests: &[(&'static str, usize)],
+        alloc: impl FnOnce(&[usize]) -> Result<Vec<Box<dyn Buffer>>>,
+    ) -> Result<Vec<ScratchKey>> {
+        let mut seen = HashSet::with_capacity(requests.len());
+        for &(tag, _) in requests {
+            if !seen.insert(tag) {
+                return Err(be(format!(
+                    "scratch batch contains duplicate workspace tag '{tag}'"
+                )));
+            }
+        }
+
+        let mut keys = Vec::with_capacity(requests.len());
+        let mut missing = Vec::new();
+        for &(tag, requested) in requests {
+            let bytes = requested.max(4);
+            let reusable = self
+                .buffers
+                .keys()
+                .filter(|(candidate, capacity)| *candidate == tag && *capacity >= bytes)
+                .min_by_key(|(_, capacity)| *capacity)
+                .copied();
+            let key = if let Some(key) = reusable {
+                key
+            } else {
+                if !self.in_use.iter().any(|(candidate, _)| *candidate == tag) {
+                    self.buffers.retain(|(candidate, _), _| *candidate != tag);
+                }
+                let key = (tag, bytes);
+                if !self.buffers.contains_key(&key) {
+                    missing.push(key);
+                }
+                key
+            };
+            keys.push(key);
+        }
+
+        if !missing.is_empty() {
+            let capacities = missing.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>();
+            let buffers = alloc(&capacities)?;
+            if buffers.len() != missing.len() {
+                return Err(be(
+                    "scratch batch allocator returned the wrong buffer count",
+                ));
+            }
+            for (key, buffer) in missing.into_iter().zip(buffers) {
+                self.buffers.insert(key, buffer);
+            }
+        }
+        self.in_use.extend(keys.iter().copied());
+        Ok(keys)
+    }
+
     /// Keep one high-water capacity per logical workspace. This is called only after every command
     /// recorded by the execute has finished, so buffers referenced earlier in that recording may
     /// now be released safely.
@@ -1210,6 +1268,26 @@ fn pooled(
     .map_err(|error| {
         be(format!(
             "pooled activation scratch '{tag}' ({bytes} bytes) allocation failed: {error}"
+        ))
+    })
+}
+
+fn pooled_batch(
+    pool: &mut ScratchPool,
+    be_: &VulkanBackend,
+    requests: &[(&'static str, usize)],
+) -> Result<Vec<ScratchKey>> {
+    pool.acquire_batch(requests, |capacities| {
+        be_.alloc_uninit_batch(capacities, BufferUsage::Activations)
+    })
+    .map_err(|error| {
+        let total = requests
+            .iter()
+            .fold(0usize, |sum, (_, bytes)| sum.saturating_add(*bytes));
+        be(format!(
+            "pooled activation scratch batch ({} buffers, {} bytes) allocation failed: {error}",
+            requests.len(),
+            total
         ))
     })
 }
@@ -3385,8 +3463,17 @@ fn lower_op(
                      k_dtype={kdt:?} v_dtype={vdt:?}"
                 )));
             }
-            let k_cache_buf = r(*k_cache)?;
-            let v_cache_buf = r(*v_cache)?;
+            let (k_cache_buf, v_cache_buf) = if graph.independent_rows {
+                // QsaGather materializes one compact prefix for one query. A parallel graph can
+                // reach this path when only one sequence row remains, so select that row's
+                // persistent cache while keeping the ordinary single-query gather kernel.
+                let spans = sequence_spans(graph, 1)?;
+                let k_rows = resolve_rows(bindings, *k_cache, spans.len())?;
+                let v_rows = resolve_rows(bindings, *v_cache, spans.len())?;
+                (k_rows[0], v_rows[0])
+            } else {
+                (r(*k_cache)?, r(*v_cache)?)
+            };
             let (k_binding, v_binding, segment_shift) = match (
                 segmented_kv_view(k_cache_buf),
                 segmented_kv_view(v_cache_buf),
@@ -4099,12 +4186,18 @@ fn lower_op(
             let kv_q8 = k_q8 && v_q8; // coupled (the Dynamic-branch kernels' q8 variant)
                                       // Planar Q8 scales region base = total cache elements (K and V caches share numel).
             let cap = graph.desc(*k_cache).numel();
-            let k_segmented = if graph.independent_rows {
+            // A QsaGather in an independent-row graph produces one compact, graph-internal K/V
+            // prefix. That prefix is already contiguous and no longer has per-session bindings;
+            // lower its following Attention through the ordinary single-sequence path.
+            let independent_cache_rows = graph.independent_rows
+                && scratch[k_cache.0 as usize].is_none()
+                && scratch[v_cache.0 as usize].is_none();
+            let k_segmented = if independent_cache_rows {
                 None
             } else {
                 segmented_kv_view(r(*k_cache)?)
             };
-            let v_segmented = if graph.independent_rows {
+            let v_segmented = if independent_cache_rows {
                 None
             } else {
                 segmented_kv_view(r(*v_cache)?)
@@ -4131,7 +4224,7 @@ fn lower_op(
             // kv_len (padded, for nonfa's 256-row tiles) outruns the rows actually present. On a
             // full-context cache kv_len <= att_cap_rows always, so none of these gates move.
             let att_cap_rows = cap / (nkv * hd).max(1);
-            if graph.independent_rows {
+            if independent_cache_rows {
                 if !matches!(mode, RopeMode::Static(_)) {
                     return Err(be(
                         "independent-row attention requires the static Vulkan path",
@@ -8118,7 +8211,13 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                         &mut mmv_memo,
                         Some(arena_addr),
                     ) {
-                        return Err(abort_segment(rec.take(), e));
+                        return Err(abort_segment(
+                            rec.take(),
+                            be(format!(
+                                "vulkan adapter: op {op_idx} {} failed: {e}",
+                                op.kind()
+                            )),
+                        ));
                     }
                     continue;
                 }
@@ -8141,7 +8240,13 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             &mut mmv_memo,
             None,
         ) {
-            return Err(abort_segment(rec.take(), e));
+            return Err(abort_segment(
+                rec.take(),
+                be(format!(
+                    "vulkan adapter: op {op_idx} {} failed: {e}",
+                    op.kind()
+                )),
+            ));
         }
     }
     for c in dyn_args.drain(..) {
@@ -9479,27 +9584,50 @@ fn execute_paged_moe<'a>(
     let moe_scratch = if use_paged_mmq {
         let n_pairs = n_slots;
         let npad = n_pairs.div_ceil(64) * 64 + 64;
+        let mut requests = vec![
+            ("moe_pgb_counts", n_expert * 4),
+            ("moe_pgb_offsets", n_expert * 4),
+            ("moe_pgb_fill", n_expert * 4),
+            ("moe_pgb_brows", n_pairs * 4),
+            ("moe_pgb_bwts", n_pairs * 4),
+            ("moe_pgb_ipos", n_pairs * 4),
+            ("moe_pgb_qa", npad * ne),
+            ("moe_pgb_qda", npad * (ne / 32) * 2),
+            ("moe_pgb_qsa", npad * (ne / 32) * 2),
+            ("moe_pgb_ge", npad * gu_width * 4),
+        ];
+        if !*fused_gate_up {
+            requests.push(("moe_pgb_ue", npad * nff * 4));
+        }
+        requests.extend([
+            ("moe_pgb_ae", npad * nff * 4),
+            ("moe_pgb_dqa", npad * nff),
+            ("moe_pgb_dda", npad * (nff / 32) * 2),
+            ("moe_pgb_dsa", npad * (nff / 32) * 2),
+            ("moe_pgb_ye", npad * ne * 4),
+        ]);
+        let mut keys = pooled_batch(pool, be_, &requests)?.into_iter();
+        let mut next = || {
+            keys.next()
+                .expect("paged MMQ scratch key count matches requests")
+        };
         PagedMoeScratch::Mmq(PagedMmqScratch {
-            counts: pooled(pool, be_, "moe_pgb_counts", n_expert * 4)?,
-            offsets: pooled(pool, be_, "moe_pgb_offsets", n_expert * 4)?,
-            fill: pooled(pool, be_, "moe_pgb_fill", n_expert * 4)?,
-            bucket_rows: pooled(pool, be_, "moe_pgb_brows", n_pairs * 4)?,
-            bucket_wts: pooled(pool, be_, "moe_pgb_bwts", n_pairs * 4)?,
-            inv_pos: pooled(pool, be_, "moe_pgb_ipos", n_pairs * 4)?,
-            qa: pooled(pool, be_, "moe_pgb_qa", npad * ne)?,
-            qda: pooled(pool, be_, "moe_pgb_qda", npad * (ne / 32) * 2)?,
-            qsa: pooled(pool, be_, "moe_pgb_qsa", npad * (ne / 32) * 2)?,
-            ge: pooled(pool, be_, "moe_pgb_ge", npad * gu_width * 4)?,
-            ue: if *fused_gate_up {
-                None
-            } else {
-                Some(pooled(pool, be_, "moe_pgb_ue", npad * nff * 4)?)
-            },
-            ae: pooled(pool, be_, "moe_pgb_ae", npad * nff * 4)?,
-            dqa: pooled(pool, be_, "moe_pgb_dqa", npad * nff)?,
-            dda: pooled(pool, be_, "moe_pgb_dda", npad * (nff / 32) * 2)?,
-            dsa: pooled(pool, be_, "moe_pgb_dsa", npad * (nff / 32) * 2)?,
-            ye: pooled(pool, be_, "moe_pgb_ye", npad * ne * 4)?,
+            counts: next(),
+            offsets: next(),
+            fill: next(),
+            bucket_rows: next(),
+            bucket_wts: next(),
+            inv_pos: next(),
+            qa: next(),
+            qda: next(),
+            qsa: next(),
+            ge: next(),
+            ue: if *fused_gate_up { None } else { Some(next()) },
+            ae: next(),
+            dqa: next(),
+            dda: next(),
+            dsa: next(),
+            ye: next(),
         })
     } else {
         PagedMoeScratch::Small(PagedSmallScratch {
@@ -10702,6 +10830,37 @@ mod tests {
             }
         })
         .unwrap();
+    }
+
+    #[test]
+    fn scratch_pool_batch_uses_one_transaction_and_reuses_high_water() {
+        let mut pool = ScratchPool::default();
+        pool.begin_execute();
+        let mut allocations = 0usize;
+        let keys = pool
+            .acquire_batch(
+                &[("small", 4), ("large", 64), ("medium", 16)],
+                |capacities| {
+                    allocations += 1;
+                    assert_eq!(capacities, &[4, 64, 16]);
+                    Ok(capacities
+                        .iter()
+                        .map(|&bytes| Box::new(TestBuffer(bytes)) as Box<dyn Buffer>)
+                        .collect())
+                },
+            )
+            .unwrap();
+        assert_eq!(keys, [("small", 4), ("large", 64), ("medium", 16)]);
+        assert_eq!(allocations, 1);
+        pool.finish_execute();
+
+        pool.begin_execute();
+        let reused = pool
+            .acquire_batch(&[("large", 32), ("small", 4)], |_| {
+                panic!("retained high-water buffers must satisfy the whole batch")
+            })
+            .unwrap();
+        assert_eq!(reused, [("large", 64), ("small", 4)]);
     }
 
     #[test]

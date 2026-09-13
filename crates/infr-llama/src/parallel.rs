@@ -2,18 +2,14 @@
 //!
 //! # What this is (and what it is not)
 //!
-//! It is a hybrid concurrent engine. Every sequence owns one KV slot. Compatible Qwen3.8 prefill
-//! requests divide the configured ubatch and run as one layer-synchronous activation batch; their
-//! decode frontiers then continue in one forward at `m = n_active`. Stateless work and paged
-//! expert traffic are shared while every sequence retains its own positions, KV/recurrent state
-//! and sampler. Other architectures and incompatible QSA phases keep the established interleaved
-//! path through [`crate::sampling::StepGate`].
-//!
-//! Qwen3.8 cohorts admit newly arrived work at token boundaries. A ready decode joins the next
-//! aggregated forward; a short prefill can share its final fitting ubatch with ready decode rows,
-//! while a longer prefill temporarily takes the cohort through layer-synchronous prefill first.
-//! Incompatible QSA phases split cleanly back into separate cohorts. The worker still releases the
-//! GPU baton after every graph, so unsupported or fallback work can continue through `StepGate`.
+//! Every sequence owns one KV slot. Qwen3.8 text requests enter one authoritative scheduler before
+//! tokenization and remain there through completion. Decode rows run layer-synchronously. Up to 96
+//! uncached prompt tokens advance as teacher-forced rows in the same Decode-LRU graphs; longer
+//! prompts share the configured ubatch in one exclusive Prefill-ring phase before decode resumes.
+//! Stateless work and paged expert traffic are shared while every sequence retains independent
+//! positions, KV/recurrent state and sampling. Dense/sparse QSA rows form compatible subgroups but
+//! never fall back to independent request loops. Other architectures and constrained generation
+//! retain the established interleaved path through [`crate::sampling::StepGate`].
 //!
 //! # VRAM: how `-np` interacts with `--ctx`
 //!
@@ -32,7 +28,7 @@
 //! When `kv.session_cache_dir` is explicitly set, a background worker streams idle dynamic Q8 KV
 //! state to checksummed files and releases its physical 32K segments. A later prefix match restores
 //! that state into any free resident slot. This extends the number of retained conversations; it
-//! does not alter the decode cohort or fallback scheduling described above.
+//! does not alter the scheduler policy described above.
 
 use crate::sampling::{ParallelSampler, RequestCtx, StepGate};
 use crate::seam::SeamKv;
@@ -47,8 +43,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const DECODE_BATCH_WAIT: Duration = Duration::from_secs(1);
-const PREFILL_BATCH_WAIT: Duration = Duration::from_millis(10);
 const MAX_DECODE_BATCH: usize = 8;
+const SHORT_PREFILL_TOKENS: usize = 96;
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
@@ -165,15 +161,6 @@ fn pick_continuation(
         .map(|(idx, _, _)| idx)
 }
 
-fn merge_stats(mut total: GenStats, tail: GenStats) -> GenStats {
-    total.n_prompt += tail.n_prompt;
-    total.n_cached += tail.n_cached;
-    total.prompt_secs += tail.prompt_secs;
-    total.n_gen += tail.n_gen;
-    total.decode_secs += tail.decode_secs;
-    total
-}
-
 /// One KV slot: its cache (moved OUT while a request holds it, so the generation gets the
 /// `&mut Option<SeamKv>` the runner wants without holding the pool lock), plus the bookkeeping the
 /// prefix-match/LRU policy needs.
@@ -200,6 +187,9 @@ struct Pool {
 /// A checked-out slot. Returns its KV to the pool on drop — including on error or panic, so a
 /// failed request can never permanently burn a slot.
 enum BatchEvent {
+    Progress {
+        progress: infr_core::GenerationProgress,
+    },
     Token {
         id: u32,
         progress: infr_core::GenerationProgress,
@@ -207,14 +197,6 @@ enum BatchEvent {
     Complete {
         kv: SeamKv,
         stats: GenStats,
-    },
-    Fallback {
-        kv: SeamKv,
-        prompt: Vec<u32>,
-        max_new: usize,
-        stats: GenStats,
-        prefilled: bool,
-        turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
     },
     Failed {
         kv: SeamKv,
@@ -225,11 +207,27 @@ enum BatchEvent {
 impl BatchEvent {
     fn into_kv(self) -> Option<SeamKv> {
         match self {
-            Self::Token { .. } => None,
-            Self::Complete { kv, .. } | Self::Fallback { kv, .. } | Self::Failed { kv, .. } => {
-                Some(kv)
-            }
+            Self::Progress { .. } | Self::Token { .. } => None,
+            Self::Complete { kv, .. } | Self::Failed { kv, .. } => Some(kv),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchPhase {
+    Unprepared,
+    ShortPrefill,
+    LongPrefill,
+    Decode,
+}
+
+fn phase_for_remaining_prefill(tokens: usize) -> BatchPhase {
+    if tokens == 0 {
+        BatchPhase::Decode
+    } else if tokens <= SHORT_PREFILL_TOKENS {
+        BatchPhase::ShortPrefill
+    } else {
+        BatchPhase::LongPrefill
     }
 }
 
@@ -237,13 +235,33 @@ struct BatchWork {
     slot: usize,
     kv: Option<SeamKv>,
     prompt: Vec<u32>,
+    prompt_end: usize,
     max_new: usize,
     generated: usize,
     stats: GenStats,
-    prefilled: bool,
+    phase: BatchPhase,
+    prefill_start: usize,
+    checkpoint_boundary: Option<usize>,
     turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
+    finished: bool,
     sampler: Option<ParallelSampler>,
     channels: Option<BatchChannels>,
+}
+
+impl BatchWork {
+    fn kv(&self) -> &SeamKv {
+        self.kv.as_ref().expect("batch work owns a KV slot")
+    }
+
+    fn remaining_prefill(&self) -> usize {
+        self.prompt_end
+            .saturating_sub(1)
+            .saturating_sub(self.kv().cached_len())
+    }
+
+    fn next_qsa_position(&self) -> usize {
+        self.kv().cached_len() + 1
+    }
 }
 
 struct BatchChannels {
@@ -254,28 +272,23 @@ struct BatchChannels {
 #[derive(Default)]
 struct DecodeBatchQueue {
     running: bool,
-    /// Batch-eligible requests registered before checkout/prefill but not yet ready for decode.
-    prefilling: usize,
+    /// Eligible requests registered before tokenization/checkout but not yet ready for scheduling.
+    arriving: usize,
     waiting: VecDeque<BatchWork>,
-    prefill_waiting: VecDeque<BatchWork>,
 }
 
-fn should_wait_for_decode_peers(prefilling: usize, ready_peers: usize) -> bool {
-    prefilling > 0 && ready_peers + 1 < MAX_DECODE_BATCH
-}
-
-struct BatchPrefillRegistration<'a> {
+struct BatchRegistration<'a> {
     engine: &'a ParallelSeam,
     active: bool,
 }
 
-impl<'a> BatchPrefillRegistration<'a> {
+impl<'a> BatchRegistration<'a> {
     fn new(engine: &'a ParallelSeam) -> Self {
         engine
             .decode_batch
             .lock()
             .expect("decode batch queue poisoned")
-            .prefilling += 1;
+            .arriving += 1;
         Self {
             engine,
             active: true,
@@ -284,12 +297,12 @@ impl<'a> BatchPrefillRegistration<'a> {
 
     fn arrive(&mut self, queue: &mut DecodeBatchQueue) {
         debug_assert!(self.active);
-        queue.prefilling = queue.prefilling.saturating_sub(1);
+        queue.arriving = queue.arriving.saturating_sub(1);
         self.active = false;
     }
 }
 
-impl Drop for BatchPrefillRegistration<'_> {
+impl Drop for BatchRegistration<'_> {
     fn drop(&mut self) {
         if !self.active {
             return;
@@ -298,7 +311,7 @@ impl Drop for BatchPrefillRegistration<'_> {
             Ok(queue) => queue,
             Err(error) => error.into_inner(),
         };
-        queue.prefilling = queue.prefilling.saturating_sub(1);
+        queue.arriving = queue.arriving.saturating_sub(1);
         drop(queue);
         self.engine.decode_ready.notify_all();
     }
@@ -1189,27 +1202,6 @@ impl ParallelSeam {
         }
     }
 
-    fn fallback_batch_work(&self, mut work: BatchWork) {
-        let kv = work.kv.take().expect("queued decode work owns a KV slot");
-        let Some(channels) = work.channels.take() else {
-            self.return_detached_slot(work.slot, kv);
-            return;
-        };
-        let remaining = work.max_new.saturating_sub(work.generated);
-        self.deliver_batch_state(
-            work.slot,
-            channels.events,
-            BatchEvent::Fallback {
-                kv,
-                prompt: work.prompt,
-                max_new: remaining,
-                stats: work.stats,
-                prefilled: work.prefilled,
-                turn_checkpoint: work.turn_checkpoint,
-            },
-        );
-    }
-
     fn fail_batch_work(&self, mut work: BatchWork, error: &str) {
         let kv = work.kv.take().expect("active decode work owns a KV slot");
         let Some(channels) = work.channels.take() else {
@@ -1245,68 +1237,99 @@ impl ParallelSeam {
         );
     }
 
-    /// End this cohort and release requests that arrived after its depth was fixed.
-    fn close_decode_batch(&self) {
+    /// End the scheduler. A normal close has already drained every queued request; an error close
+    /// returns the same failure to work that arrived while the active graph was unwinding.
+    fn close_decode_batch(&self, error: Option<&str>) {
         let waiting = {
             let mut queue = self
                 .decode_batch
                 .lock()
                 .expect("decode batch queue poisoned");
             queue.running = false;
-            let mut waiting = queue.waiting.drain(..).collect::<Vec<_>>();
-            waiting.extend(queue.prefill_waiting.drain(..));
+            let waiting = queue.waiting.drain(..).collect::<Vec<_>>();
             self.batch_interrupt.store(false, Ordering::Release);
             waiting
         };
         for work in waiting {
-            self.fallback_batch_work(work);
+            if let Some(error) = error {
+                self.fail_batch_work(work, error);
+            } else {
+                self.fail_batch_work(work, "parallel scheduler closed with queued work");
+            }
         }
     }
 
-    fn take_pending_batch_work(&self, active: &[BatchWork]) -> Vec<BatchWork> {
-        if active.is_empty() || !self.batch_interrupt.swap(false, Ordering::AcqRel) {
+    fn take_pending_batch_work(&self, capacity: usize, force: bool) -> Vec<BatchWork> {
+        if capacity == 0 || (!force && !self.batch_interrupt.swap(false, Ordering::AcqRel)) {
             return Vec::new();
         }
-        let sparse = self.qsa_sparse_at(active[0].prompt.len());
-        let (accepted, fallback) = {
+        let accepted = {
             let mut queue = self
                 .decode_batch
                 .lock()
                 .expect("decode batch queue poisoned");
-            let mut candidates = queue.waiting.drain(..).collect::<Vec<_>>();
-            candidates.extend(queue.prefill_waiting.drain(..));
-            let mut accepted = Vec::new();
-            let mut fallback = Vec::new();
-            for work in candidates {
-                if active.len() + accepted.len() < MAX_DECODE_BATCH
-                    && (!work.prefilled || self.qsa_sparse_at(work.prompt.len()) == sparse)
-                {
-                    accepted.push(work);
-                } else {
-                    fallback.push(work);
-                }
+            let take = capacity.min(queue.waiting.len());
+            let accepted = queue.waiting.drain(..take).collect::<Vec<_>>();
+            if !queue.waiting.is_empty() {
+                self.batch_interrupt.store(true, Ordering::Release);
             }
-            (accepted, fallback)
+            accepted
         };
         if !accepted.is_empty() {
             tracing::debug!(
                 lanes = accepted.len(),
-                prefill_lanes = accepted.iter().filter(|work| !work.prefilled).count(),
-                "admitting work into the active generation cohort"
+                "admitting work into the unified Qwen3.8 scheduler"
             );
-        }
-        for work in fallback {
-            self.fallback_batch_work(work);
         }
         accepted
     }
 
-    fn batch_frontier_ready(&self, kv: &SeamKv, prompt: &[u32]) -> bool {
-        self.model.config().qwen4exp && kv.cached_len() + 1 == prompt.len()
+    fn take_initial_batch_peers(&self, capacity: usize) -> Vec<BatchWork> {
+        if capacity == 0 {
+            return Vec::new();
+        }
+        let queue = self
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned");
+        let (mut queue, _) = self
+            .decode_ready
+            .wait_timeout_while(queue, DECODE_BATCH_WAIT, |queue| {
+                queue.arriving > 0 && queue.waiting.len() < capacity
+            })
+            .expect("decode batch queue poisoned");
+        let take = capacity.min(queue.waiting.len());
+        let peers = queue.waiting.drain(..take).collect::<Vec<_>>();
+        self.batch_interrupt
+            .store(!queue.waiting.is_empty(), Ordering::Release);
+        peers
     }
 
-    fn batch_qsa_sparse(&self, kv: &SeamKv) -> bool {
-        self.qsa_sparse_at(kv.cached_len() + 1)
+    /// Called only after the active set becomes empty. It either atomically hands queued work to
+    /// the existing leader or marks the scheduler idle, so a racing request can never be stranded
+    /// behind `running=true` with no worker.
+    fn refill_batch_or_close(&self) -> Option<Vec<BatchWork>> {
+        let queue = self
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned");
+        let (mut queue, _) = self
+            .decode_ready
+            .wait_timeout_while(queue, DECODE_BATCH_WAIT, |queue| {
+                queue.waiting.is_empty() && queue.arriving > 0
+            })
+            .expect("decode batch queue poisoned");
+        if queue.waiting.is_empty() {
+            queue.running = false;
+            self.batch_interrupt.store(false, Ordering::Release);
+            None
+        } else {
+            let take = MAX_DECODE_BATCH.min(queue.waiting.len());
+            let work = queue.waiting.drain(..take).collect::<Vec<_>>();
+            self.batch_interrupt
+                .store(!queue.waiting.is_empty(), Ordering::Release);
+            Some(work)
+        }
     }
 
     fn qsa_sparse_at(&self, visible_tokens: usize) -> bool {
@@ -1325,91 +1348,21 @@ impl ParallelSeam {
         cfg.indexer_top_k + ratio - 1
     }
 
-    fn retain_decode_mode(&self, active: Vec<BatchWork>) -> Vec<BatchWork> {
-        let Some(first) = active.first() else {
-            return active;
-        };
-        let sparse = self.qsa_sparse_at(first.prompt.len());
-        let mut compatible = Vec::with_capacity(active.len());
-        let mut fallback = Vec::new();
-        for (lane, work) in active.into_iter().enumerate() {
-            if lane == 0 || self.qsa_sparse_at(work.prompt.len()) == sparse {
-                compatible.push(work);
-            } else {
-                fallback.push(work);
-            }
-        }
-        if !fallback.is_empty() {
-            tracing::debug!(
-                kept = compatible.len(),
-                deferred = fallback.len(),
-                sparse,
-                "split generation cohort at the QSA mode boundary"
-            );
-        }
-        for work in fallback {
-            self.fallback_batch_work(work);
-        }
-        compatible
-    }
-
-    fn decode_steps_before_qsa_boundary(&self, active: &[BatchWork]) -> usize {
+    fn token_steps_before_qsa_boundary<'a>(
+        &self,
+        active: impl IntoIterator<Item = &'a BatchWork>,
+    ) -> usize {
         let threshold = self.qsa_threshold();
         active
-            .iter()
-            .filter(|work| !self.qsa_sparse_at(work.prompt.len()))
+            .into_iter()
+            .filter(|work| !self.qsa_sparse_at(work.next_qsa_position()))
             .map(|work| {
                 threshold
-                    .saturating_sub(work.prompt.len())
+                    .saturating_sub(work.next_qsa_position())
                     .saturating_add(1)
             })
             .min()
             .unwrap_or(usize::MAX)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn continue_after_prefill<F: FnMut(&str)>(
-        &self,
-        guard: &mut SlotGuard<'_>,
-        prompt: &[u32],
-        max_new: usize,
-        req: &RequestCtx,
-        acc: &mut Vec<u32>,
-        printed: &mut usize,
-        on_piece: &mut F,
-        stats: GenStats,
-        prompt_accounted: bool,
-        turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
-    ) -> Result<GenStats> {
-        if max_new == 0 || crate::sampling::abort_requested(Some(req)) {
-            return Ok(stats);
-        }
-        let (_, tail) = crate::seam::generate_dense_vulkan_session(
-            self.vk.as_ref(),
-            self.model.gguf(),
-            self.model.config(),
-            self.model.engine_cfg(),
-            self.model.embd(),
-            self.model.per_layer_embd(),
-            prompt,
-            max_new,
-            |id| crate::stream_token(self.model.tokenizer(), acc, printed, id, on_piece),
-            &mut guard.kv,
-            self.max_ctx,
-            turn_checkpoint,
-            None,
-            Some(req),
-            None,
-        )?;
-        if prompt_accounted {
-            Ok(GenStats {
-                n_gen: stats.n_gen.saturating_add(tail.n_gen),
-                decode_secs: stats.decode_secs + tail.decode_secs,
-                ..stats
-            })
-        } else {
-            Ok(merge_stats(stats, tail))
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1434,6 +1387,7 @@ impl ParallelSeam {
                 }
             };
             match event {
+                BatchEvent::Progress { progress } => req.report_progress(progress),
                 BatchEvent::Token { id, progress } => {
                     req.report_progress(progress);
                     let keep_going = if crate::sampling::abort_requested(Some(req)) {
@@ -1448,28 +1402,6 @@ impl ParallelSeam {
                     guard.reattach(kv);
                     return Ok(stats);
                 }
-                BatchEvent::Fallback {
-                    kv,
-                    prompt,
-                    max_new,
-                    stats,
-                    prefilled,
-                    turn_checkpoint,
-                } => {
-                    guard.reattach(kv);
-                    return self.continue_after_prefill(
-                        guard,
-                        &prompt,
-                        max_new,
-                        req,
-                        acc,
-                        printed,
-                        on_piece,
-                        stats,
-                        prefilled,
-                        turn_checkpoint,
-                    );
-                }
                 BatchEvent::Failed { kv, error } => {
                     guard.reattach(kv);
                     return Err(anyhow!(error));
@@ -1478,325 +1410,79 @@ impl ParallelSeam {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn run_prefill_batch(
-        &self,
-        leader: BatchWork,
-        peers: Vec<BatchWork>,
-        leader_guard: &mut SlotGuard<'_>,
-        req: &RequestCtx,
-        leader_on_token: &mut dyn FnMut(u32) -> bool,
-    ) -> Result<GenStats> {
-        let mut active = Vec::with_capacity(1 + peers.len());
-        active.push(leader);
-        active.extend(peers);
-        let (active, leader_result) =
-            self.prepare_prefill_work(active, leader_guard, req, leader_on_token, None)?;
-        if active.is_empty() {
-            return leader_result
-                .ok_or_else(|| anyhow!("mixed prefill completed without a leader result"));
+    fn prepare_unified_work(&self, work: &mut BatchWork, req: &RequestCtx) -> Result<()> {
+        if work.phase != BatchPhase::Unprepared {
+            return Ok(());
         }
-        self.run_decode_work(active, leader_guard, req, leader_on_token, leader_result)
+        let checkpoint = work.turn_checkpoint.take();
+        let prepared = {
+            let _gate = req.gate_pass();
+            crate::seam::prepare_dense_vulkan_parallel_prompt_session(
+                self.vk.as_ref(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                work.kv.as_mut().expect("unprepared work owns a KV slot"),
+                &work.prompt[..work.prompt_end],
+                checkpoint,
+            )?
+        };
+        work.prefill_start = prepared.start;
+        work.checkpoint_boundary = prepared.checkpoint_boundary;
+        work.stats.n_prompt = work
+            .stats
+            .n_prompt
+            .saturating_add(work.prompt_end.saturating_sub(prepared.start));
+        work.stats.n_cached = work.stats.n_cached.saturating_add(prepared.start);
+        work.phase = phase_for_remaining_prefill(work.remaining_prefill());
+        tracing::debug!(
+            slot = work.slot,
+            start = prepared.start,
+            prompt_tokens = work.prompt_end,
+            remaining = work.remaining_prefill(),
+            phase = ?work.phase,
+            "prepared work for the unified Qwen3.8 scheduler"
+        );
+        Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_prefill_work(
-        &self,
-        mut active: Vec<BatchWork>,
-        leader_guard: &mut SlotGuard<'_>,
-        req: &RequestCtx,
-        leader_on_token: &mut dyn FnMut(u32) -> bool,
-        mut leader_result: Option<GenStats>,
-    ) -> Result<(Vec<BatchWork>, Option<GenStats>)> {
-        let prompts = active
+    fn run_long_prefill_phase(&self, active: &mut Vec<BatchWork>, req: &RequestCtx) -> Result<()> {
+        let mut long = Vec::new();
+        let mut token_work = Vec::with_capacity(active.len());
+        for work in active.drain(..) {
+            if work.phase == BatchPhase::LongPrefill {
+                long.push(work);
+            } else {
+                token_work.push(work);
+            }
+        }
+        *active = token_work;
+        if long.is_empty() {
+            return Ok(());
+        }
+
+        let prompts = long
             .iter()
-            .map(|work| work.prompt.clone())
+            .map(|work| work.prompt[..work.prompt_end].to_vec())
             .collect::<Vec<_>>();
-        let turn_checkpoints = active
+        let prepared = long
             .iter()
-            .map(|work| work.turn_checkpoint)
+            .map(|work| crate::seam::PreparedParallelPrompt {
+                start: work.prefill_start,
+                checkpoint_boundary: work.checkpoint_boundary,
+            })
             .collect::<Vec<_>>();
-        let mut primary = active[0].kv.take();
-        let mut peer_kv = active
+        let mut primary = long[0].kv.take();
+        let mut peers = long
             .iter_mut()
             .skip(1)
-            .map(|work| work.kv.take().expect("prefill lane owns a KV slot"))
+            .map(|work| work.kv.take().expect("long prefill work owns a KV slot"))
             .collect::<Vec<_>>();
-        let mut samplers = active
-            .iter_mut()
-            .map(|work| work.sampler.take().expect("prefill lane owns a sampler"))
-            .collect::<Vec<_>>();
-        let prefilled = crate::seam::generate_dense_vulkan_parallel_prefill_session(
-            self.vk.as_ref(),
-            self.model.gguf(),
-            self.model.config(),
-            self.model.engine_cfg(),
-            self.model.embd(),
-            self.model.per_layer_embd(),
-            &prompts,
-            &mut primary,
-            &mut peer_kv,
-            self.max_ctx,
-            &turn_checkpoints,
-            &mut samplers,
-            Some(req),
-        );
-
-        active[0].kv = primary;
-        for (work, kv) in active.iter_mut().skip(1).zip(peer_kv) {
-            work.kv = Some(kv);
-        }
-        for (work, sampler) in active.iter_mut().zip(samplers) {
-            work.sampler = Some(sampler);
-        }
-
-        let (prefill_stats, mixed_outputs) = match prefilled {
-            Ok((stats, outputs))
-                if stats.len() == active.len() && outputs.len() == active.len() =>
-            {
-                (stats, outputs)
-            }
-            Ok((stats, outputs)) => {
-                let message = format!(
-                    "parallel prefill returned {} stats and {} output lanes for {} active lanes",
-                    stats.len(),
-                    outputs.len(),
-                    active.len()
-                );
-                for mut work in active {
-                    work.kv
-                        .as_mut()
-                        .expect("invalid prefill lane owns a KV slot")
-                        .reset();
-                    if work.channels.is_none() {
-                        leader_guard.reattach(
-                            work.kv
-                                .take()
-                                .expect("invalid prefill leader owns a KV slot"),
-                        );
-                    } else {
-                        self.fail_batch_work(work, &message);
-                    }
-                }
-                return Err(anyhow!(message));
-            }
-            Err(error) => {
-                let message = error.to_string();
-                for mut work in active {
-                    if work.channels.is_none() {
-                        leader_guard.reattach(
-                            work.kv
-                                .take()
-                                .expect("failed prefill leader owns a KV slot"),
-                        );
-                    } else {
-                        self.fail_batch_work(work, &message);
-                    }
-                }
-                return Err(error);
-            }
-        };
-
-        for (work, mut stats) in active.iter_mut().zip(prefill_stats) {
-            if work.prefilled {
-                stats.n_prompt = 0;
-                stats.n_cached = 0;
-                stats.prompt_secs = 0.0;
-            }
-            work.stats = merge_stats(work.stats, stats);
-            work.prefilled = true;
-            work.turn_checkpoint = None;
-        }
-        let cfg = self.model.config();
-        let mut next = Vec::with_capacity(active.len());
-        for (mut work, output) in active.into_iter().zip(mixed_outputs) {
-            let Some(token) = output else {
-                next.push(work);
-                continue;
-            };
-            let request_prompt_tokens = work.prompt.len().saturating_sub(work.generated);
-            work.generated += 1;
-            let progress = self.batch_decode_progress(
-                request_prompt_tokens,
-                work.stats.n_cached,
-                work.generated,
-            );
-            let eos = !self.model.engine_cfg().sampling.ignore_eos
-                && (cfg.eos_ids.contains(&token) || token == cfg.eos);
-            let accepted = if eos {
-                false
-            } else if let Some(channels) = work.channels.as_mut() {
-                channels
-                    .events
-                    .send(BatchEvent::Token {
-                        id: token,
-                        progress,
-                    })
-                    .is_ok()
-                    && channels.acknowledgements.recv().unwrap_or(false)
-            } else {
-                req.report_progress(progress);
-                leader_on_token(token)
-            };
-            if eos || !accepted || work.generated >= work.max_new {
-                if work.channels.is_none() {
-                    leader_guard.reattach(
-                        work.kv
-                            .take()
-                            .expect("completed mixed leader owns a KV slot"),
-                    );
-                    leader_result = Some(work.stats);
-                } else {
-                    self.complete_batch_work(work);
-                }
-            } else {
-                work.prompt.push(token);
-                next.push(work);
-            }
-        }
-        let active = next;
-        if active.is_empty() {
-            return Ok((active, leader_result));
-        }
-        if active.iter().any(|work| {
-            !work
-                .kv
-                .as_ref()
-                .is_some_and(|kv| self.batch_frontier_ready(kv, &work.prompt))
-        }) {
-            let message = "parallel prefill stopped before every lane reached its decode frontier";
-            for mut work in active {
-                work.kv
-                    .as_mut()
-                    .expect("incomplete prefill lane owns a KV slot")
-                    .reset();
-                if work.channels.is_none() {
-                    leader_guard.reattach(
-                        work.kv
-                            .take()
-                            .expect("incomplete prefill leader owns a KV slot"),
-                    );
-                } else {
-                    self.fail_batch_work(work, message);
-                }
-            }
-            return Err(anyhow!(message));
-        }
-
-        Ok((active, leader_result))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_decode_batch(
-        &self,
-        leader: BatchWork,
-        peers: Vec<BatchWork>,
-        leader_guard: &mut SlotGuard<'_>,
-        req: &RequestCtx,
-        leader_on_token: &mut dyn FnMut(u32) -> bool,
-    ) -> Result<GenStats> {
-        let mut active = Vec::with_capacity(1 + peers.len());
-        active.push(leader);
-        active.extend(peers);
-        self.run_decode_work(active, leader_guard, req, leader_on_token, None)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_decode_work(
-        &self,
-        mut active: Vec<BatchWork>,
-        leader_guard: &mut SlotGuard<'_>,
-        req: &RequestCtx,
-        leader_on_token: &mut dyn FnMut(u32) -> bool,
-        mut leader_result: Option<GenStats>,
-    ) -> Result<GenStats> {
-        while !active.is_empty() {
-            active = self.retain_decode_mode(active);
-            let pending = self.take_pending_batch_work(&active);
-            if !pending.is_empty() {
-                active.extend(pending);
-                (active, leader_result) = self.prepare_prefill_work(
-                    active,
-                    leader_guard,
-                    req,
-                    leader_on_token,
-                    leader_result,
-                )?;
-                if active.is_empty() {
-                    return leader_result.ok_or_else(|| {
-                        anyhow!("dynamic decode cohort completed without a leader result")
-                    });
-                }
-                continue;
-            }
-            let steps = active
-                .iter()
-                .map(|work| work.max_new.saturating_sub(work.generated))
-                .min()
-                .unwrap_or(0);
-            let steps = steps.min(self.decode_steps_before_qsa_boundary(&active));
-            if steps == 0 {
-                return Err(anyhow!("parallel decode cohort contains exhausted work"));
-            }
-            let lanes = active.len();
-            let prompts = active
-                .iter()
-                .map(|work| work.prompt.clone())
-                .collect::<Vec<_>>();
-            let mut primary = active[0].kv.take();
-            let mut peer_kv = active
-                .iter_mut()
-                .skip(1)
-                .map(|work| work.kv.take().expect("active lane owns a KV slot"))
-                .collect::<Vec<_>>();
-            let mut samplers = active
-                .iter_mut()
-                .map(|work| work.sampler.take().expect("active lane owns a sampler"))
-                .collect::<Vec<_>>();
-            let mut lane_io = active
-                .iter_mut()
-                .map(|work| work.channels.take())
-                .collect::<Vec<_>>();
-            let progress_bases = active
-                .iter()
-                .map(|work| {
-                    (
-                        work.prompt.len().saturating_sub(work.generated),
-                        work.stats.n_cached,
-                        work.generated,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let mut streamed = vec![0usize; lanes];
-            let mut accepted = vec![true; lanes];
-            let mut stream = |lane: usize, id: u32| {
-                streamed[lane] += 1;
-                let (prompt_tokens, cached_prompt_tokens, generated) = progress_bases[lane];
-                let progress = self.batch_decode_progress(
-                    prompt_tokens,
-                    cached_prompt_tokens,
-                    generated.saturating_add(streamed[lane]),
-                );
-                let keep_going = match lane_io.get_mut(lane) {
-                    Some(None) => {
-                        req.report_progress(progress);
-                        leader_on_token(id)
-                    }
-                    Some(Some(channels)) => {
-                        channels
-                            .events
-                            .send(BatchEvent::Token { id, progress })
-                            .is_ok()
-                            && channels.acknowledgements.recv().unwrap_or(false)
-                    }
-                    None => false,
-                };
-                if let Some(accepted) = accepted.get_mut(lane) {
-                    *accepted = keep_going;
-                }
-                keep_going
-            };
-            let decoded = crate::seam::generate_dense_vulkan_parallel_sampled_session(
+        let result = {
+            // Long prefill owns the pager phase as one transaction. Passing no RequestCtx below
+            // avoids per-chunk baton release and prevents unrelated legacy work from rebuilding
+            // Decode LRU between ring chunks.
+            let _gate = req.gate_pass();
+            crate::seam::generate_dense_vulkan_parallel_prefill_session(
                 self.vk.as_ref(),
                 self.model.gguf(),
                 self.model.config(),
@@ -1804,99 +1490,380 @@ impl ParallelSeam {
                 self.model.embd(),
                 self.model.per_layer_embd(),
                 &prompts,
-                steps,
                 &mut primary,
-                &mut peer_kv,
+                &mut peers,
                 self.max_ctx,
-                &mut samplers,
-                &mut stream,
-                Some(&self.batch_interrupt),
-                Some(req),
-            );
-
-            active[0].kv = primary;
-            for (work, kv) in active.iter_mut().skip(1).zip(peer_kv) {
-                work.kv = Some(kv);
-            }
-            for (work, sampler) in active.iter_mut().zip(samplers) {
-                work.sampler = Some(sampler);
-            }
-            for (work, io) in active.iter_mut().zip(lane_io) {
-                if let Some(channels) = io {
-                    work.channels = Some(channels);
-                }
-            }
-
-            let (outputs, batch_stats) = match decoded {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    let message = error.to_string();
-                    for mut work in std::mem::take(&mut active) {
-                        if work.channels.is_none() {
-                            leader_guard
-                                .reattach(work.kv.take().expect("failed leader owns a KV slot"));
-                        } else {
-                            self.fail_batch_work(work, &message);
-                        }
-                    }
-                    if let Some(stats) = leader_result {
-                        tracing::warn!(%error, "decode batch failed after the leader completed");
-                        return Ok(stats);
-                    }
-                    return Err(error);
-                }
-            };
-            if outputs.len() != lanes || outputs.iter().any(Vec::is_empty) {
-                let message = format!(
-                    "parallel decode returned {} output lanes for {lanes} active lanes",
-                    outputs.len()
-                );
-                for mut work in std::mem::take(&mut active) {
-                    if work.channels.is_none() {
-                        leader_guard.reattach(
-                            work.kv
-                                .take()
-                                .expect("invalid leader output owns a KV slot"),
-                        );
-                    } else {
-                        self.fail_batch_work(work, &message);
-                    }
-                }
-                return Err(anyhow!(message));
-            }
-
-            let cfg = self.model.config();
-            let mut next = Vec::with_capacity(lanes);
-            for (lane, (mut work, output)) in std::mem::take(&mut active)
-                .into_iter()
-                .zip(outputs)
-                .enumerate()
-            {
-                work.generated += output.len();
-                work.stats.n_gen += output.len();
-                work.stats.decode_secs += batch_stats.decode_secs;
-                work.prompt.extend_from_slice(&output);
-                let eos = output.last().is_some_and(|token| {
-                    !self.model.engine_cfg().sampling.ignore_eos
-                        && (cfg.eos_ids.contains(token) || *token == cfg.eos)
-                });
-                let done = eos || !accepted[lane] || work.generated >= work.max_new;
-                if done {
-                    if work.channels.is_none() {
-                        leader_guard
-                            .reattach(work.kv.take().expect("completed leader owns a KV slot"));
-                        leader_result = Some(work.stats);
-                    } else {
-                        self.complete_batch_work(work);
-                    }
-                } else {
-                    next.push(work);
-                }
-            }
-            active = next;
+                &prepared,
+                None,
+            )
+        };
+        long[0].kv = primary;
+        for (work, kv) in long.iter_mut().skip(1).zip(peers) {
+            work.kv = Some(kv);
         }
 
-        leader_result.ok_or_else(|| anyhow!("parallel decode completed without a leader result"))
+        let stats = match result {
+            Ok(stats) if stats.len() == long.len() => stats,
+            Ok(stats) => {
+                active.extend(long);
+                return Err(anyhow!(
+                    "parallel prefill returned {} stats for {} lanes",
+                    stats.len(),
+                    prompts.len()
+                ));
+            }
+            Err(error) => {
+                active.extend(long);
+                return Err(error);
+            }
+        };
+        if long
+            .iter()
+            .any(|work| work.kv().cached_len() + 1 != work.prompt_end)
+        {
+            active.extend(long);
+            return Err(anyhow!(
+                "parallel long prefill stopped before every lane reached its decode frontier"
+            ));
+        }
+        for (work, stats) in long.iter_mut().zip(stats) {
+            work.stats.prompt_secs += stats.prompt_secs;
+            work.phase = BatchPhase::Decode;
+            work.checkpoint_boundary = None;
+            let progress = infr_core::GenerationProgress {
+                phase: infr_core::GenerationPhase::Prefill,
+                prompt_tokens: work.prompt_end as u64,
+                cached_prompt_tokens: work.prefill_start as u64,
+                prefill_tokens: work.prompt_end.saturating_sub(work.prefill_start) as u64,
+                completion_tokens: 0,
+                context_tokens: work.prompt_end.saturating_sub(1) as u64,
+                context_limit: self.max_ctx as u64,
+            };
+            if let Some(channels) = work.channels.as_ref() {
+                let _ = channels.events.send(BatchEvent::Progress { progress });
+            } else {
+                req.report_progress(progress);
+            }
+        }
+        tracing::debug!(
+            lanes = long.len(),
+            "completed one exclusive long-prefill phase"
+        );
+        active.extend(long);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_token_group(
+        &self,
+        active: &mut [BatchWork],
+        indices: &[usize],
+        quantum: usize,
+        req: &RequestCtx,
+        leader_on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<()> {
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let max_steps = indices
+            .iter()
+            .map(|&index| {
+                let work = &active[index];
+                work.remaining_prefill()
+                    .saturating_add(work.max_new.saturating_sub(work.generated))
+            })
+            .min()
+            .unwrap_or(0)
+            .min(self.token_steps_before_qsa_boundary(indices.iter().map(|&index| &active[index])))
+            .min(quantum);
+        if max_steps == 0 {
+            return Err(anyhow!("parallel token group contains exhausted work"));
+        }
+
+        let prompts = indices
+            .iter()
+            .map(|&index| active[index].prompt.clone())
+            .collect::<Vec<_>>();
+        let prompt_ends = indices
+            .iter()
+            .map(|&index| active[index].prompt_end)
+            .collect::<Vec<_>>();
+        let checkpoints = indices
+            .iter()
+            .map(|&index| active[index].checkpoint_boundary)
+            .collect::<Vec<_>>();
+        let mut primary = active[indices[0]].kv.take();
+        let mut peers = indices[1..]
+            .iter()
+            .map(|&index| {
+                active[index]
+                    .kv
+                    .take()
+                    .expect("parallel token work owns a KV slot")
+            })
+            .collect::<Vec<_>>();
+        let mut samplers = indices
+            .iter()
+            .map(|&index| {
+                active[index]
+                    .sampler
+                    .take()
+                    .expect("parallel token work owns a sampler")
+            })
+            .collect::<Vec<_>>();
+        let mut channels = indices
+            .iter()
+            .map(|&index| active[index].channels.take())
+            .collect::<Vec<_>>();
+        let progress_bases = indices
+            .iter()
+            .map(|&index| {
+                let work = &active[index];
+                (work.prompt_end, work.prefill_start, work.generated)
+            })
+            .collect::<Vec<_>>();
+        let mut streamed = vec![0usize; indices.len()];
+        let mut accepted = vec![true; indices.len()];
+        let mut stream = |lane: usize, id: u32| {
+            streamed[lane] += 1;
+            let (prompt_tokens, cached_prompt_tokens, generated) = progress_bases[lane];
+            let progress = self.batch_decode_progress(
+                prompt_tokens,
+                cached_prompt_tokens,
+                generated.saturating_add(streamed[lane]),
+            );
+            let keep_going = match channels.get_mut(lane) {
+                Some(None) => {
+                    req.report_progress(progress);
+                    leader_on_token(id)
+                }
+                Some(Some(channels)) => {
+                    channels
+                        .events
+                        .send(BatchEvent::Token { id, progress })
+                        .is_ok()
+                        && channels.acknowledgements.recv().unwrap_or(false)
+                }
+                None => false,
+            };
+            accepted[lane] = keep_going;
+            keep_going
+        };
+        let result = crate::seam::generate_dense_vulkan_parallel_sampled_session(
+            self.vk.as_ref(),
+            self.model.gguf(),
+            self.model.config(),
+            self.model.engine_cfg(),
+            self.model.embd(),
+            self.model.per_layer_embd(),
+            &prompts,
+            &prompt_ends,
+            &checkpoints,
+            max_steps,
+            &mut primary,
+            &mut peers,
+            self.max_ctx,
+            &mut samplers,
+            &mut stream,
+            Some(&self.batch_interrupt),
+            Some(req),
+        );
+
+        active[indices[0]].kv = primary;
+        for (&index, kv) in indices[1..].iter().zip(peers) {
+            active[index].kv = Some(kv);
+        }
+        for (&index, sampler) in indices.iter().zip(samplers) {
+            active[index].sampler = Some(sampler);
+        }
+        for (&index, channel) in indices.iter().zip(channels) {
+            active[index].channels = channel;
+        }
+
+        let (outputs, prompt_secs, decode_secs) = result?;
+        if outputs.len() != indices.len()
+            || prompt_secs.len() != indices.len()
+            || decode_secs.len() != indices.len()
+        {
+            return Err(anyhow!(
+                "parallel token runner returned inconsistent lane counts"
+            ));
+        }
+        let cfg = self.model.config();
+        for (lane, &index) in indices.iter().enumerate() {
+            let work = &mut active[index];
+            work.stats.prompt_secs += prompt_secs[lane];
+            work.stats.decode_secs += decode_secs[lane];
+            work.generated += outputs[lane].len();
+            work.stats.n_gen += outputs[lane].len();
+            work.prompt.extend_from_slice(&outputs[lane]);
+            if work
+                .checkpoint_boundary
+                .is_some_and(|boundary| work.kv().cached_len() >= boundary)
+            {
+                work.checkpoint_boundary = None;
+            }
+            work.phase = phase_for_remaining_prefill(work.remaining_prefill());
+            let eos = outputs[lane].last().is_some_and(|token| {
+                !self.model.engine_cfg().sampling.ignore_eos
+                    && (cfg.eos_ids.contains(token) || *token == cfg.eos)
+            });
+            work.finished = eos || !accepted[lane] || work.generated >= work.max_new;
+
+            if work.phase == BatchPhase::ShortPrefill {
+                let progress = infr_core::GenerationProgress {
+                    phase: infr_core::GenerationPhase::Prefill,
+                    prompt_tokens: work.prompt_end as u64,
+                    cached_prompt_tokens: work.prefill_start as u64,
+                    prefill_tokens: work.kv().cached_len().saturating_sub(work.prefill_start)
+                        as u64,
+                    completion_tokens: work.generated as u64,
+                    context_tokens: work.kv().cached_len() as u64,
+                    context_limit: self.max_ctx as u64,
+                };
+                if let Some(channels) = work.channels.as_ref() {
+                    if channels
+                        .events
+                        .send(BatchEvent::Progress { progress })
+                        .is_err()
+                    {
+                        work.finished = true;
+                    }
+                } else {
+                    req.report_progress(progress);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_finished_work(
+        &self,
+        active: &mut Vec<BatchWork>,
+        leader_guard: &mut SlotGuard<'_>,
+        leader_result: &mut Option<GenStats>,
+    ) {
+        for index in (0..active.len()).rev() {
+            if !active[index].finished {
+                continue;
+            }
+            let mut work = active.remove(index);
+            if work.channels.is_none() {
+                leader_guard.reattach(
+                    work.kv
+                        .take()
+                        .expect("completed scheduler leader owns a KV slot"),
+                );
+                *leader_result = Some(work.stats);
+            } else {
+                self.complete_batch_work(work);
+            }
+        }
+    }
+
+    fn fail_unified_scheduler(
+        &self,
+        active: &mut Vec<BatchWork>,
+        leader_guard: &mut SlotGuard<'_>,
+        leader_result: Option<GenStats>,
+        error: anyhow::Error,
+    ) -> Result<GenStats> {
+        let message = error.to_string();
+        for mut work in active.drain(..) {
+            if work.channels.is_none() {
+                leader_guard.reattach(
+                    work.kv
+                        .take()
+                        .expect("failed scheduler leader owns a KV slot"),
+                );
+            } else {
+                self.fail_batch_work(work, &message);
+            }
+        }
+        self.close_decode_batch(Some(&message));
+        if let Some(stats) = leader_result {
+            tracing::warn!(%error, "parallel scheduler failed after its leader completed");
+            Ok(stats)
+        } else {
+            Err(error)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_unified_batch(
+        &self,
+        leader: BatchWork,
+        peers: Vec<BatchWork>,
+        leader_guard: &mut SlotGuard<'_>,
+        req: &RequestCtx,
+        leader_on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<GenStats> {
+        let mut active = Vec::with_capacity(MAX_DECODE_BATCH);
+        active.push(leader);
+        active.extend(peers);
+        let mut leader_result = None;
+
+        loop {
+            let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
+            active.extend(self.take_pending_batch_work(capacity, false));
+            if active.is_empty() {
+                match self.refill_batch_or_close() {
+                    Some(work) => active = work,
+                    None => {
+                        return leader_result.ok_or_else(|| {
+                            anyhow!("unified scheduler completed without a leader result")
+                        })
+                    }
+                }
+            }
+
+            for work in &mut active {
+                if let Err(error) = self.prepare_unified_work(work, req) {
+                    return self.fail_unified_scheduler(
+                        &mut active,
+                        leader_guard,
+                        leader_result,
+                        error,
+                    );
+                }
+            }
+
+            if active
+                .iter()
+                .any(|work| work.phase == BatchPhase::LongPrefill)
+            {
+                if let Err(error) = self.run_long_prefill_phase(&mut active, req) {
+                    return self.fail_unified_scheduler(
+                        &mut active,
+                        leader_guard,
+                        leader_result,
+                        error,
+                    );
+                }
+                continue;
+            }
+
+            let mut groups = [Vec::new(), Vec::new()];
+            for (index, work) in active.iter().enumerate() {
+                groups[usize::from(self.qsa_sparse_at(work.next_qsa_position()))].push(index);
+            }
+            let qsa_groups = groups.iter().filter(|indices| !indices.is_empty()).count();
+            let quantum = if qsa_groups > 1 { 16 } else { usize::MAX };
+            for mut indices in groups {
+                indices.sort_by_key(|&index| std::cmp::Reverse(active[index].remaining_prefill()));
+                if let Err(error) =
+                    self.run_token_group(&mut active, &indices, quantum, req, leader_on_token)
+                {
+                    return self.fail_unified_scheduler(
+                        &mut active,
+                        leader_guard,
+                        leader_result,
+                        error,
+                    );
+                }
+            }
+            self.retire_finished_work(&mut active, leader_guard, &mut leader_result);
+        }
     }
 
     pub fn render_chat_messages(&self, messages: &[(&str, &str)]) -> Result<String> {
@@ -1916,8 +1883,9 @@ impl ParallelSeam {
         self.generate_turn(prompt, None, max_new, constraint, req, on_piece)
     }
 
-    /// [`generate`](Self::generate) with a stable rendered-history prefix for recurrent state
-    /// checkpointing. Attention-only models ignore the resulting boundary in the runner.
+    /// Generate one turn through the authoritative Qwen3.8 scheduler. Eligible requests register
+    /// before tokenization, then stay owned by this queue from KV reconciliation through their
+    /// final decode token; they never fall back to the legacy per-request StepGate path.
     pub fn generate_turn(
         &self,
         prompt: &str,
@@ -1927,151 +1895,25 @@ impl ParallelSeam {
         req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
     ) -> Result<GenStats> {
-        let prompt_tokens = self.model.encode(prompt)?;
-        let turn_checkpoint = self.model.turn_checkpoint(&prompt_tokens, stable_prefix)?;
-        // Cap the reply to the context actually left in THIS slot (a per-slot ctx is smaller than
-        // the model's trained window under `-np N`), mirroring the sequential session path: a
-        // generation ceiling is a default, not a demand. An over-long PROMPT still errors cleanly
-        // in the runner.
-        let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
-        let batch_candidate = self.model.config().qwen4exp
+        let initially_eligible = self.model.config().qwen4exp
             && constraint.is_none()
             && self.gate.is_some()
             && max_new > 0;
-        // Register before checkout: a peer already at the frontier should know that another
-        // eligible request is on its way through restore/prefill.
-        let mut batch_prefill = batch_candidate.then(|| BatchPrefillRegistration::new(self));
-        let mut guard = self.checkout(&prompt_tokens, req)?;
-        let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
-        // Resolve `ubatch_rows`/`kv_auto_q8` against THIS engine's pins for the decode (warm calls
-        // must agree with the buffers placement sized). Concurrent requests share the one cell.
-        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
-        if batch_candidate {
-            let sampler = ParallelSampler::new(req, &self.model.engine_cfg().sampling);
-            let mut queue = self
-                .decode_batch
-                .lock()
-                .expect("decode batch queue poisoned");
-            if queue.running {
-                let (event_tx, event_rx) = mpsc::sync_channel(0);
-                let (ack_tx, ack_rx) = mpsc::sync_channel(0);
-                let slot = guard.idx;
-                let kv = guard.detach();
-                queue.prefill_waiting.push_back(BatchWork {
-                    slot,
-                    kv: Some(kv),
-                    prompt: prompt_tokens,
-                    max_new,
-                    generated: 0,
-                    stats: GenStats::default(),
-                    prefilled: false,
-                    turn_checkpoint,
-                    sampler: Some(sampler),
-                    channels: Some(BatchChannels {
-                        events: event_tx,
-                        acknowledgements: ack_rx,
-                    }),
-                });
-                self.batch_interrupt.store(true, Ordering::Release);
-                self.decode_ready.notify_all();
-                drop(queue);
-                drop(batch_prefill.take());
-                return self.wait_for_decode_batch(
-                    &mut guard,
-                    event_rx,
-                    ack_tx,
-                    req,
-                    &mut acc,
-                    &mut printed,
-                    &mut on_piece,
-                );
-            }
-
-            queue.running = true;
-            let (mut queue, _) = self
-                .decode_ready
-                .wait_timeout_while(queue, PREFILL_BATCH_WAIT, |queue| {
-                    queue.waiting.is_empty() && queue.prefill_waiting.is_empty()
-                })
-                .expect("decode batch queue poisoned");
-            let leader_sparse = self.qsa_sparse_at(prompt_tokens.len());
-            let (peers, fallback) = {
-                let mut peers = Vec::new();
-                let mut fallback = Vec::new();
-                let mut candidates = queue.waiting.drain(..).collect::<Vec<_>>();
-                candidates.extend(queue.prefill_waiting.drain(..));
-                for work in candidates {
-                    if peers.len() + 1 < MAX_DECODE_BATCH
-                        && (!work.prefilled
-                            || self.qsa_sparse_at(work.prompt.len()) == leader_sparse)
-                        && work.kv.as_ref().is_some_and(|kv| {
-                            !work.prefilled || self.batch_frontier_ready(kv, &work.prompt)
-                        })
-                    {
-                        peers.push(work);
-                    } else {
-                        fallback.push(work);
-                    }
-                }
-                if peers.is_empty() || crate::sampling::abort_requested(Some(req)) {
-                    queue.running = false;
-                } else {
-                    batch_prefill
-                        .as_mut()
-                        .expect("batch candidate registered before cohort collection")
-                        .arrive(&mut queue);
-                }
-                self.batch_interrupt.store(false, Ordering::Release);
-                (peers, fallback)
-            };
-            drop(queue);
-            for work in fallback {
-                self.fallback_batch_work(work);
-            }
-
-            if !peers.is_empty() && !crate::sampling::abort_requested(Some(req)) {
-                drop(batch_prefill.take());
-                tracing::debug!(
-                    lanes = peers.len() + 1,
-                    "collected layer-synchronous prefill cohort"
-                );
-                let leader = BatchWork {
-                    slot: guard.idx,
-                    kv: Some(guard.detach()),
-                    prompt: prompt_tokens,
-                    max_new,
-                    generated: 0,
-                    stats: GenStats::default(),
-                    prefilled: false,
-                    turn_checkpoint,
-                    sampler: Some(sampler),
-                    channels: None,
-                };
-                let mut leader_stream = |id| {
-                    if crate::sampling::abort_requested(Some(req)) {
-                        return false;
-                    }
-                    crate::stream_token(
-                        self.model.tokenizer(),
-                        &mut acc,
-                        &mut printed,
-                        id,
-                        &mut on_piece,
-                    );
-                    !crate::sampling::abort_requested(Some(req))
-                };
-                let result =
-                    self.run_prefill_batch(leader, peers, &mut guard, req, &mut leader_stream);
-                self.close_decode_batch();
-                return result;
-            }
-            for work in peers {
-                self.fallback_batch_work(work);
-            }
-        }
+        let mut registration = initially_eligible.then(|| BatchRegistration::new(self));
+        let prompt_tokens = self.model.encode(prompt)?;
+        let turn_checkpoint = self.model.turn_checkpoint(&prompt_tokens, stable_prefix)?;
+        let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let batch_candidate = initially_eligible && max_new > 0;
         if !batch_candidate {
-            let (_ids, stats) = crate::seam::generate_dense_vulkan_session(
+            drop(registration.take());
+        }
+
+        let mut guard = self.checkout(&prompt_tokens, req)?;
+        let mut acc = Vec::new();
+        let mut printed = 0usize;
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
+        if !batch_candidate {
+            let (_, stats) = crate::seam::generate_dense_vulkan_session(
                 self.vk.as_ref(),
                 self.model.gguf(),
                 self.model.config(),
@@ -2099,57 +1941,17 @@ impl ParallelSeam {
             return Ok(stats);
         }
 
-        // No cohort was ready during the short admission window. Establish this prompt's frontier
-        // independently, then either join the active cohort or lead a new one. An active cohort can
-        // also admit this request before this point through `prefill_waiting` above.
-        let (_ids, prefill_stats) = crate::seam::generate_dense_vulkan_session(
-            self.vk.as_ref(),
-            self.model.gguf(),
-            self.model.config(),
-            self.model.engine_cfg(),
-            self.model.embd(),
-            self.model.per_layer_embd(),
-            &prompt_tokens,
-            0,
-            |_| {},
-            &mut guard.kv,
-            self.max_ctx,
-            turn_checkpoint,
-            None,
-            Some(req),
-            None,
-        )?;
-        if crate::sampling::abort_requested(Some(req))
-            || !guard
-                .kv
-                .as_ref()
-                .is_some_and(|kv| self.batch_frontier_ready(kv, &prompt_tokens))
-        {
-            drop(batch_prefill.take());
-            return self.continue_after_prefill(
-                &mut guard,
-                &prompt_tokens,
-                max_new,
-                req,
-                &mut acc,
-                &mut printed,
-                &mut on_piece,
-                prefill_stats,
-                false,
-                None,
-            );
-        }
-
         let sampler = ParallelSampler::new(req, &self.model.engine_cfg().sampling);
         let mut queue = self
             .decode_batch
             .lock()
             .expect("decode batch queue poisoned");
-        batch_prefill
+        registration
             .as_mut()
-            .expect("batch candidate registered before prefill")
+            .expect("eligible request registered before tokenization")
             .arrive(&mut queue);
-        drop(batch_prefill.take());
+        drop(registration.take());
+
         if queue.running {
             let (event_tx, event_rx) = mpsc::sync_channel(0);
             let (ack_tx, ack_rx) = mpsc::sync_channel(0);
@@ -2158,12 +1960,16 @@ impl ParallelSeam {
             queue.waiting.push_back(BatchWork {
                 slot,
                 kv: Some(kv),
+                prompt_end: prompt_tokens.len(),
                 prompt: prompt_tokens,
                 max_new,
                 generated: 0,
-                stats: prefill_stats,
-                prefilled: true,
-                turn_checkpoint: None,
+                stats: GenStats::default(),
+                phase: BatchPhase::Unprepared,
+                prefill_start: 0,
+                checkpoint_boundary: None,
+                turn_checkpoint,
+                finished: false,
                 sampler: Some(sampler),
                 channels: Some(BatchChannels {
                     events: event_tx,
@@ -2184,82 +1990,23 @@ impl ParallelSeam {
             );
         }
 
-        // The first ready request leads this cohort. It only waits while registered work is truly
-        // still reaching the frontier, so a lone request pays no unconditional batching delay.
         queue.running = true;
-        let (mut queue, _) = self
-            .decode_ready
-            .wait_timeout_while(queue, DECODE_BATCH_WAIT, |queue| {
-                should_wait_for_decode_peers(
-                    queue.prefilling,
-                    queue.waiting.len() + queue.prefill_waiting.len(),
-                )
-            })
-            .expect("decode batch queue poisoned");
-
-        let leader_kv = guard.kv.as_ref().expect("checked-out leader has a KV slot");
-        let depth = leader_kv.cached_len();
-        let leader_sparse = self.batch_qsa_sparse(leader_kv);
-        let (peers, fallback) = {
-            let mut peers = Vec::new();
-            let mut fallback = Vec::new();
-            let mut candidates = queue.waiting.drain(..).collect::<Vec<_>>();
-            candidates.extend(queue.prefill_waiting.drain(..));
-            for work in candidates {
-                let compatible = peers.len() + 1 < MAX_DECODE_BATCH
-                    && work.kv.as_ref().is_some_and(|kv| {
-                        (!work.prefilled || self.batch_frontier_ready(kv, &work.prompt))
-                            && (!work.prefilled
-                                || self.qsa_sparse_at(work.prompt.len()) == leader_sparse)
-                    });
-                if compatible {
-                    peers.push(work);
-                } else {
-                    fallback.push(work);
-                }
-            }
-            self.batch_interrupt.store(false, Ordering::Release);
-            (peers, fallback)
-        };
+        self.batch_interrupt.store(false, Ordering::Release);
         drop(queue);
-        for work in fallback {
-            self.fallback_batch_work(work);
-        }
-        let needs_prefill = peers.iter().any(|work| !work.prefilled);
-        tracing::debug!(
-            depth,
-            lanes = peers.len() + 1,
-            needs_prefill,
-            "collected parallel generation cohort"
-        );
-        if crate::sampling::abort_requested(Some(req)) {
-            self.close_decode_batch();
-            for work in peers {
-                self.fallback_batch_work(work);
-            }
-            return self.continue_after_prefill(
-                &mut guard,
-                &prompt_tokens,
-                max_new,
-                req,
-                &mut acc,
-                &mut printed,
-                &mut on_piece,
-                prefill_stats,
-                false,
-                None,
-            );
-        }
-
+        let peers = self.take_initial_batch_peers(MAX_DECODE_BATCH - 1);
         let leader = BatchWork {
             slot: guard.idx,
             kv: Some(guard.detach()),
+            prompt_end: prompt_tokens.len(),
             prompt: prompt_tokens,
             max_new,
             generated: 0,
-            stats: prefill_stats,
-            prefilled: true,
-            turn_checkpoint: None,
+            stats: GenStats::default(),
+            phase: BatchPhase::Unprepared,
+            prefill_start: 0,
+            checkpoint_boundary: None,
+            turn_checkpoint,
+            finished: false,
             sampler: Some(sampler),
             channels: None,
         };
@@ -2276,13 +2023,7 @@ impl ParallelSeam {
             );
             !crate::sampling::abort_requested(Some(req))
         };
-        let result = if needs_prefill {
-            self.run_prefill_batch(leader, peers, &mut guard, req, &mut leader_stream)
-        } else {
-            self.run_decode_batch(leader, peers, &mut guard, req, &mut leader_stream)
-        };
-        self.close_decode_batch();
-        result
+        self.run_unified_batch(leader, peers, &mut guard, req, &mut leader_stream)
     }
 
     /// Generate one Qwen3.8 vision turn. Projector execution is completed by the caller before
@@ -2376,15 +2117,22 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_multimodal_prompt, pick_continuation, should_wait_for_decode_peers,
-        MultimodalEmbedding, MAX_DECODE_BATCH,
+        expand_multimodal_prompt, phase_for_remaining_prefill, pick_continuation, BatchPhase,
+        MultimodalEmbedding, SHORT_PREFILL_TOKENS,
     };
 
     #[test]
-    fn decode_cohort_waits_only_for_registered_capacity() {
-        assert!(!should_wait_for_decode_peers(0, 0));
-        assert!(should_wait_for_decode_peers(1, 0));
-        assert!(!should_wait_for_decode_peers(1, MAX_DECODE_BATCH - 1));
+    fn short_prefill_boundary_is_inclusive_at_96_tokens() {
+        assert_eq!(phase_for_remaining_prefill(0), BatchPhase::Decode);
+        assert_eq!(phase_for_remaining_prefill(1), BatchPhase::ShortPrefill);
+        assert_eq!(
+            phase_for_remaining_prefill(SHORT_PREFILL_TOKENS),
+            BatchPhase::ShortPrefill
+        );
+        assert_eq!(
+            phase_for_remaining_prefill(SHORT_PREFILL_TOKENS + 1),
+            BatchPhase::LongPrefill
+        );
     }
 
     #[test]

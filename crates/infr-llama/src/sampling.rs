@@ -461,6 +461,22 @@ impl ParallelSampler {
         (self.sampler.temp <= 0.0 || self.sampler.top_k == 1) && self.penalties.is_none()
     }
 
+    /// Whether a one-row parallel graph may bake `graph_sampler` into `Op::Sample`. The graph is
+    /// built from the scheduler driver's `RequestCtx`, so a surviving peer with request-local
+    /// overrides must fall back to host sampling unless its effective parameters are identical.
+    pub(crate) fn can_gpu_sample_with(&self, graph_sampler: Sampler) -> bool {
+        self.sampler.temp > 0.0
+            && self.penalties.is_none()
+            && self.sampler.temp.to_bits() == graph_sampler.temp.to_bits()
+            && self.sampler.top_k == graph_sampler.top_k
+            && self.sampler.top_p.to_bits() == graph_sampler.top_p.to_bits()
+    }
+
+    /// Draw from this lane's own stream for a device-side inverse-CDF sample.
+    pub(crate) fn next_uniform(&mut self) -> f32 {
+        next_uniform(&mut self.rng)
+    }
+
     pub(crate) fn sample(&mut self, logits: &mut [f32]) -> u32 {
         if let Some(penalties) = self.penalties.as_ref() {
             penalties.apply(logits);
@@ -945,6 +961,31 @@ mod tests {
                 "batched lane diverged from the ordinary sampler at step {step}"
             );
         }
+    }
+
+    #[test]
+    fn one_row_gpu_sampling_keeps_lane_parameters_and_rng() {
+        let req = RequestCtx::new(cfg(1.0, 42));
+        let baked = Sampler::resolve(Some(&req), &scfg());
+        let mut lane = ParallelSampler::new(&req, &scfg());
+        assert!(lane.can_gpu_sample_with(baked));
+
+        let mut expected_rng = resolve_seed(Some(&req), &scfg());
+        assert_eq!(lane.next_uniform(), next_uniform(&mut expected_rng));
+
+        assert!(!lane.can_gpu_sample_with(Sampler {
+            top_p: 0.9,
+            ..baked
+        }));
+
+        let penalized = RequestCtx::new(RequestSampling {
+            temp: Some(1.0),
+            seed: Some(42),
+            presence_penalty: 0.25,
+            ..Default::default()
+        });
+        let penalized_baked = Sampler::resolve(Some(&penalized), &scfg());
+        assert!(!ParallelSampler::new(&penalized, &scfg()).can_gpu_sample_with(penalized_baked));
     }
 
     /// Penalties are per-sequence state (their token history is), and a sequence that sets none must
