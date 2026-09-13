@@ -406,9 +406,9 @@ enum Cmd {
         /// Concurrent generation slots (llama-server's `-np`). N requests generate at once, each
         /// with its own KV cache, taking turns on the GPU at token granularity; the (N+1)'th queues.
         ///
-        /// Each slot owns a full KV cache, so the DEFAULT per-slot context is the VRAM-fit window
-        /// divided by N: the N slots together stay inside the same VRAM budget one slot is held to,
-        /// and raising `-np` can never OOM a box that `-np 1` fit. The visible cost is a smaller
+        /// Each slot owns independent KV/recurrent state, so the DEFAULT per-slot context is solved
+        /// against all N states plus one shared runtime workspace. Raising `-np` cannot OOM a box
+        /// that `-np 1` fit; the visible cost can be a smaller
         /// per-request window. Pass `--ctx` to pin the per-slot window instead (then `N * ctx` must
         /// fit, and the Vulkan budget guard will say so if it doesn't).
         /// `--np` is accepted as an alias (llama-server spells this `-np`; clap shorts are a single
@@ -4517,8 +4517,8 @@ fn cmd_serve(
     if is_vulkan {
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
         // `--ctx` (or INFR_CTX) is the PER-SLOT window: an explicit token count is used verbatim,
-        // a `%` is a fraction of the whole device's KV capacity split across the slots, and unset
-        // derives it from the VRAM fit divided by N. See `SeamModel::vulkan_slot_ctx`.
+        // a `%` is a fraction of the fitted per-slot context after all slot state is priced, and
+        // unset derives the maximum safe per-slot context. See `SeamModel::vulkan_slot_ctx`.
         let want_ctx = cfg.device.ctx;
         let t0 = std::time::Instant::now();
         let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;

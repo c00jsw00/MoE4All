@@ -147,6 +147,14 @@ impl SegmentedKvLayout {
             .sum()
     }
 
+    /// Logical bytes represented by the planes before 32K physical-segment rounding.
+    pub(crate) fn logical_bytes(&self) -> u64 {
+        self.planes
+            .iter()
+            .map(|plane| plane.spec(self.max_ctx).logical_bytes as u64)
+            .sum()
+    }
+
     pub(crate) fn plane(&self, layer: usize, kind: PlaneKind) -> Option<PlaneLayout> {
         self.planes
             .iter()

@@ -453,6 +453,10 @@ pub(crate) struct SeamKv {
     /// prefill only the prior visible answer plus the new user turn, even when chat-history
     /// normalization makes the newly rendered prompt diverge from `cached`.
     pub(super) turn_recurrent_ckpt: Option<TurnRecurrentCkpt>,
+    /// Additional serve slots whose persistent device allocations were materialized beside slot
+    /// 0 before the unified arena consumed the measured remainder. Startup drains this vector
+    /// immediately; ordinary one-shot/session paths always keep it empty.
+    pub(super) preallocated_siblings: Vec<SeamKv>,
 }
 
 #[derive(Default)]
@@ -825,6 +829,10 @@ pub(crate) struct SeamWeights {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamKv {
+    pub(crate) fn take_preallocated_siblings(&mut self) -> Vec<SeamKv> {
+        std::mem::take(&mut self.preallocated_siblings)
+    }
+
     /// The context this slot's KV cache was allocated for — the AUTHORITY on a session's window,
     /// because the cold init may have re-clamped the caller's `want_ctx` against the device's live
     /// free memory (`crate::seam::reclamp_ctx_to_live_room`). A caller that keeps its own copy
@@ -1215,6 +1223,27 @@ impl SeamKv {
                 }
             }
         }
+        let ple_state_buf = if cfg.qwen4exp {
+            let hist = (cfg.ple_conv_kernel - 1) * cfg.ple_ngram_size;
+            Some(
+                be.alloc(hist * cfg.hc_mult * cfg.n_embd * 4, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
+        let mut turn_recurrent_ckpt = None;
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
+            TurnRecurrentCkpt::begin(
+                &mut turn_recurrent_ckpt,
+                be,
+                cfg,
+                &kbufs,
+                &vbufs,
+                ple_state_buf.as_deref(),
+                &[],
+            )?;
+        }
         Ok(SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
             stable: std::sync::Arc::clone(&self.stable),
@@ -1263,15 +1292,7 @@ impl SeamKv {
             } else {
                 None
             },
-            ple_state_buf: if cfg.qwen4exp {
-                let hist = (cfg.ple_conv_kernel - 1) * cfg.ple_ngram_size;
-                Some(
-                    be.alloc(hist * cfg.hc_mult * cfg.n_embd * 4, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                )
-            } else {
-                None
-            },
+            ple_state_buf,
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
@@ -1290,7 +1311,8 @@ impl SeamKv {
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
-            turn_recurrent_ckpt: None,
+            turn_recurrent_ckpt,
+            preallocated_siblings: Vec::new(),
         })
     }
 

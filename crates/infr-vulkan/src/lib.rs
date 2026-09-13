@@ -6332,9 +6332,9 @@ impl Backend for VulkanBackend {
     }
 
     fn alloc_segmented_kv(&self, spec: SegmentedKvSpec) -> Result<Option<Box<dyn Buffer>>> {
-        if self.unified_vram().is_none() {
-            return Ok(None);
-        }
+        // The lightweight address table is a persistent session allocation and may be created
+        // before the unified arena is finalized. Physical segments are still impossible to commit
+        // until `ensure_segmented_kv*`, which validates and claims from the installed arena.
         Ok(Some(Box::new(self.make_segmented_kv(spec)?)))
     }
 

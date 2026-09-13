@@ -419,6 +419,272 @@ pub(super) struct DecodeHandles {
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
+/// One serve slot with every pool-external, session-lifetime allocation already materialized.
+/// Segmented KV payload and LLM runtime buffers are attached only after the unified arena has been
+/// sized from the device's then-current free room.
+struct PendingSeamSlot {
+    kbufs: Vec<Option<Box<dyn Buffer>>>,
+    vbufs: Vec<Option<Box<dyn Buffer>>>,
+    qsa_kbufs: Vec<Option<Box<dyn Buffer>>>,
+    qsa_cbufs: Vec<Option<Box<dyn Buffer>>>,
+    hidden_buf: Box<dyn Buffer>,
+    pos_buf: Box<dyn Buffer>,
+    ipl_buf: Option<Box<dyn Buffer>>,
+    logits_buf: Box<dyn Buffer>,
+    ple_embd_buf: Option<Box<dyn Buffer>>,
+    ple_state_buf: Option<Box<dyn Buffer>>,
+    turn_recurrent_ckpt: Option<TurnRecurrentCkpt>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_pending_seam_slot(
+    be: &dyn Backend,
+    cfg: &Config,
+    ec: &EngineConfig,
+    want_ctx: usize,
+    kv_ring: bool,
+    k_fmt: DType,
+    v_fmt: DType,
+    segmented_layout: Option<&SegmentedKvLayout>,
+    e2b: bool,
+    gpu_ple: bool,
+    checkpoint: bool,
+) -> AResult<PendingSeamSlot> {
+    let mut kbufs = Vec::with_capacity(cfg.n_layer);
+    let mut vbufs = Vec::with_capacity(cfg.n_layer);
+    let mut qsa_kbufs = Vec::with_capacity(cfg.n_layer);
+    let mut qsa_cbufs = Vec::with_capacity(cfg.n_layer);
+    for layer in 0..cfg.n_layer {
+        let (k_bytes, v_bytes) = super::layer_state_bytes(
+            cfg,
+            layer,
+            want_ctx,
+            kv_ring,
+            super::ubatch_rows(ec),
+            k_fmt,
+            v_fmt,
+        );
+        let k_segmented =
+            segmented_layout.is_some_and(|layout| layout.plane(layer, PlaneKind::K).is_some());
+        kbufs.push(if k_segmented {
+            Some(alloc_segmented_plane(
+                be,
+                segmented_layout.expect("segmented K has a layout"),
+                layer,
+                PlaneKind::K,
+            )?)
+        } else {
+            Some(
+                be.alloc(k_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        });
+        let v_segmented =
+            segmented_layout.is_some_and(|layout| layout.plane(layer, PlaneKind::V).is_some());
+        vbufs.push(if v_segmented {
+            Some(alloc_segmented_plane(
+                be,
+                segmented_layout.expect("segmented V has a layout"),
+                layer,
+                PlaneKind::V,
+            )?)
+        } else {
+            Some(
+                be.alloc(v_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        });
+
+        let qsa_bytes = super::qsa_raw_cache_bytes(cfg, layer, want_ctx);
+        qsa_kbufs.push(if qsa_bytes > 0 {
+            Some(if let Some(layout) = segmented_layout {
+                alloc_segmented_plane(be, layout, layer, PlaneKind::QsaRaw)?
+            } else {
+                be.alloc(qsa_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?
+            })
+        } else {
+            None
+        });
+        let qsa_comp_bytes = super::qsa_block_cache_bytes(cfg, layer, want_ctx);
+        qsa_cbufs.push(if qsa_comp_bytes > 0 {
+            Some(if let Some(layout) = segmented_layout {
+                alloc_segmented_plane(be, layout, layer, PlaneKind::QsaBlock)?
+            } else {
+                be.alloc(qsa_comp_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?
+            })
+        } else {
+            None
+        });
+    }
+
+    let ple_state_buf = if cfg.qwen4exp {
+        let hist = (cfg.ple_conv_kernel - 1) * cfg.ple_ngram_size;
+        Some(
+            be.alloc(hist * cfg.hc_mult * cfg.n_embd * 4, BufferUsage::KvCache)
+                .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+    let mut turn_recurrent_ckpt = None;
+    if checkpoint && (cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3) {
+        TurnRecurrentCkpt::begin_before_dynamic_kv(
+            &mut turn_recurrent_ckpt,
+            be,
+            cfg,
+            &kbufs,
+            &vbufs,
+            ple_state_buf.as_deref(),
+            &[],
+        )?;
+    }
+
+    let npl = cfg.n_embd_per_layer.max(1);
+    let hidden_buf = be
+        .alloc(cfg.n_embd * 4, BufferUsage::Staging)
+        .map_err(|e| anyhow!("{e}"))?;
+    let pos_buf = be
+        .alloc(4, BufferUsage::Staging)
+        .map_err(|e| anyhow!("{e}"))?;
+    let ipl_buf = if e2b && !gpu_ple {
+        Some(
+            be.alloc(cfg.n_layer * npl * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+    let logits_buf = be
+        .alloc(cfg.vocab * 4, BufferUsage::Readback)
+        .map_err(|e| anyhow!("{e}"))?;
+    let ple_embd_buf = if cfg.qwen4exp {
+        let heads = (cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram;
+        Some(
+            be.alloc(heads * cfg.ple_head_dim * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(PendingSeamSlot {
+        kbufs,
+        vbufs,
+        qsa_kbufs,
+        qsa_cbufs,
+        hidden_buf,
+        pos_buf,
+        ipl_buf,
+        logits_buf,
+        ple_embd_buf,
+        ple_state_buf,
+        turn_recurrent_ckpt,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_pending_seam_slot(
+    mut pending: PendingSeamSlot,
+    be: &dyn Backend,
+    cfg: &Config,
+    weights: std::sync::Arc<SeamWeights>,
+    stable: std::sync::Arc<SessionStable>,
+    segmented_layout: Option<&SegmentedKvLayout>,
+    k_fmt: DType,
+    v_fmt: DType,
+    want_ctx: usize,
+    kv_ring: bool,
+) -> AResult<SeamKv> {
+    if let Some(layout) = segmented_layout {
+        for layer in 0..cfg.n_layer {
+            if pending.kbufs[layer].is_none() && layout.plane(layer, PlaneKind::K).is_some() {
+                pending.kbufs[layer] =
+                    Some(alloc_segmented_plane(be, layout, layer, PlaneKind::K)?);
+            }
+            if pending.vbufs[layer].is_none() && layout.plane(layer, PlaneKind::V).is_some() {
+                pending.vbufs[layer] =
+                    Some(alloc_segmented_plane(be, layout, layer, PlaneKind::V)?);
+            }
+            if pending.qsa_kbufs[layer].is_none()
+                && super::qsa_raw_cache_bytes(cfg, layer, want_ctx) > 0
+            {
+                pending.qsa_kbufs[layer] =
+                    Some(alloc_segmented_plane(be, layout, layer, PlaneKind::QsaRaw)?);
+            }
+            if pending.qsa_cbufs[layer].is_none()
+                && super::qsa_block_cache_bytes(cfg, layer, want_ctx) > 0
+            {
+                pending.qsa_cbufs[layer] = Some(alloc_segmented_plane(
+                    be,
+                    layout,
+                    layer,
+                    PlaneKind::QsaBlock,
+                )?);
+            }
+        }
+    }
+    let kbufs = pending
+        .kbufs
+        .into_iter()
+        .enumerate()
+        .map(|(layer, buffer)| {
+            buffer.ok_or_else(|| anyhow!("layer {layer} K/state buffer was not allocated"))
+        })
+        .collect::<AResult<Vec<_>>>()?;
+    let vbufs = pending
+        .vbufs
+        .into_iter()
+        .enumerate()
+        .map(|(layer, buffer)| {
+            buffer.ok_or_else(|| anyhow!("layer {layer} V/state buffer was not allocated"))
+        })
+        .collect::<AResult<Vec<_>>>()?;
+
+    Ok(SeamKv {
+        weights,
+        stable,
+        kbufs,
+        vbufs,
+        qsa_kbufs: pending.qsa_kbufs,
+        qsa_cbufs: pending.qsa_cbufs,
+        segmented_kv: if segmented_layout.is_some() {
+            SegmentedKvState::enabled()
+        } else {
+            SegmentedKvState::default()
+        },
+        k_fmt,
+        v_fmt,
+        hidden_buf: pending.hidden_buf,
+        pos_buf: pending.pos_buf,
+        ipl_buf: pending.ipl_buf,
+        logits_buf: pending.logits_buf,
+        qwen_wide_buf: if cfg.qwen4exp {
+            Some(
+                be.alloc(cfg.hc_mult * cfg.n_embd * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        },
+        ple_embd_buf: pending.ple_embd_buf,
+        ple_state_buf: pending.ple_state_buf,
+        max_ctx: want_ctx,
+        kv_ring,
+        cached: Vec::new(),
+        denoise_cache: None,
+        self_cond_w: None,
+        sc_embt: None,
+        sc_ping: None,
+        sc_ping_write: 0,
+        sc_temp_inv_buf: None,
+        mtp_delta_ckpt: None,
+        turn_recurrent_ckpt: pending.turn_recurrent_ckpt,
+        preallocated_siblings: Vec::new(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_backend(
@@ -1405,7 +1671,12 @@ pub(crate) fn generate_dense_backend(
                 .as_ref()
                 .is_some_and(|layout| layout.plane(l, PlaneKind::K).is_some());
             kbufs.push(if k_segmented {
-                None
+                Some(alloc_segmented_plane(
+                    be,
+                    segmented_layout.as_ref().expect("segmented K has a layout"),
+                    l,
+                    PlaneKind::K,
+                )?)
             } else {
                 Some(
                     be.alloc(k_bytes, BufferUsage::KvCache)
@@ -1416,7 +1687,12 @@ pub(crate) fn generate_dense_backend(
                 .as_ref()
                 .is_some_and(|layout| layout.plane(l, PlaneKind::V).is_some());
             vbufs.push(if v_segmented {
-                None
+                Some(alloc_segmented_plane(
+                    be,
+                    segmented_layout.as_ref().expect("segmented V has a layout"),
+                    l,
+                    PlaneKind::V,
+                )?)
             } else {
                 Some(
                     be.alloc(v_bytes, BufferUsage::KvCache)
@@ -1424,20 +1700,24 @@ pub(crate) fn generate_dense_backend(
                 )
             });
             let qsa_bytes = crate::seam::qsa_raw_cache_bytes(c, l, want_ctx);
-            qsa_kbufs.push(if qsa_bytes > 0 && segmented_layout.is_none() {
-                Some(
+            qsa_kbufs.push(if qsa_bytes > 0 {
+                Some(if let Some(layout) = segmented_layout.as_ref() {
+                    alloc_segmented_plane(be, layout, l, PlaneKind::QsaRaw)?
+                } else {
                     be.alloc(qsa_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                )
+                        .map_err(|e| anyhow!("{e}"))?
+                })
             } else {
                 None
             });
             let qsa_comp_bytes = crate::seam::qsa_block_cache_bytes(c, l, want_ctx);
-            qsa_cbufs.push(if qsa_comp_bytes > 0 && segmented_layout.is_none() {
-                Some(
+            qsa_cbufs.push(if qsa_comp_bytes > 0 {
+                Some(if let Some(layout) = segmented_layout.as_ref() {
+                    alloc_segmented_plane(be, layout, l, PlaneKind::QsaBlock)?
+                } else {
                     be.alloc(qsa_comp_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                )
+                        .map_err(|e| anyhow!("{e}"))?
+                })
             } else {
                 None
             });
@@ -1469,51 +1749,33 @@ pub(crate) fn generate_dense_backend(
             )?;
         }
 
-        if let Some(finish) = finish_fixed_allocations {
-            finish()?;
-            // The pager now exists and all deferred expert sources are registered, so the
-            // established host-tier preload can run unchanged.
-            be.finish_weight_load().map_err(|e| anyhow!("{e}"))?;
+        // A paged serve engine must make every sibling slot's pool-external lifetime allocation
+        // visible to the driver's live-budget query below. Their unified runtime storage is
+        // attached only after that query creates the arena.
+        let sibling_count = if pager_deferred {
+            super::placement_slots().saturating_sub(1) as usize
+        } else {
+            0
+        };
+        let mut pending_siblings = Vec::with_capacity(sibling_count);
+        for _ in 0..sibling_count {
+            pending_siblings.push(allocate_pending_seam_slot(
+                be,
+                c,
+                ec,
+                want_ctx,
+                kv_ring,
+                k_fmt,
+                v_fmt,
+                segmented_layout.as_ref(),
+                e2b,
+                gpu_ple,
+                turn_checkpoint.is_some(),
+            )?);
         }
 
-        // Dynamic planes allocate only lightweight address-table handles here. Their 32K physical
-        // segments are claimed lazily from the newly measured unified arena at context growth.
-        if let Some(layout) = segmented_layout.as_ref() {
-            for l in 0..c.n_layer {
-                if kbufs[l].is_none() && layout.plane(l, PlaneKind::K).is_some() {
-                    kbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::K)?);
-                }
-                if vbufs[l].is_none() && layout.plane(l, PlaneKind::V).is_some() {
-                    vbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::V)?);
-                }
-                if crate::seam::qsa_raw_cache_bytes(c, l, want_ctx) > 0 {
-                    qsa_kbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::QsaRaw)?);
-                }
-                if crate::seam::qsa_block_cache_bytes(c, l, want_ctx) > 0 {
-                    qsa_cbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::QsaBlock)?);
-                }
-            }
-        }
-        let kbufs: Vec<Box<dyn Buffer>> = kbufs
-            .into_iter()
-            .enumerate()
-            .map(|(layer, buffer)| {
-                buffer.ok_or_else(|| anyhow!("layer {layer} K/state buffer was not allocated"))
-            })
-            .collect::<AResult<_>>()?;
-        let vbufs: Vec<Box<dyn Buffer>> = vbufs
-            .into_iter()
-            .enumerate()
-            .map(|(layer, buffer)| {
-                buffer.ok_or_else(|| anyhow!("layer {layer} V/state buffer was not allocated"))
-            })
-            .collect::<AResult<_>>()?;
-
-        // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
-        // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
-        be.kv_overflow_report();
-
-        // ── per-step IO buffers ────────────────────────────────────────────────────────
+        // These persistent control buffers used to land after the measured arena had consumed the
+        // remainder. Allocate the real objects now so the final live-room query sees them.
         let hidden_buf = be
             .alloc(ne * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
@@ -1542,8 +1804,6 @@ pub(crate) fn generate_dense_backend(
             }
             None => None,
         };
-        // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
-        // (Host path only — `gpu_ple` gathers it on-device from the resident table.)
         let ipl_buf = if e2b && !gpu_ple {
             Some(
                 be.alloc(c.n_layer * npl * 4, BufferUsage::Staging)
@@ -1555,14 +1815,6 @@ pub(crate) fn generate_dense_backend(
         let logits_buf = be
             .alloc(c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
-        let qwen_wide_buf = if c.qwen4exp {
-            Some(
-                be.alloc(c.hc_mult * ne * 4, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
-            )
-        } else {
-            None
-        };
         let ple_embd_buf = if c.qwen4exp {
             let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
             Some(
@@ -1572,22 +1824,95 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
+
+        if let Some(finish) = finish_fixed_allocations {
+            finish()?;
+            // The pager now exists and all deferred expert sources are registered, so the
+            // established host-tier preload can run unchanged.
+            be.finish_weight_load().map_err(|e| anyhow!("{e}"))?;
+        }
+
+        // Dynamic planes allocate only lightweight address-table handles here. Their 32K physical
+        // segments are claimed lazily from the newly measured unified arena at context growth.
+        if let Some(layout) = segmented_layout.as_ref() {
+            for l in 0..c.n_layer {
+                if kbufs[l].is_none() && layout.plane(l, PlaneKind::K).is_some() {
+                    kbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::K)?);
+                }
+                if vbufs[l].is_none() && layout.plane(l, PlaneKind::V).is_some() {
+                    vbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::V)?);
+                }
+                if qsa_kbufs[l].is_none() && crate::seam::qsa_raw_cache_bytes(c, l, want_ctx) > 0 {
+                    qsa_kbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::QsaRaw)?);
+                }
+                if qsa_cbufs[l].is_none() && crate::seam::qsa_block_cache_bytes(c, l, want_ctx) > 0
+                {
+                    qsa_cbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::QsaBlock)?);
+                }
+            }
+        }
+        let kbufs: Vec<Box<dyn Buffer>> = kbufs
+            .into_iter()
+            .enumerate()
+            .map(|(layer, buffer)| {
+                buffer.ok_or_else(|| anyhow!("layer {layer} K/state buffer was not allocated"))
+            })
+            .collect::<AResult<_>>()?;
+        let vbufs: Vec<Box<dyn Buffer>> = vbufs
+            .into_iter()
+            .enumerate()
+            .map(|(layer, buffer)| {
+                buffer.ok_or_else(|| anyhow!("layer {layer} V/state buffer was not allocated"))
+            })
+            .collect::<AResult<_>>()?;
+
+        // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
+        // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
+        be.kv_overflow_report();
+
+        // ── per-step IO buffers ────────────────────────────────────────────────────────
+        // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
+        // (Host path only — `gpu_ple` gathers it on-device from the resident table.)
+        let qwen_wide_buf = if c.qwen4exp {
+            Some(
+                be.alloc(c.hc_mult * ne * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
         let ple_worker = super::ple::PleWorker::new(g, c)?.map(std::sync::Arc::new);
+        let weights = std::sync::Arc::new(SeamWeights {
+            wbufs,
+            wspecs,
+            rf_buf,
+            yff_buf,
+            layer_has_epb,
+            layer_fused_experts,
+            ple_worker,
+        });
+        let mut preallocated_siblings = Vec::with_capacity(pending_siblings.len());
+        for pending in pending_siblings {
+            preallocated_siblings.push(finish_pending_seam_slot(
+                pending,
+                be,
+                c,
+                std::sync::Arc::clone(&weights),
+                std::sync::Arc::clone(&stable),
+                segmented_layout.as_ref(),
+                k_fmt,
+                v_fmt,
+                want_ctx,
+                kv_ring,
+            )?);
+        }
         // Host DMA imports are optional aliases, but on WDDM they share finite driver allocation
         // capacity with real model buffers. Admit them only after the complete persistent session
         // shape exists; backends without such a lower tier keep the default no-op.
         be.finish_session_allocations()
             .map_err(|e| anyhow!("{e}"))?;
         *state = Some(SeamKv {
-            weights: std::sync::Arc::new(SeamWeights {
-                wbufs,
-                wspecs,
-                rf_buf,
-                yff_buf,
-                layer_has_epb,
-                layer_fused_experts,
-                ple_worker,
-            }),
+            weights,
             stable: std::sync::Arc::clone(&stable),
             kbufs,
             vbufs,
@@ -1618,6 +1943,7 @@ pub(crate) fn generate_dense_backend(
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
             turn_recurrent_ckpt,
+            preallocated_siblings,
         });
     }
     // A live append-only recurrent state wins when the new prompt extends it exactly. Otherwise
@@ -1677,6 +2003,7 @@ pub(crate) fn generate_dense_backend(
         sc_temp_inv_buf,
         mtp_delta_ckpt: _,
         turn_recurrent_ckpt,
+        preallocated_siblings: _,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,

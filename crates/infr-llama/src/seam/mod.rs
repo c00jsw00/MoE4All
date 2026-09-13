@@ -1220,6 +1220,18 @@ pub(crate) struct PlacementPins {
     /// the peak is a high-water mark and the reserve is fixed — so without a latch a server would
     /// repeat the same line on every request for as long as it runs.
     act_over_reserve_reported: std::sync::atomic::AtomicBool,
+    /// Number of independently stateful conversation slots owned by this engine. Weights and
+    /// execution workspace are shared; KV, recurrent state and rolling checkpoints are not.
+    slots: std::sync::atomic::AtomicUsize,
+}
+
+impl PlacementPins {
+    pub(crate) fn for_slots(slots: usize) -> Self {
+        Self {
+            slots: std::sync::atomic::AtomicUsize::new(slots.max(1)),
+            ..Self::default()
+        }
+    }
 }
 
 thread_local! {
@@ -1244,6 +1256,14 @@ fn with_placement_pins<R>(f: impl FnOnce(&PlacementPins) -> R) -> R {
         Some(p) => f(p),
         None => f(FALLBACK_PINS.get_or_init(|| std::sync::Arc::new(PlacementPins::default()))),
     })
+}
+
+fn placement_slots() -> u64 {
+    with_placement_pins(|pins| pins.slots.load(std::sync::atomic::Ordering::Relaxed).max(1) as u64)
+}
+
+fn total_slot_state_bytes(per_slot: u64) -> u64 {
+    per_slot.saturating_mul(placement_slots())
 }
 
 /// RAII guard binding `pins` as the current thread's placement scope. Every seam entry that runs a
@@ -1919,6 +1939,32 @@ pub(crate) fn segmented_kv_wanted(
         && !ec.kv.overflow
         && k_fmt == DType::Q8_0
         && v_fmt == DType::Q8_0
+}
+
+/// Per-slot persistent state as the allocator must reserve it. Dynamic Qwen caches occupy whole
+/// 32K physical segments, while recurrent/checkpoint state keeps its exact byte size.
+fn kv_state_reserve_bytes(
+    cfg: &Config,
+    ec: &EngineConfig,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> u64 {
+    let logical = match (k_fmt, v_fmt) {
+        (DType::Q8_0, DType::Q8_0) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, true),
+        (DType::F16, DType::F16) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, false),
+        _ => kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, k_fmt, v_fmt),
+    };
+    if !segmented_kv_wanted(cfg, ec, ring, k_fmt, v_fmt) {
+        return logical;
+    }
+    let layout = segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx.max(1), k_fmt, v_fmt)
+        .expect("segmented Qwen state has a layout");
+    logical
+        .saturating_sub(layout.logical_bytes())
+        .saturating_add(layout.committed_bytes(want_ctx))
 }
 
 /// Bytes a FULLY-RESIDENT dense session needs at one EXPLICIT prefill chunk height and KV format
@@ -2621,8 +2667,10 @@ pub(crate) fn kv_fit_ctx_in_budget(
 /// Context fit with separate placement domains. `persistent_budget` is ordinary device room and
 /// must contain KV/recurrent state. `elastic_activation_budget`, when present, is an already-
 /// committed arena that only activation scratch may borrow; keeping the two tests separate avoids
-/// pretending that persistent KV can consume Expert slots. `minimum_elastic_bytes` reserves a
-/// physical arena floor that can itself be reused by activation scratch.
+/// pretending that persistent KV can consume Expert slots. Before the arena exists,
+/// `minimum_elastic_bytes` is the Expert floor that must coexist with activation scratch. Once an
+/// elastic arena is already committed, the caller passes its whole capacity separately and those
+/// two claims are checked against that shared capacity.
 fn kv_fit_ctx_in_budgets(
     cfg: &Config,
     caps: &Capabilities,
@@ -2641,10 +2689,18 @@ fn kv_fit_ctx_in_budgets(
     let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
     let fits = |ctx: usize| -> bool {
         cands.iter().any(|&ubatch| {
-            let kv = kv_bytes_estimate_fmt(cfg, ctx, ring, ubatch, k_fmt, v_fmt);
+            // Every parallel slot owns an independent KV/recurrent state. Runtime workspace is
+            // shared because forwards are serialized at this placement stage, so price it once.
+            let kv = total_slot_state_bytes(kv_state_reserve_bytes(
+                cfg, ec, ctx, ring, ubatch, k_fmt, v_fmt,
+            ));
             let reserve = runtime_reserve_at(cfg, caps, ctx, ring, ubatch, k_fmt, v_fmt);
             elastic_activation_budget.map_or_else(
-                || kv.saturating_add(reserve.max(minimum_elastic_bytes)) <= persistent_budget,
+                || {
+                    kv.saturating_add(reserve)
+                        .saturating_add(minimum_elastic_bytes)
+                        <= persistent_budget
+                },
                 |activation_budget| {
                     kv <= persistent_budget
                         && reserve.max(minimum_elastic_bytes) <= activation_budget
@@ -3071,10 +3127,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
             segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx, k_fmt, v_fmt)
                 .expect("Qwen hybrid models have segmented KV geometry")
         });
-        let dynamic_kv_reserve = dynamic_layout
+        let dynamic_kv_reserve_per_slot = dynamic_layout
             .as_ref()
             .map(|layout| layout.committed_bytes(want_ctx))
             .unwrap_or(0);
+        let dynamic_kv_reserve = total_slot_state_bytes(dynamic_kv_reserve_per_slot);
         dynamic_state_max_allocation_bytes = dynamic_layout
             .as_ref()
             .and_then(|layout| {
@@ -3085,14 +3142,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .max()
             })
             .unwrap_or(0);
-        let kv_bytes_at = |ubatch| match (k_fmt, v_fmt) {
-            (DType::Q8_0, DType::Q8_0) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, true),
-            (DType::F16, DType::F16) => kv_bytes_estimate(cfg, want_ctx, ring, ubatch, false),
-            _ => kv_bytes_estimate_fmt(cfg, want_ctx, ring, ubatch, k_fmt, v_fmt),
-        };
+        let kv_bytes_at =
+            |ubatch| kv_state_reserve_bytes(cfg, ec, want_ctx, ring, ubatch, k_fmt, v_fmt);
         let initial_ubatch = ubatch_rows(ec);
         let mut selected_ubatch = initial_ubatch;
-        let kv_bytes = kv_bytes_at(selected_ubatch);
+        let kv_bytes = total_slot_state_bytes(kv_bytes_at(selected_ubatch));
         let persistent_state = kv_bytes.saturating_sub(dynamic_kv_reserve);
         // Reserve the workspace for the chunk this session will actually execute. A user selecting
         // 4096 rows still gets the full 4K reserve; the default 1024-row session no longer strands
@@ -3133,7 +3187,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let mut paged_target = paged_target_at(plan);
         if paged_target.is_some_and(|bytes| bytes < prefill_floor) {
             for candidate in moe_ubatch_fallback_candidates(ec).into_iter().skip(1) {
-                let candidate_kv = kv_bytes_at(candidate);
+                let candidate_kv = total_slot_state_bytes(kv_bytes_at(candidate));
                 let candidate_persistent = candidate_kv.saturating_sub(dynamic_kv_reserve);
                 let candidate_runtime =
                     runtime_reserve_at(cfg, &caps, want_ctx, ring, candidate, k_fmt, v_fmt);
@@ -5541,6 +5595,13 @@ mod seam_helper_tests {
     const GIB: usize = 1 << 30;
 
     #[test]
+    fn parallel_placement_prices_state_for_every_slot() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::for_slots(3)));
+        assert_eq!(super::placement_slots(), 3);
+        assert_eq!(super::total_slot_state_bytes(17), 51);
+    }
+
+    #[test]
     fn host_ram_request_preserves_total_budget_and_legacy_cache_semantics() {
         use infr_core::{hostmem::RamRequest, SizeSpec};
 
@@ -7524,7 +7585,7 @@ mod seam_helper_tests {
         let need = |ctx: usize, ub: usize| {
             let kv = super::kv_bytes_estimate_fmt(&cfg, ctx, ring, ub, k, v);
             let runtime = super::dense_act_reserve_at(&cfg, &conservative_caps(), ctx, ub);
-            fixed + kv + runtime.max(expert_floor)
+            fixed + kv + runtime + expert_floor
         };
         let cands = super::ubatch_candidates(&ec);
         assert!(cands.iter().any(|&ub| need(fit, ub) <= XTX_ROOM));

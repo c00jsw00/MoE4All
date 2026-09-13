@@ -24,11 +24,11 @@
 //!
 //! # VRAM: how `-np` interacts with `--ctx`
 //!
-//! N slots means N KV caches. The per-slot context is therefore `min(n_ctx_train, kv_fit_ctx / N)`
-//! by default, so the N slots TOGETHER are bounded by exactly the VRAM fit that bounds one slot:
-//! raising `-np` can never OOM a device that `-np 1` fit. (It is NOT the same footprint — when the
-//! trained window is below the fit, `-np 4` does allocate more total KV than `-np 1`; what it
-//! cannot do is exceed the budget. The visible cost is the per-request window shrinking.) An
+//! N slots means N independent KV/recurrent states. The fit solver prices all N states plus one
+//! shared runtime workspace and returns the maximum per-slot context, so raising `-np` cannot OOM
+//! a device that `-np 1` fit. (It is NOT the same footprint — when the trained window is below the
+//! fit, `-np 4` may allocate more total state than `-np 1`; what it cannot do is exceed the budget.
+//! The visible cost can be a smaller per-request window.) An
 //! explicit `--ctx C` is used verbatim per slot, and the Vulkan alloc-time budget guard is left to
 //! fail it cleanly if `N * C` truly doesn't fit.
 //!
@@ -414,7 +414,7 @@ impl ParallelSeam {
         // This engine's own placement pins, entered as the current scope for the whole
         // placement phase (the clamp inside `vulkan_slot_ctx` + the `init_slots` warmup, which is
         // where the binder pins the prefill chunk / auto-q8 KV). See `PlacementPins`.
-        let pins = Arc::new(crate::seam::PlacementPins::default());
+        let pins = Arc::new(crate::seam::PlacementPins::for_slots(n_slots));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
         let session_idle = Duration::from_secs(model.engine_cfg().kv.session_idle_secs);
@@ -574,24 +574,36 @@ impl ParallelSeam {
         // of forking off a garbage prefix.
         slot0.reset();
 
+        let preallocated = slot0.take_preallocated_siblings();
+        if !preallocated.is_empty() && preallocated.len() != n_slots.saturating_sub(1) {
+            return Err(anyhow!(
+                "startup materialized {} sibling slots, expected {}",
+                preallocated.len(),
+                n_slots.saturating_sub(1),
+            ));
+        }
+        let mut preallocated = preallocated.into_iter();
         let mut slots = Vec::with_capacity(n_slots);
         for i in 1..n_slots {
             // A fork shares the `Arc<SeamWeights>` — it costs only its own KV + IO buffers. If VRAM
             // refuses, say so HERE, at boot, with the two knobs that fix it. Never mid-request.
-            let kv = slot0
-                .fork(
-                    self.vk.as_ref(),
-                    self.model.config(),
-                    self.model.engine_cfg(),
-                )
-                .map_err(|e| {
-                    anyhow!(
-                        "could not allocate KV slot {}/{n_slots} at ctx {}: {e}\n\
-                     lower --parallel, or lower --ctx (each slot owns a full context of KV cache)",
-                        i + 1,
-                        self.max_ctx,
+            let kv = match preallocated.next() {
+                Some(kv) => kv,
+                None => slot0
+                    .fork(
+                        self.vk.as_ref(),
+                        self.model.config(),
+                        self.model.engine_cfg(),
                     )
-                })?;
+                    .map_err(|e| {
+                        anyhow!(
+                            "could not allocate KV slot {}/{n_slots} at ctx {}: {e}\n\
+                         lower --parallel, or lower --ctx (each slot owns a full context of KV cache)",
+                            i + 1,
+                            self.max_ctx,
+                        )
+                    })?,
+            };
             slots.push(Slot {
                 kv: Some(kv),
                 busy: false,

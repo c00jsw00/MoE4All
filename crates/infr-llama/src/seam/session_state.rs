@@ -164,7 +164,9 @@ impl SeamKv {
             meta.committed_tokens.max(meta.cached.len()),
         )?;
         self.mtp_delta_ckpt = None;
-        self.turn_recurrent_ckpt = None;
+        if let Some(checkpoint) = self.turn_recurrent_ckpt.as_mut() {
+            checkpoint.invalidate();
+        }
         if let Some(tokens) = meta.checkpoint_tokens.as_deref() {
             TurnRecurrentCkpt::begin(
                 &mut self.turn_recurrent_ckpt,
@@ -215,7 +217,7 @@ impl SeamKv {
         if let Some(checkpoint) = self
             .turn_recurrent_ckpt
             .as_ref()
-            .filter(|checkpoint| !checkpoint.valid)
+            .filter(|checkpoint| !checkpoint.valid && !checkpoint.tokens.is_empty())
         {
             for (index, &layer) in checkpoint.layers.iter().enumerate() {
                 specs.push((
@@ -248,6 +250,7 @@ impl SeamKv {
                 checkpoint.ple_copied = true;
                 checkpoint.valid = true;
             }
+            (None, Some(checkpoint)) => checkpoint.invalidate(),
             (None, None) => {}
             _ => {
                 return Err(anyhow!(
@@ -277,7 +280,9 @@ impl SeamKv {
         self.segmented_kv.committed_tokens = 0;
         self.cached.clear();
         self.mtp_delta_ckpt = None;
-        self.turn_recurrent_ckpt = None;
+        if let Some(checkpoint) = self.turn_recurrent_ckpt.as_mut() {
+            checkpoint.invalidate();
+        }
         for plane in layout.planes {
             let buffer: &dyn Buffer = match plane.kind {
                 PlaneKind::K => self.kbufs[plane.layer].as_ref(),
