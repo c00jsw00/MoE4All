@@ -4917,14 +4917,14 @@ impl VulkanBackend {
 
     /// Expert-aware initializer: physical shard boundaries are placed between slots so the
     /// driver allocation cap never strands an unusable tail smaller than the next slot.
-    pub(crate) fn init_unified_vram_for_expert_slots(
+    fn plan_unified_vram_for_expert_slots(
         &self,
         specs: &[(usize, usize, usize)],
         dynamic_state_reserve_bytes: u64,
         dynamic_state_max_allocation_bytes: u64,
         prefill_min_lane_bytes: u64,
         runtime_reserve_bytes: u64,
-    ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
+    ) -> Result<crate::unified::ExpertArenaLayout> {
         const WINDOWS_MAX_SHARD: usize = 3 * 1024 * 1024 * 1024;
         let driver_max = usize::try_from(self.shared.max_mem_alloc_size)
             .unwrap_or(usize::MAX)
@@ -4934,7 +4934,7 @@ impl VulkanBackend {
         } else {
             driver_max
         };
-        let layout = crate::unified::ExpertArenaLayout::build(
+        crate::unified::ExpertArenaLayout::build(
             specs,
             platform_max,
             usize::try_from(dynamic_state_reserve_bytes)
@@ -4945,6 +4945,45 @@ impl VulkanBackend {
                 .map_err(|_| be("minimum Prefill lane exceeds the host address space"))?,
             usize::try_from(runtime_reserve_bytes)
                 .map_err(|_| be("runtime reserve exceeds the host address space"))?,
+        )
+    }
+
+    /// Validate an expert-aware arena geometry without allocating device memory. Startup uses this
+    /// after every pool-external owner is resident to choose the tallest Prefill chunk that fits
+    /// the measured remainder; the selected layout is then materialized exactly once below.
+    pub fn validate_moe_unified_vram(
+        &self,
+        specs: &[(usize, usize, usize)],
+        dynamic_state_reserve_bytes: u64,
+        dynamic_state_max_allocation_bytes: u64,
+        prefill_min_lane_bytes: u64,
+        runtime_reserve_bytes: u64,
+    ) -> Result<usize> {
+        Ok(self
+            .plan_unified_vram_for_expert_slots(
+                specs,
+                dynamic_state_reserve_bytes,
+                dynamic_state_max_allocation_bytes,
+                prefill_min_lane_bytes,
+                runtime_reserve_bytes,
+            )?
+            .total_bytes())
+    }
+
+    pub(crate) fn init_unified_vram_for_expert_slots(
+        &self,
+        specs: &[(usize, usize, usize)],
+        dynamic_state_reserve_bytes: u64,
+        dynamic_state_max_allocation_bytes: u64,
+        prefill_min_lane_bytes: u64,
+        runtime_reserve_bytes: u64,
+    ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
+        let layout = self.plan_unified_vram_for_expert_slots(
+            specs,
+            dynamic_state_reserve_bytes,
+            dynamic_state_max_allocation_bytes,
+            prefill_min_lane_bytes,
+            runtime_reserve_bytes,
         )?;
         let expected = layout.total_bytes();
         let mut cell = self.unified_pool.lock().unwrap();
