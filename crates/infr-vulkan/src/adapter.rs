@@ -768,6 +768,15 @@ impl RuntimePhaseArena {
         self.activate_scratch_topology(layout);
         let reset_retained_scratch = self.scratch.iter().any(Option::is_some);
         let scratch_reused = self.scratch_satisfies(layout);
+        // A Qwen3.8 prefill can start with the shorter QSA-boundary chunk and then grow to the
+        // configured ubatch. Pooled MoE buffers from that drained chunk are safe to discard and
+        // will themselves need a larger capacity later in this execute. Keeping them while the
+        // graph scratch grows creates an artificial old-pool + new-graph peak that the steady-
+        // state runtime reserve neither needs nor prices. Equal-shape prefill still retains its
+        // high-water pool, and Decode keeps the established alternating-topology cache.
+        if phase == RuntimePhase::Prefill && !scratch_reused && reset_retained_scratch {
+            self.pool.clear();
+        }
         RuntimePhaseStart {
             previous,
             scratch_reused,
@@ -10677,7 +10686,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_phase_shape_growth_retains_old_slot_until_replacement() {
+    fn runtime_phase_prefill_shape_growth_drops_prior_pooled_workspace() {
         let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut arena = RuntimePhaseArena::default();
         let old_layout = vec![Some(4)];
@@ -10702,9 +10711,9 @@ mod tests {
 
         assert!(!start.scratch_reused);
         assert!(start.reset_retained_scratch);
-        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(arena.scratch[0].is_some());
-        assert!(arena.pool.buffers.contains_key(&("high_water", 8)));
+        assert!(arena.pool.buffers.is_empty());
     }
 
     #[test]
