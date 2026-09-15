@@ -169,6 +169,27 @@ fn windows_process_resident_bytes() -> Option<u64> {
     Some(counters.WorkingSetSize as u64)
 }
 
+/// Ask Windows to evict clean pages from this process's working set at a load-phase boundary.
+///
+/// The Vulkan loader touches GGUF source pages while uploading fixed weights. Those pages are no
+/// longer needed once the upload queue is drained, but Windows may otherwise keep them resident
+/// while the anonymous MoE host arena is filled. This is deliberately an explicit one-shot hook:
+/// calling it after the host arena exists would evict useful expert pages too. Other platforms do
+/// nothing and preserve their existing VM behaviour.
+pub fn trim_reclaimable_working_set() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+        use windows::Win32::System::Threading::GetCurrentProcess;
+
+        unsafe { EmptyWorkingSet(GetCurrentProcess()).is_ok() }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn parse_process_resident(text: &str) -> Option<u64> {
     let line = text.lines().find(|line| line.starts_with("VmRSS:"))?;

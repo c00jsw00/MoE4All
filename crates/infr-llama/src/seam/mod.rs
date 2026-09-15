@@ -3697,6 +3697,18 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // Staging is part of the load, not the steady-state layout. Free it before the
                 // live budget query so its ring cannot reduce the expert filler permanently.
                 vk.finish_resident_uploads();
+                if reclaimable_fixed_host_source_bytes > 0 {
+                    let resident_before_trim = infr_core::hostmem::process_resident_bytes();
+                    if infr_core::hostmem::trim_reclaimable_working_set() {
+                        let resident_after_trim = infr_core::hostmem::process_resident_bytes();
+                        tracing::info!(
+                            reclaimable_source_bytes = reclaimable_fixed_host_source_bytes,
+                            resident_before_trim_bytes = resident_before_trim,
+                            resident_after_trim_bytes = resident_after_trim,
+                            "trimmed clean fixed-weight source pages before MoE host-cache allocation"
+                        );
+                    }
+                }
 
                 let live_alloc_room = vk.alloc_room();
                 let measured_room = live_alloc_room.saturating_sub(POST_KV_DEVICE_RESERVE);
