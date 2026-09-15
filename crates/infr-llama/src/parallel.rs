@@ -2,14 +2,16 @@
 //!
 //! # What this is (and what it is not)
 //!
-//! Every sequence owns one KV slot. Qwen3.8 text requests enter one authoritative scheduler before
-//! tokenization and remain there through completion. Decode rows run layer-synchronously. Up to 96
-//! uncached prompt tokens advance as teacher-forced rows in the same Decode-LRU graphs; longer
-//! prompts share the configured ubatch in one exclusive Prefill-ring phase before decode resumes.
-//! Stateless work and paged expert traffic are shared while every sequence retains independent
-//! positions, KV/recurrent state and sampling. Dense/sparse QSA rows form compatible subgroups but
-//! never fall back to independent request loops. Other architectures and constrained generation
-//! retain the established interleaved path through [`crate::sampling::StepGate`].
+//! Every sequence owns one KV slot. Qwen3.8 text requests register with one persistent compute
+//! worker before tokenization, then enqueue their prepared task and remain under that scheduler
+//! through completion; no request thread doubles as the cohort leader. Decode rows run
+//! layer-synchronously. Up to 96 uncached prompt tokens advance as teacher-forced rows in the same
+//! Decode-LRU graphs; longer prompts share the configured ubatch in one exclusive Prefill-ring
+//! phase before decode resumes. Stateless work and paged expert traffic are shared while every
+//! sequence retains independent positions, KV/recurrent state and sampling. Dense/sparse QSA rows
+//! form compatible subgroups but never fall back to independent request loops. Other architectures
+//! and constrained generation retain the established interleaved path through
+//! [`crate::sampling::StepGate`].
 //!
 //! # VRAM: how `-np` interacts with `--ctx`
 //!
@@ -30,7 +32,7 @@
 //! that state into any free resident slot. This extends the number of retained conversations; it
 //! does not alter the scheduler policy described above.
 
-use crate::sampling::{ParallelSampler, RequestCtx, StepGate};
+use crate::sampling::{ParallelSampler, RequestCtx, RequestSampling, StepGate};
 use crate::seam::SeamKv;
 use crate::session_cache::SessionCache;
 use crate::{Config, GenStats, SeamModel};
@@ -222,6 +224,36 @@ enum BatchPhase {
     Decode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchedulerMode {
+    DecodeRows,
+    ShortPrefillRows,
+    DecodeAndShortPrefillRows,
+    LongPrefill,
+}
+
+fn scheduler_mode(phases: impl IntoIterator<Item = BatchPhase>) -> Option<SchedulerMode> {
+    let mut decode = false;
+    let mut short_prefill = false;
+    let mut any = false;
+    for phase in phases {
+        any = true;
+        match phase {
+            BatchPhase::Unprepared => unreachable!("scheduler classified an unprepared task"),
+            BatchPhase::LongPrefill => return Some(SchedulerMode::LongPrefill),
+            BatchPhase::ShortPrefill => short_prefill = true,
+            BatchPhase::Decode => decode = true,
+        }
+    }
+    match (any, decode, short_prefill) {
+        (false, _, _) => None,
+        (true, true, true) => Some(SchedulerMode::DecodeAndShortPrefillRows),
+        (true, true, false) => Some(SchedulerMode::DecodeRows),
+        (true, false, true) => Some(SchedulerMode::ShortPrefillRows),
+        (true, false, false) => unreachable!("a prepared batch has a known phase"),
+    }
+}
+
 fn phase_for_remaining_prefill(tokens: usize) -> BatchPhase {
     if tokens == 0 {
         BatchPhase::Decode
@@ -245,6 +277,7 @@ struct BatchWork {
     checkpoint_boundary: Option<usize>,
     turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
     finished: bool,
+    sampling: RequestSampling,
     sampler: Option<ParallelSampler>,
     channels: Option<BatchChannels>,
 }
@@ -272,7 +305,6 @@ struct BatchChannels {
 
 #[derive(Default)]
 struct DecodeBatchQueue {
-    running: bool,
     /// Eligible requests registered before tokenization/checkout but not yet ready for scheduling.
     arriving: usize,
     waiting: VecDeque<BatchWork>,
@@ -374,6 +406,24 @@ struct ColdWorker {
     stop: Arc<AtomicBool>,
     wake: Arc<Condvar>,
     thread: Option<JoinHandle<()>>,
+}
+
+struct SchedulerWorker {
+    stop: Arc<AtomicBool>,
+    wake: Arc<Condvar>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for SchedulerWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!("parallel scheduler thread panicked while shutting down");
+            }
+        }
+    }
 }
 
 impl Drop for ColdWorker {
@@ -488,21 +538,23 @@ fn cold_session_worker(
     }
 }
 
-/// The concurrent seam engine. `Sync`: `&self` is all a request needs, so N of them run at once.
+/// The concurrent seam engine. Request threads own tokenization, streaming and one checked-out
+/// session; a persistent worker exclusively owns batched compute scheduling.
 pub struct ParallelSeam {
-    /// Declared first so its `Drop` joins the maintenance thread before model/backend fields drop.
+    /// Declared first so `Drop` joins both workers before model/backend fields drop.
+    scheduler_worker: Option<SchedulerWorker>,
     cold_worker: Option<ColdWorker>,
-    model: SeamModel,
+    model: Arc<SeamModel>,
     vk: Arc<infr_vulkan::VulkanBackend>,
     pool: Arc<Mutex<Pool>>,
     /// Signalled when a slot is returned — a queued request waits here.
     freed: Arc<Condvar>,
-    decode_batch: Mutex<DecodeBatchQueue>,
-    /// Wakes a cohort leader when a registered request reaches (or abandons) decode.
-    decode_ready: Condvar,
-    /// Set only when an active decode worker has new work to admit. The runner polls it once per
+    decode_batch: Arc<Mutex<DecodeBatchQueue>>,
+    /// Wakes the dedicated scheduler when a registered request becomes ready or abandons arrival.
+    decode_ready: Arc<Condvar>,
+    /// Set only when the scheduler has new work to admit. The runner polls it once per
     /// aggregated token; an empty steady-state decode takes no queue lock.
-    batch_interrupt: AtomicBool,
+    batch_interrupt: Arc<AtomicBool>,
     /// The GPU baton. `None` when `n_slots == 1`: a lone sequence must not pay even a mutex per
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
@@ -591,17 +643,18 @@ impl ParallelSeam {
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
         let session_idle = Duration::from_secs(model.engine_cfg().kv.session_idle_secs);
         let mut engine = Self {
+            scheduler_worker: None,
             cold_worker: None,
-            model,
+            model: Arc::new(model),
             vk: Arc::new(vk),
             pool: Arc::new(Mutex::new(Pool {
                 slots: Vec::new(),
                 tick: 0,
             })),
             freed: Arc::new(Condvar::new()),
-            decode_batch: Mutex::new(DecodeBatchQueue::default()),
-            decode_ready: Condvar::new(),
-            batch_interrupt: AtomicBool::new(false),
+            decode_batch: Arc::new(Mutex::new(DecodeBatchQueue::default())),
+            decode_ready: Arc::new(Condvar::new()),
+            batch_interrupt: Arc::new(AtomicBool::new(false)),
             // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
@@ -614,6 +667,7 @@ impl ParallelSeam {
         engine.init_session_cache()?;
         drop(scope);
         engine.start_cold_worker()?;
+        engine.start_scheduler_worker()?;
         Ok(engine)
     }
 
@@ -679,6 +733,61 @@ impl ParallelSeam {
             thread: Some(thread),
         });
         Ok(())
+    }
+
+    /// Build the shallow engine handle owned by the scheduler thread. It shares all model,
+    /// allocator and queue state but owns neither background worker, avoiding a self-reference.
+    fn scheduler_handle(&self) -> Self {
+        Self {
+            scheduler_worker: None,
+            cold_worker: None,
+            model: Arc::clone(&self.model),
+            vk: Arc::clone(&self.vk),
+            pool: Arc::clone(&self.pool),
+            freed: Arc::clone(&self.freed),
+            decode_batch: Arc::clone(&self.decode_batch),
+            decode_ready: Arc::clone(&self.decode_ready),
+            batch_interrupt: Arc::clone(&self.batch_interrupt),
+            gate: self.gate.as_ref().map(Arc::clone),
+            session_cache: self.session_cache.as_ref().map(Arc::clone),
+            session_idle: self.session_idle,
+            max_ctx: self.max_ctx,
+            pins: Arc::clone(&self.pins),
+        }
+    }
+
+    fn start_scheduler_worker(&mut self) -> Result<()> {
+        if self.gate.is_none() || !self.model.config().qwen4exp {
+            return Ok(());
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let wake = Arc::clone(&self.decode_ready);
+        let scheduler = self.scheduler_handle();
+        let thread = std::thread::Builder::new()
+            .name("infr-parallel".into())
+            .spawn(move || scheduler.scheduler_loop(worker_stop))
+            .context("start parallel scheduler thread")?;
+        self.scheduler_worker = Some(SchedulerWorker {
+            stop,
+            wake,
+            thread: Some(thread),
+        });
+        Ok(())
+    }
+
+    fn scheduler_loop(self, stop: Arc<AtomicBool>) {
+        let gate = self
+            .gate
+            .as_ref()
+            .expect("parallel scheduler requires a shared GPU gate")
+            .clone();
+        let req = RequestCtx::with_gate(crate::sampling::RequestSampling::default(), gate);
+        let _scope = crate::seam::PlacementScope::enter(Arc::clone(&self.pins));
+        while let Some(work) = self.wait_for_scheduler_work(stop.as_ref()) {
+            self.run_unified_batch(work, &req);
+        }
+        self.close_decode_batch(Some("parallel scheduler is shutting down"));
     }
 
     pub fn fork_embedding_backend(&self) -> Result<infr_vulkan::VulkanBackend> {
@@ -1238,15 +1347,14 @@ impl ParallelSeam {
         );
     }
 
-    /// End the scheduler. A normal close has already drained every queued request; an error close
-    /// returns the same failure to work that arrived while the active graph was unwinding.
+    /// Fail and drain work that has not entered the active cohort. Used after a batch error and
+    /// when the persistent worker shuts down.
     fn close_decode_batch(&self, error: Option<&str>) {
         let waiting = {
             let mut queue = self
                 .decode_batch
                 .lock()
                 .expect("decode batch queue poisoned");
-            queue.running = false;
             let waiting = queue.waiting.drain(..).collect::<Vec<_>>();
             self.batch_interrupt.store(false, Ordering::Release);
             waiting
@@ -1285,25 +1393,40 @@ impl ParallelSeam {
         accepted
     }
 
-    fn take_initial_batch_peers(&self, capacity: usize) -> Vec<BatchWork> {
-        if capacity == 0 {
-            return Vec::new();
-        }
-        let queue = self
+    fn wait_for_scheduler_work(&self, stop: &AtomicBool) -> Option<Vec<BatchWork>> {
+        let mut queue = self
             .decode_batch
             .lock()
             .expect("decode batch queue poisoned");
-        let (mut queue, _) = self
-            .decode_ready
-            .wait_timeout_while(queue, DECODE_BATCH_WAIT, |queue| {
-                queue.arriving > 0 && queue.waiting.len() < capacity
-            })
-            .expect("decode batch queue poisoned");
-        let take = capacity.min(queue.waiting.len());
-        let peers = queue.waiting.drain(..take).collect::<Vec<_>>();
+        while queue.waiting.is_empty() && !stop.load(Ordering::Acquire) {
+            queue = self
+                .decode_ready
+                .wait(queue)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+
+        if queue.arriving > 0 && queue.waiting.len() < MAX_DECODE_BATCH {
+            (queue, _) = self
+                .decode_ready
+                .wait_timeout_while(queue, DECODE_BATCH_WAIT, |queue| {
+                    !stop.load(Ordering::Acquire)
+                        && queue.arriving > 0
+                        && queue.waiting.len() < MAX_DECODE_BATCH
+                })
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let take = MAX_DECODE_BATCH.min(queue.waiting.len());
+        let work = queue.waiting.drain(..take).collect::<Vec<_>>();
         self.batch_interrupt
             .store(!queue.waiting.is_empty(), Ordering::Release);
-        peers
+        Some(work)
     }
 
     fn take_prefill_cohort_peers(&self, capacity: usize) -> Vec<BatchWork> {
@@ -1330,10 +1453,9 @@ impl ParallelSeam {
         peers
     }
 
-    /// Called only after the active set becomes empty. It either atomically hands queued work to
-    /// the existing leader or marks the scheduler idle, so a racing request can never be stranded
-    /// behind `running=true` with no worker.
-    fn refill_batch_or_close(&self) -> Option<Vec<BatchWork>> {
+    /// Called only after the active set becomes empty. Briefly include requests that registered
+    /// before tokenization; otherwise return control to the persistent worker's idle wait.
+    fn refill_batch(&self) -> Option<Vec<BatchWork>> {
         let queue = self
             .decode_batch
             .lock()
@@ -1345,7 +1467,6 @@ impl ParallelSeam {
             })
             .expect("decode batch queue poisoned");
         if queue.waiting.is_empty() {
-            queue.running = false;
             self.batch_interrupt.store(false, Ordering::Release);
             None
         } else {
@@ -1565,9 +1686,13 @@ impl ParallelSeam {
                 context_limit: self.max_ctx as u64,
             };
             if let Some(channels) = work.channels.as_ref() {
-                let _ = channels.events.send(BatchEvent::Progress { progress });
-            } else {
-                req.report_progress(progress);
+                if channels
+                    .events
+                    .send(BatchEvent::Progress { progress })
+                    .is_err()
+                {
+                    work.finished = true;
+                }
             }
         }
         tracing::debug!(
@@ -1584,8 +1709,6 @@ impl ParallelSeam {
         active: &mut [BatchWork],
         indices: &[usize],
         quantum: usize,
-        req: &RequestCtx,
-        leader_on_token: &mut dyn FnMut(u32) -> bool,
     ) -> Result<()> {
         if indices.is_empty() {
             return Ok(());
@@ -1657,22 +1780,25 @@ impl ParallelSeam {
                 cached_prompt_tokens,
                 generated.saturating_add(streamed[lane]),
             );
-            let keep_going = match channels.get_mut(lane) {
-                Some(None) => {
-                    req.report_progress(progress);
-                    leader_on_token(id)
-                }
-                Some(Some(channels)) => {
-                    channels
-                        .events
-                        .send(BatchEvent::Token { id, progress })
-                        .is_ok()
-                        && channels.acknowledgements.recv().unwrap_or(false)
-                }
-                None => false,
-            };
+            let keep_going =
+                channels
+                    .get_mut(lane)
+                    .and_then(Option::as_mut)
+                    .is_some_and(|channels| {
+                        channels
+                            .events
+                            .send(BatchEvent::Token { id, progress })
+                            .is_ok()
+                            && channels.acknowledgements.recv().unwrap_or(false)
+                    });
             accepted[lane] = keep_going;
             keep_going
+        };
+        let group_req = match &self.gate {
+            Some(gate) => {
+                RequestCtx::with_gate(active[indices[0]].sampling.clone(), Arc::clone(gate))
+            }
+            None => RequestCtx::new(active[indices[0]].sampling.clone()),
         };
         let result = crate::seam::generate_dense_vulkan_parallel_sampled_session(
             self.vk.as_ref(),
@@ -1691,7 +1817,7 @@ impl ParallelSeam {
             &mut samplers,
             &mut stream,
             Some(&self.batch_interrupt),
-            Some(req),
+            Some(&group_req),
         );
 
         active[indices[0]].kv = primary;
@@ -1754,110 +1880,56 @@ impl ParallelSeam {
                     {
                         work.finished = true;
                     }
-                } else {
-                    req.report_progress(progress);
                 }
             }
         }
         Ok(())
     }
 
-    fn retire_finished_work(
-        &self,
-        active: &mut Vec<BatchWork>,
-        leader_guard: &mut SlotGuard<'_>,
-        leader_result: &mut Option<GenStats>,
-    ) {
+    fn retire_finished_work(&self, active: &mut Vec<BatchWork>) {
         for index in (0..active.len()).rev() {
             if !active[index].finished {
                 continue;
             }
-            let mut work = active.remove(index);
-            if work.channels.is_none() {
-                leader_guard.reattach(
-                    work.kv
-                        .take()
-                        .expect("completed scheduler leader owns a KV slot"),
-                );
-                *leader_result = Some(work.stats);
-            } else {
-                self.complete_batch_work(work);
-            }
+            self.complete_batch_work(active.remove(index));
         }
     }
 
-    fn fail_unified_scheduler(
-        &self,
-        active: &mut Vec<BatchWork>,
-        leader_guard: &mut SlotGuard<'_>,
-        leader_result: Option<GenStats>,
-        error: anyhow::Error,
-    ) -> Result<GenStats> {
+    fn fail_unified_scheduler(&self, active: &mut Vec<BatchWork>, error: anyhow::Error) {
         let message = error.to_string();
-        for mut work in active.drain(..) {
-            if work.channels.is_none() {
-                leader_guard.reattach(
-                    work.kv
-                        .take()
-                        .expect("failed scheduler leader owns a KV slot"),
-                );
-            } else {
-                self.fail_batch_work(work, &message);
-            }
+        for work in active.drain(..) {
+            self.fail_batch_work(work, &message);
         }
         self.close_decode_batch(Some(&message));
-        if let Some(stats) = leader_result {
-            tracing::warn!(%error, "parallel scheduler failed after its leader completed");
-            Ok(stats)
-        } else {
-            Err(error)
-        }
+        self.vk.release_primary_runtime_after_cohort_shrink();
+        tracing::warn!(%error, "parallel scheduler batch failed");
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn run_unified_batch(
-        &self,
-        leader: BatchWork,
-        peers: Vec<BatchWork>,
-        leader_guard: &mut SlotGuard<'_>,
-        req: &RequestCtx,
-        leader_on_token: &mut dyn FnMut(u32) -> bool,
-    ) -> Result<GenStats> {
+    fn run_unified_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
         let mut active = Vec::with_capacity(MAX_DECODE_BATCH);
-        active.push(leader);
-        active.extend(peers);
-        let mut leader_result = None;
+        active.extend(work);
         let mut long_prefill_coalesced = false;
 
         loop {
             let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
             active.extend(self.take_pending_batch_work(capacity, false));
             if active.is_empty() {
-                match self.refill_batch_or_close() {
+                match self.refill_batch() {
                     Some(work) => active = work,
-                    None => {
-                        return leader_result.ok_or_else(|| {
-                            anyhow!("unified scheduler completed without a leader result")
-                        })
-                    }
+                    None => return,
                 }
             }
 
             for work in &mut active {
                 if let Err(error) = self.prepare_unified_work(work, req) {
-                    return self.fail_unified_scheduler(
-                        &mut active,
-                        leader_guard,
-                        leader_result,
-                        error,
-                    );
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
                 }
             }
 
-            if active
-                .iter()
-                .any(|work| work.phase == BatchPhase::LongPrefill)
-            {
+            let mode = scheduler_mode(active.iter().map(|work| work.phase))
+                .expect("the active scheduler cohort is non-empty");
+            if mode == SchedulerMode::LongPrefill {
                 if !long_prefill_coalesced {
                     let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
                     let peers = self.take_prefill_cohort_peers(capacity);
@@ -1872,12 +1944,13 @@ impl ParallelSeam {
                     }
                 }
                 if let Err(error) = self.run_long_prefill_phase(&mut active, req) {
-                    return self.fail_unified_scheduler(
-                        &mut active,
-                        leader_guard,
-                        leader_result,
-                        error,
-                    );
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                let cohort_len = active.len();
+                self.retire_finished_work(&mut active);
+                if active.len() < cohort_len {
+                    self.vk.release_primary_runtime_after_cohort_shrink();
                 }
                 long_prefill_coalesced = false;
                 continue;
@@ -1892,18 +1965,20 @@ impl ParallelSeam {
             let quantum = if qsa_groups > 1 { 16 } else { usize::MAX };
             for mut indices in groups {
                 indices.sort_by_key(|&index| std::cmp::Reverse(active[index].remaining_prefill()));
-                if let Err(error) =
-                    self.run_token_group(&mut active, &indices, quantum, req, leader_on_token)
-                {
-                    return self.fail_unified_scheduler(
-                        &mut active,
-                        leader_guard,
-                        leader_result,
-                        error,
-                    );
+                if let Err(error) = self.run_token_group(&mut active, &indices, quantum) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
                 }
             }
-            self.retire_finished_work(&mut active, leader_guard, &mut leader_result);
+            let cohort_len = active.len();
+            self.retire_finished_work(&mut active);
+            if active.len() < cohort_len {
+                // Paged Decode deliberately retains graph scratch across tokens. A wider cohort
+                // raises that high-water mark; without this request-boundary reset, its retired
+                // expert slots remain unavailable after lanes leave and the surviving request
+                // stays permanently in the wider batch's slow cache state.
+                self.vk.release_primary_runtime_after_cohort_shrink();
+            }
         }
     }
 
@@ -1911,8 +1986,8 @@ impl ParallelSeam {
         self.model.render_chat_messages(messages)
     }
 
-    /// Generate one sequence: check out a slot, run the ordinary seam decode on it (taking turns on
-    /// the GPU baton at every step), and return the slot. `&self` — N of these run concurrently.
+    /// Generate one sequence: check out a slot, enqueue its work, stream scheduler events, and
+    /// return the slot as soon as this request completes.
     pub fn generate(
         &self,
         prompt: &str,
@@ -1925,8 +2000,8 @@ impl ParallelSeam {
     }
 
     /// Generate one turn through the authoritative Qwen3.8 scheduler. Eligible requests register
-    /// before tokenization, then stay owned by this queue from KV reconciliation through their
-    /// final decode token; they never fall back to the legacy per-request StepGate path.
+    /// before tokenization, then stay owned by the dedicated worker from KV reconciliation through
+    /// their final decode token; they never fall back to the legacy per-request StepGate path.
     pub fn generate_turn(
         &self,
         prompt: &str,
@@ -1992,50 +2067,9 @@ impl ParallelSeam {
             .expect("eligible request registered before tokenization")
             .arrive(&mut queue);
         drop(registration.take());
-
-        if queue.running {
-            let (event_tx, event_rx) = mpsc::sync_channel(0);
-            let (ack_tx, ack_rx) = mpsc::sync_channel(0);
-            let slot = guard.idx;
-            let kv = guard.detach();
-            queue.waiting.push_back(BatchWork {
-                slot,
-                kv: Some(kv),
-                prompt_end: prompt_tokens.len(),
-                prompt: prompt_tokens,
-                max_new,
-                generated: 0,
-                stats: GenStats::default(),
-                phase: BatchPhase::Unprepared,
-                prefill_start: 0,
-                checkpoint_boundary: None,
-                turn_checkpoint,
-                finished: false,
-                sampler: Some(sampler),
-                channels: Some(BatchChannels {
-                    events: event_tx,
-                    acknowledgements: ack_rx,
-                }),
-            });
-            self.batch_interrupt.store(true, Ordering::Release);
-            self.decode_ready.notify_all();
-            drop(queue);
-            return self.wait_for_decode_batch(
-                &mut guard,
-                event_rx,
-                ack_tx,
-                req,
-                &mut acc,
-                &mut printed,
-                &mut on_piece,
-            );
-        }
-
-        queue.running = true;
-        self.batch_interrupt.store(false, Ordering::Release);
-        drop(queue);
-        let peers = self.take_initial_batch_peers(MAX_DECODE_BATCH - 1);
-        let leader = BatchWork {
+        let (event_tx, event_rx) = mpsc::sync_channel(0);
+        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+        queue.waiting.push_back(BatchWork {
             slot: guard.idx,
             kv: Some(guard.detach()),
             prompt_end: prompt_tokens.len(),
@@ -2048,23 +2082,25 @@ impl ParallelSeam {
             checkpoint_boundary: None,
             turn_checkpoint,
             finished: false,
+            sampling: req.sampling().clone(),
             sampler: Some(sampler),
-            channels: None,
-        };
-        let mut leader_stream = |id| {
-            if crate::sampling::abort_requested(Some(req)) {
-                return false;
-            }
-            crate::stream_token(
-                self.model.tokenizer(),
-                &mut acc,
-                &mut printed,
-                id,
-                &mut on_piece,
-            );
-            !crate::sampling::abort_requested(Some(req))
-        };
-        self.run_unified_batch(leader, peers, &mut guard, req, &mut leader_stream)
+            channels: Some(BatchChannels {
+                events: event_tx,
+                acknowledgements: ack_rx,
+            }),
+        });
+        self.batch_interrupt.store(true, Ordering::Release);
+        self.decode_ready.notify_all();
+        drop(queue);
+        self.wait_for_decode_batch(
+            &mut guard,
+            event_rx,
+            ack_tx,
+            req,
+            &mut acc,
+            &mut printed,
+            &mut on_piece,
+        )
     }
 
     /// Generate one Qwen3.8 vision turn. Projector execution is completed by the caller before
@@ -2158,8 +2194,8 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_multimodal_prompt, phase_for_remaining_prefill, pick_continuation, BatchPhase,
-        MultimodalEmbedding, SHORT_PREFILL_TOKENS,
+        expand_multimodal_prompt, phase_for_remaining_prefill, pick_continuation, scheduler_mode,
+        BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
 
     #[test]
@@ -2173,6 +2209,26 @@ mod tests {
         assert_eq!(
             phase_for_remaining_prefill(SHORT_PREFILL_TOKENS + 1),
             BatchPhase::LongPrefill
+        );
+    }
+
+    #[test]
+    fn scheduler_routes_the_four_supported_work_mixes() {
+        assert_eq!(
+            scheduler_mode([BatchPhase::Decode, BatchPhase::Decode]),
+            Some(SchedulerMode::DecodeRows)
+        );
+        assert_eq!(
+            scheduler_mode([BatchPhase::ShortPrefill, BatchPhase::ShortPrefill]),
+            Some(SchedulerMode::ShortPrefillRows)
+        );
+        assert_eq!(
+            scheduler_mode([BatchPhase::Decode, BatchPhase::ShortPrefill]),
+            Some(SchedulerMode::DecodeAndShortPrefillRows)
+        );
+        assert_eq!(
+            scheduler_mode([BatchPhase::Decode, BatchPhase::LongPrefill]),
+            Some(SchedulerMode::LongPrefill)
         );
     }
 
