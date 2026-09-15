@@ -471,6 +471,10 @@ impl ExpertArenaLayout {
         // runtime workspace behind small shard-tail fragments. Restore caller order before commit
         // so returned handles still align exactly with the request slice.
         ordered.sort_unstable_by_key(|&(index, _, len)| (std::cmp::Reverse(len), index));
+        let batch_bytes = ordered
+            .iter()
+            .fold(0usize, |sum, (_, _, len)| sum.saturating_add(*len));
+        let initial_blockers = blockers.len();
         let mut ranges = vec![None; requested.len()];
         for (index, requested_len, len) in ordered {
             let candidate = match direction {
@@ -478,8 +482,35 @@ impl ExpertArenaLayout {
                 ClaimDirection::High => find_high_gap(&pieces, &blockers, len),
             }
             .ok_or_else(|| {
+                let corridor_bytes = pieces
+                    .iter()
+                    .fold(0usize, |sum, piece| sum.saturating_add(piece.end - piece.start));
+                let (free_bytes, largest_gap, gaps) = gap_stats(&pieces, &blockers);
+                let live_classes = live
+                    .iter()
+                    .filter(|range| {
+                        range.class != UnifiedVramClass::Expert
+                            && pieces.iter().any(|piece| {
+                                piece.shard == range.shard
+                                    && range.offset < piece.end
+                                    && range.offset.saturating_add(range.len) > piece.start
+                            })
+                    })
+                    .fold(HashMap::<UnifiedVramClass, usize>::new(), |mut bytes, range| {
+                        *bytes.entry(range.class).or_default() += range.len;
+                        bytes
+                    });
                 be(format!(
-                    "{class:?} cannot fit {len} contiguous bytes in its frozen arena corridor"
+                    "{class:?} cannot fit {len} contiguous bytes in its frozen arena corridor: \
+                     corridor={corridor_bytes} bytes across {} shard piece(s), available={free_bytes} \
+                     bytes in {gaps} gap(s), largest_gap={largest_gap} bytes, batch={batch_bytes} \
+                     bytes / {} range(s), placed={} range(s), live={live_classes:?}, reservations={}, \
+                     protected_experts={}",
+                    pieces.len(),
+                    requested.len(),
+                    blockers.len().saturating_sub(initial_blockers),
+                    reservations.len(),
+                    protected_experts.len(),
                 ))
             })?;
             let range = PlannedRange {
@@ -802,6 +833,43 @@ fn find_high_gap(
         }
     }
     None
+}
+
+fn gap_stats(pieces: &[ArenaPiece], blockers: &[PlannedRange]) -> (usize, usize, usize) {
+    let mut total = 0usize;
+    let mut largest = 0usize;
+    let mut count = 0usize;
+    for piece in pieces {
+        let mut occupied: Vec<_> = blockers
+            .iter()
+            .filter(|range| range.shard == piece.shard)
+            .map(|range| {
+                (
+                    range.offset.max(piece.start),
+                    range.offset.saturating_add(range.len).min(piece.end),
+                )
+            })
+            .filter(|&(start, end)| start < end)
+            .collect();
+        occupied.sort_unstable();
+        let mut cursor = piece.start;
+        for (start, end) in occupied {
+            if cursor < start {
+                let bytes = start - cursor;
+                total = total.saturating_add(bytes);
+                largest = largest.max(bytes);
+                count += 1;
+            }
+            cursor = cursor.max(end);
+        }
+        if cursor < piece.end {
+            let bytes = piece.end - cursor;
+            total = total.saturating_add(bytes);
+            largest = largest.max(bytes);
+            count += 1;
+        }
+    }
+    (total, largest, count)
 }
 
 fn ranges_overlap(a_offset: usize, a_len: usize, b_offset: usize, b_len: usize) -> bool {
