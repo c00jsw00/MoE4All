@@ -58,6 +58,7 @@ use std::ffi::CStr;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::time::Duration;
 
 use ash::vk;
 use gpu_allocator::vulkan::{
@@ -607,7 +608,10 @@ struct VulkanShared {
     /// Vulkan requires host access to one queue to be externally synchronized. It also turns the
     /// rare submit-OOM recovery into one atomic drain/retry boundary across the graph and Prefill
     /// upload threads without changing GPU submission order.
-    queue_access: Mutex<()>,
+    queue_access: Arc<Mutex<()>>,
+    /// Keeps affected AMD Windows drivers from evicting idle dedicated VRAM into their system-RAM
+    /// backing store while model weights are loading or a server is between requests.
+    vram_keepalive: Option<VramKeepalive>,
     /// First unrecoverable queue-submit result, or `SUCCESS` while submissions are usable. Pager
     /// residency is resolved before its copies are submitted, so allowing a later request after an
     /// ultimately failed submit could turn those unexecuted copies into false cache hits.
@@ -750,6 +754,162 @@ struct VulkanShared {
     /// Reused staging ring for weight uploads (see [`StagingRing`]). Built lazily on
     /// the first staged weight upload of a load and torn down with the weight scope.
     staging_ring: Mutex<Option<StagingRing>>,
+}
+
+const AMD_WINDOWS_VRAM_KEEPALIVE_MIN_DRIVER: u32 = vk::make_api_version(0, 2, 0, 395);
+const AMD_WINDOWS_VRAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+fn needs_amd_windows_vram_keepalive(
+    probe: &crate::caps::DeviceProbe,
+    arch: crate::caps::DeviceArch,
+    driver_version: u32,
+) -> bool {
+    cfg!(target_os = "windows")
+        && probe.driver_id_reported
+        && probe.driver_id == vk::DriverId::AMD_PROPRIETARY
+        && arch == crate::caps::DeviceArch::AmdRdna3
+        && driver_version >= AMD_WINDOWS_VRAM_KEEPALIVE_MIN_DRIVER
+}
+
+struct VramKeepalive {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VramKeepalive {
+    fn start(
+        device: ash::Device,
+        queue: vk::Queue,
+        queue_family_index: u32,
+        queue_access: Arc<Mutex<()>>,
+    ) -> Option<Self> {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("infr-vram-keepalive".into())
+            .spawn(move || {
+                let pool = match unsafe {
+                    device.create_command_pool(
+                        &vk::CommandPoolCreateInfo::default()
+                            .queue_family_index(queue_family_index),
+                        None,
+                    )
+                } {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        tracing::warn!(
+                            "[infr] AMD Windows VRAM keepalive could not create its command pool: {error}"
+                        );
+                        return;
+                    }
+                };
+                let command = match unsafe {
+                    device.allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                } {
+                    Ok(commands) => commands[0],
+                    Err(error) => {
+                        tracing::warn!(
+                            "[infr] AMD Windows VRAM keepalive could not allocate its command buffer: {error}"
+                        );
+                        unsafe { device.destroy_command_pool(pool, None) };
+                        return;
+                    }
+                };
+                let fence = match unsafe {
+                    device.create_fence(&vk::FenceCreateInfo::default(), None)
+                } {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        tracing::warn!(
+                            "[infr] AMD Windows VRAM keepalive could not create its fence: {error}"
+                        );
+                        unsafe { device.destroy_command_pool(pool, None) };
+                        return;
+                    }
+                };
+                let record_result = unsafe {
+                    device
+                        .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+                        .and_then(|()| device.end_command_buffer(command))
+                };
+                if let Err(error) = record_result {
+                    tracing::warn!(
+                        "[infr] AMD Windows VRAM keepalive could not record its command buffer: {error}"
+                    );
+                    unsafe {
+                        device.destroy_fence(fence, None);
+                        device.destroy_command_pool(pool, None);
+                    }
+                    return;
+                }
+
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    let commands = [command];
+                    let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
+                    let submit_result = {
+                        let Ok(_queue) = queue_access.lock() else {
+                            break;
+                        };
+                        unsafe {
+                            device
+                                .reset_fences(&[fence])
+                                .and_then(|()| device.queue_submit(queue, &submits, fence))
+                        }
+                    };
+                    if let Err(error) = submit_result {
+                        tracing::warn!(
+                            "[infr] AMD Windows VRAM keepalive stopped after queue submit failed: {error}"
+                        );
+                        break;
+                    }
+                    if let Err(error) = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }
+                    {
+                        tracing::warn!(
+                            "[infr] AMD Windows VRAM keepalive stopped after fence wait failed: {error}"
+                        );
+                        break;
+                    }
+                    match stop_rx.recv_timeout(AMD_WINDOWS_VRAM_KEEPALIVE_INTERVAL) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => break,
+                    }
+                }
+                unsafe {
+                    device.destroy_fence(fence, None);
+                    device.destroy_command_pool(pool, None);
+                }
+            });
+        match worker {
+            Ok(worker) => Some(Self {
+                stop: Some(stop_tx),
+                worker: Some(worker),
+            }),
+            Err(error) => {
+                tracing::warn!("[infr] AMD Windows VRAM keepalive thread could not start: {error}");
+                None
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for VramKeepalive {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1291,6 +1451,9 @@ impl VulkanShared {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for VulkanShared {
     fn drop(&mut self) {
+        if let Some(mut keepalive) = self.vram_keepalive.take() {
+            keepalive.stop();
+        }
         unsafe {
             // Also the pipeline cache's TRIPWIRE verdict (see `pcache.rs`): VK_ERROR_DEVICE_LOST is
             // STICKY — once the device is lost every call returns it — so this one drain doubles as
@@ -3762,6 +3925,27 @@ impl VulkanBackend {
                 }
             }
         });
+        let queue_access = Arc::new(Mutex::new(()));
+        let vram_keepalive = if needs_amd_windows_vram_keepalive(
+            &device_probe,
+            device_arch,
+            props.driver_version,
+        ) {
+            tracing::info!(
+                "[infr] AMD Windows VRAM keepalive enabled for Vulkan driver {}.{}.{}; one empty submit per second prevents idle dedicated-VRAM eviction into system RAM",
+                vk::api_version_major(props.driver_version),
+                vk::api_version_minor(props.driver_version),
+                vk::api_version_patch(props.driver_version),
+            );
+            VramKeepalive::start(
+                device.clone(),
+                queue,
+                queue_family_index,
+                queue_access.clone(),
+            )
+        } else {
+            None
+        };
 
         // Success: the instance/device/pool now move into `VulkanShared` (which owns their
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
@@ -3790,7 +3974,8 @@ impl VulkanBackend {
                 queue,
                 queue_family_index,
                 dedicated_transfer,
-                queue_access: Mutex::new(()),
+                queue_access,
+                vram_keepalive,
                 queue_submit_failure: AtomicI32::new(vk::Result::SUCCESS.as_raw()),
                 cmd_pool: Mutex::new(cmd_pool),
                 recorder_cmds: Mutex::new(Vec::new()),
@@ -7259,6 +7444,37 @@ mod tests {
 
     fn submit_policy(profile: infr_core::config::AutoProfile) -> SubmitAutoPolicy {
         SubmitAutoPolicy::new(SubmitAutoSettings::for_profile(profile))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn amd_windows_vram_keepalive_starts_only_on_the_fixed_submit_driver_branch() {
+        let mut probe = crate::caps::DeviceProbe {
+            driver_id: vk::DriverId::AMD_PROPRIETARY,
+            driver_id_reported: true,
+            ..Default::default()
+        };
+        assert!(!needs_amd_windows_vram_keepalive(
+            &probe,
+            crate::caps::DeviceArch::AmdRdna3,
+            vk::make_api_version(0, 2, 0, 388),
+        ));
+        assert!(needs_amd_windows_vram_keepalive(
+            &probe,
+            crate::caps::DeviceArch::AmdRdna3,
+            AMD_WINDOWS_VRAM_KEEPALIVE_MIN_DRIVER,
+        ));
+        assert!(!needs_amd_windows_vram_keepalive(
+            &probe,
+            crate::caps::DeviceArch::Other,
+            AMD_WINDOWS_VRAM_KEEPALIVE_MIN_DRIVER,
+        ));
+        probe.driver_id = vk::DriverId::MESA_RADV;
+        assert!(!needs_amd_windows_vram_keepalive(
+            &probe,
+            crate::caps::DeviceArch::AmdRdna3,
+            AMD_WINDOWS_VRAM_KEEPALIVE_MIN_DRIVER,
+        ));
     }
 
     #[test]
