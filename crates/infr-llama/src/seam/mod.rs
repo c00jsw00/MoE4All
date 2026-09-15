@@ -1065,8 +1065,34 @@ fn parallel_prefill_attention_scratch_bytes(cfg: &Config, want_ctx: usize, ubatc
         .saturating_mul(4)
 }
 
+/// Score matrix retained by the Vulkan QSA indexer while it selects compressed KV blocks.
+///
+/// This is one pooled high-water workspace, not one allocation per QSA layer. Its second
+/// dimension grows with context depth, so omitting it from the frozen runtime corridor lets a
+/// short prefill start successfully and then fail when a later chunk crosses a larger score size.
+fn qsa_indexer_scratch_bytes(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
+    if !cfg.qwen4exp || want_ctx == 0 || ubatch == 0 || cfg.indexer_top_k == 0 {
+        return 0;
+    }
+    let ratio = cfg
+        .compress_ratios
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let sparse_threshold = cfg.indexer_top_k.saturating_add(ratio).saturating_sub(1);
+    if want_ctx <= sparse_threshold {
+        return 0;
+    }
+    (ubatch.min(want_ctx) as u64)
+        .saturating_mul((want_ctx / ratio) as u64)
+        .saturating_mul(4)
+}
+
 /// Runtime workspace priced by placement and checked against Vulkan's measured activation peak.
-/// This includes the graph's ordinary activation pools plus format-specific KV read scratch.
+/// This includes the graph's ordinary activation pools plus format-specific KV read and QSA
+/// indexer scratch.
 pub(crate) fn runtime_reserve_at(
     cfg: &Config,
     caps: &Capabilities,
@@ -1083,6 +1109,7 @@ pub(crate) fn runtime_reserve_at(
         .saturating_add(parallel_prefill_attention_scratch_bytes(
             cfg, want_ctx, ubatch,
         ))
+        .saturating_add(qsa_indexer_scratch_bytes(cfg, want_ctx, ubatch))
 }
 
 /// Number of ubatches in one Qwen3.8 layer-major prefill group. Eight leaves enough same-layer
@@ -6652,6 +6679,25 @@ mod seam_helper_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn qwen38_reserves_qsa_indexer_scores_to_the_context_limit() {
+        let cfg = Config {
+            qwen4exp: true,
+            indexer_top_k: 2048,
+            compress_ratios: vec![0, 4, 0, 4],
+            ..Default::default()
+        };
+        assert_eq!(super::qsa_indexer_scratch_bytes(&cfg, 2051, 3072), 0);
+        assert_eq!(
+            super::qsa_indexer_scratch_bytes(&cfg, 8192, 3072),
+            25_165_824
+        );
+        assert_eq!(
+            super::qsa_indexer_scratch_bytes(&cfg, 163_840, 3072),
+            503_316_480
+        );
     }
 
     #[test]

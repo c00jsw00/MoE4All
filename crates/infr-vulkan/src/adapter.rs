@@ -404,6 +404,53 @@ fn sequence_spans(graph: &Graph, rows: usize) -> Result<&[SequenceSpan]> {
     Ok(&graph.sequence_spans)
 }
 
+fn decode_token_rows(graph: &Graph) -> Option<usize> {
+    if !graph.independent_rows {
+        return Some(1);
+    }
+    (!graph.sequence_spans.is_empty() && graph.sequence_spans.iter().all(|span| span.rows == 1))
+        .then_some(graph.sequence_spans.len())
+}
+
+fn qsa_topk_workspace_needed(
+    rows: u32,
+    blocks: u32,
+    independent_spans: Option<&[SequenceSpan]>,
+    ratio: u32,
+) -> bool {
+    independent_spans.map_or(
+        rows == 1 && blocks >= QSA_TOPK_PARALLEL_MIN_BLOCKS,
+        |spans| {
+            spans.iter().any(|span| {
+                span.rows == 1
+                    && (span.start_pos + span.rows) / ratio >= QSA_TOPK_PARALLEL_MIN_BLOCKS
+            })
+        },
+    )
+}
+
+fn qsa_indexer_blocks(kv_len: u32, independent_spans: Option<&[SequenceSpan]>, ratio: u32) -> u32 {
+    independent_spans.map_or(kv_len / ratio, |spans| {
+        spans
+            .iter()
+            .map(|span| (span.start_pos + span.rows) / ratio)
+            .max()
+            .unwrap_or(0)
+    })
+}
+
+fn qsa_indexer_score_capacity_bytes(
+    rows: u32,
+    current_blocks: u32,
+    block_cache_elements: usize,
+    head_dim: u32,
+) -> usize {
+    let capacity_blocks = block_cache_elements / head_dim.max(1) as usize;
+    (rows as usize)
+        .saturating_mul(capacity_blocks.max(current_blocks as usize))
+        .saturating_mul(4)
+}
+
 /// Allocate the `Internal` scratch (activations) for `graph`. The leading (row) dim is padded to a
 /// multiple of 64 so the prefill GEMM / flash kernels — which write ceil(rows/64)*64 output rows —
 /// write DIRECTLY into these buffers (no padded temp + copy). Padding rows are never read (downstream
@@ -628,6 +675,21 @@ impl ScratchPool {
         requests: &[(&'static str, usize)],
         alloc: impl FnOnce(&[usize]) -> Result<Vec<Box<dyn Buffer>>>,
     ) -> Result<Vec<ScratchKey>> {
+        let (keys, missing) = self.plan_batch(requests)?;
+        if !missing.is_empty() {
+            let capacities = missing.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>();
+            let buffers = alloc(&capacities)?;
+            self.finish_planned_batch(&keys, missing, buffers)?;
+        } else {
+            self.in_use.extend(keys.iter().copied());
+        }
+        Ok(keys)
+    }
+
+    fn plan_batch(
+        &mut self,
+        requests: &[(&'static str, usize)],
+    ) -> Result<(Vec<ScratchKey>, Vec<ScratchKey>)> {
         let mut seen = HashSet::with_capacity(requests.len());
         for &(tag, _) in requests {
             if !seen.insert(tag) {
@@ -662,20 +724,25 @@ impl ScratchPool {
             keys.push(key);
         }
 
-        if !missing.is_empty() {
-            let capacities = missing.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>();
-            let buffers = alloc(&capacities)?;
-            if buffers.len() != missing.len() {
-                return Err(be(
-                    "scratch batch allocator returned the wrong buffer count",
-                ));
-            }
-            for (key, buffer) in missing.into_iter().zip(buffers) {
-                self.buffers.insert(key, buffer);
-            }
+        Ok((keys, missing))
+    }
+
+    fn finish_planned_batch(
+        &mut self,
+        keys: &[ScratchKey],
+        missing: Vec<ScratchKey>,
+        buffers: Vec<Box<dyn Buffer>>,
+    ) -> Result<()> {
+        if buffers.len() != missing.len() {
+            return Err(be(
+                "scratch batch allocator returned the wrong buffer count",
+            ));
+        }
+        for (key, buffer) in missing.into_iter().zip(buffers) {
+            self.buffers.insert(key, buffer);
         }
         self.in_use.extend(keys.iter().copied());
-        Ok(keys)
+        Ok(())
     }
 
     /// Keep one high-water capacity per logical workspace. This is called only after every command
@@ -765,7 +832,7 @@ impl RuntimePhaseArena {
         }
         self.pool.begin_execute();
 
-        self.activate_scratch_topology(layout);
+        let topology_changed = self.activate_scratch_topology(phase, layout);
         let reset_retained_scratch = self.scratch.iter().any(Option::is_some);
         let scratch_reused = self.scratch_satisfies(layout);
         // A Qwen3.8 prefill can start with the shorter QSA-boundary chunk and then grow to the
@@ -774,7 +841,10 @@ impl RuntimePhaseArena {
         // graph scratch grows creates an artificial old-pool + new-graph peak that the steady-
         // state runtime reserve neither needs nor prices. Equal-shape prefill still retains its
         // high-water pool, and Decode keeps the established alternating-topology cache.
-        if phase == RuntimePhase::Prefill && !scratch_reused && reset_retained_scratch {
+        if phase == RuntimePhase::Prefill
+            && !scratch_reused
+            && (topology_changed || reset_retained_scratch)
+        {
             self.pool.clear();
         }
         RuntimePhaseStart {
@@ -788,10 +858,23 @@ impl RuntimePhaseArena {
     /// third family replaces the inactive one, bounding retained VRAM while preserving the common
     /// A/B/A/B path. Buffers never move while an execute is live: callers enter here only after the
     /// preceding execution has drained.
-    fn activate_scratch_topology(&mut self, layout: &ScratchLayout) {
+    fn activate_scratch_topology(&mut self, phase: RuntimePhase, layout: &ScratchLayout) -> bool {
         let topology: Vec<bool> = layout.iter().map(Option::is_some).collect();
         if self.scratch_topology == topology {
-            return;
+            return false;
+        }
+
+        // Alternating graph retention is a Decode-only optimization. Prefill workspaces are
+        // several GiB at a wide ubatch, so carrying the previous topology into the next allocation
+        // creates an artificial old+new peak. The preceding execute has drained before this call,
+        // making it safe to return both prior topologies to the unified arena immediately.
+        if phase == RuntimePhase::Prefill {
+            self.scratch.clear();
+            self.scratch_layout = layout.iter().map(|_| None).collect();
+            self.scratch = (0..layout.len()).map(|_| None).collect();
+            self.scratch_topology = topology;
+            self.parked_scratch = None;
+            return true;
         }
 
         let current = (!self.scratch.is_empty()).then(|| PhaseScratch {
@@ -817,6 +900,7 @@ impl RuntimePhaseArena {
             self.scratch_layout = layout.iter().map(|_| None).collect();
             self.scratch = (0..layout.len()).map(|_| None).collect();
         }
+        true
     }
 
     fn scratch_satisfies(&self, layout: &ScratchLayout) -> bool {
@@ -835,10 +919,15 @@ impl RuntimePhaseArena {
                 )
     }
 
-    /// Allocate only missing/grown TensorId slots. Existing capacities are released before their
-    /// replacements are requested, and modest geometric growth amortizes context-dependent shapes
-    /// without reserving a second copy of the whole graph.
-    fn grow_scratch(&mut self, be_: &VulkanBackend, layout: &ScratchLayout) -> Result<()> {
+    /// Allocate missing/grown graph tensors and pooled phase workspaces as one transaction. The
+    /// unified allocator can then pack every indivisible range largest-first across physical
+    /// shards instead of seeing several individually well-packed batches that fragment each other.
+    fn grow_workspace(
+        &mut self,
+        be_: &VulkanBackend,
+        layout: &ScratchLayout,
+        pool_requests: &[(&'static str, usize)],
+    ) -> Result<()> {
         debug_assert_eq!(self.scratch_topology.len(), layout.len());
         let mut indices = Vec::new();
         let mut capacities = Vec::new();
@@ -860,14 +949,23 @@ impl RuntimePhaseArena {
             indices.push(i);
             capacities.push(capacity);
         }
-        if indices.is_empty() {
-            return Ok(());
-        }
-        let buffers = be_.alloc_zeroed_batch(&capacities, BufferUsage::Activations)?;
-        for ((i, capacity), buffer) in indices.into_iter().zip(capacities).zip(buffers) {
+
+        let (pool_keys, pool_missing) = self.pool.plan_batch(pool_requests)?;
+        let mut sizes = capacities.clone();
+        sizes.extend(pool_missing.iter().map(|(_, bytes)| *bytes));
+        let mut buffers = be_
+            .alloc_zeroed_batch(&sizes, BufferUsage::Activations)?
+            .into_iter();
+        for (i, capacity) in indices.into_iter().zip(capacities) {
             self.scratch_layout[i] = Some(capacity);
-            self.scratch[i] = Some(buffer);
+            self.scratch[i] = Some(
+                buffers
+                    .next()
+                    .expect("workspace allocation returned every graph buffer"),
+            );
         }
+        self.pool
+            .finish_planned_batch(&pool_keys, pool_missing, buffers.collect())?;
         Ok(())
     }
 
@@ -1301,14 +1399,160 @@ fn pooled_batch(
     })
 }
 
+/// Describe the largest QSA indexer workspace used by this graph. QSA first appears late in a
+/// Qwen3.8 layer, so its context-sized score matrix must join the phase's initial packing plan.
+fn paged_qsa_scratch_requests(graph: &Graph) -> Result<Vec<(&'static str, usize)>> {
+    let mut score_bytes = 0usize;
+    let mut needs_topk_work = false;
+    for op in &graph.ops {
+        let Op::QsaIndexer {
+            block_cache,
+            rows,
+            kv_len,
+            ratio,
+            head_dim,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let independent_spans = graph
+            .independent_rows
+            .then(|| sequence_spans(graph, *rows as usize))
+            .transpose()?;
+        let ratio = (*ratio).max(1);
+        let blocks = qsa_indexer_blocks(*kv_len, independent_spans, ratio);
+        // The cache declaration describes the complete configured context even when its dynamic
+        // segmented binding has committed only the current 32K prefix. Reserve that full score
+        // width now: growing this pooled matrix at every context step can strand its old high-water
+        // neighbours and fail despite the runtime corridor having priced the final capacity.
+        score_bytes = score_bytes.max(qsa_indexer_score_capacity_bytes(
+            *rows,
+            blocks,
+            graph.desc(*block_cache).numel(),
+            *head_dim,
+        ));
+        needs_topk_work |= qsa_topk_workspace_needed(*rows, blocks, independent_spans, ratio);
+    }
+
+    if score_bytes == 0 {
+        return Ok(Vec::new());
+    }
+    let mut requests = vec![("qsa_indexer_scores", score_bytes)];
+    if needs_topk_work {
+        requests.push(("qsa_indexer_topk_work", QSA_TOPK_PARALLEL_WORK_BYTES));
+    }
+    Ok(requests)
+}
+
+fn paged_mmq_scratch_requests(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    op: &Op,
+) -> Option<Vec<(&'static str, usize)>> {
+    let Op::MoeFfn {
+        x,
+        gate_exps,
+        up_exps,
+        down_exps,
+        fused_gate_up,
+        ne,
+        n_expert,
+        n_used,
+        n_ff_exp,
+        act,
+        ..
+    } = op
+    else {
+        return None;
+    };
+    let (ne, n_expert, n_used, nff) = (
+        *ne as usize,
+        *n_expert as usize,
+        *n_used as usize,
+        *n_ff_exp as usize,
+    );
+    let rows = graph.desc(*x).numel() / ne;
+    let parallel_decode = rows > 1
+        && graph.independent_rows
+        && graph.sequence_spans.len() == rows
+        && graph.sequence_spans.iter().all(|span| span.rows == 1);
+    let (gdt, udt, ddt) = (
+        graph.desc(*gate_exps).dtype,
+        graph.desc(*up_exps).dtype,
+        graph.desc(*down_exps).dtype,
+    );
+    let paged_mmq_act_ok = if *fused_gate_up {
+        matches!(act, Activation::Silu | Activation::Gelu)
+    } else {
+        matches!(act, Activation::Silu)
+    };
+    if parallel_decode
+        || rows <= moe_small_m_threshold(be_)
+        || !be_.caps().i8_dot
+        || !paged_mmq_act_ok
+        || !infr_core::tensor::moe_paged_mmq_ok(gdt)
+        || !infr_core::tensor::moe_paged_mmq_ok(udt)
+        || !infr_core::tensor::moe_paged_mmq_ok(ddt)
+    {
+        return None;
+    }
+
+    let n_pairs = rows * n_used;
+    let npad = n_pairs.div_ceil(64) * 64 + 64;
+    let gu_width = if *fused_gate_up { 2 * nff } else { nff };
+    let mut requests = vec![
+        ("moe_pgb_counts", n_expert * 4),
+        ("moe_pgb_offsets", n_expert * 4),
+        ("moe_pgb_fill", n_expert * 4),
+        ("moe_pgb_brows", n_pairs * 4),
+        ("moe_pgb_bwts", n_pairs * 4),
+        ("moe_pgb_ipos", n_pairs * 4),
+        ("moe_pgb_qa", npad * ne),
+        ("moe_pgb_qda", npad * (ne / 32) * 2),
+        ("moe_pgb_qsa", npad * (ne / 32) * 2),
+        ("moe_pgb_ge", npad * gu_width * 4),
+    ];
+    if !*fused_gate_up {
+        requests.push(("moe_pgb_ue", npad * nff * 4));
+    }
+    requests.extend([
+        ("moe_pgb_ae", npad * nff * 4),
+        ("moe_pgb_dqa", npad * nff),
+        ("moe_pgb_dda", npad * (nff / 32) * 2),
+        ("moe_pgb_dsa", npad * (nff / 32) * 2),
+        ("moe_pgb_ye", npad * ne * 4),
+    ]);
+    Some(requests)
+}
+
+/// Describe the largest paged-MMQ workspace. Every MoE layer reuses these tags, so only the
+/// maximum capacity for each tag is live.
+fn paged_moe_scratch_requests(be_: &VulkanBackend, graph: &Graph) -> Vec<(&'static str, usize)> {
+    let mut maxima = HashMap::<&'static str, usize>::new();
+    for op in &graph.ops {
+        let Some(requests) = paged_mmq_scratch_requests(be_, graph, op) else {
+            continue;
+        };
+        for (tag, bytes) in requests {
+            maxima
+                .entry(tag)
+                .and_modify(|capacity| *capacity = (*capacity).max(bytes))
+                .or_insert(bytes);
+        }
+    }
+    let mut requests = maxima.into_iter().collect::<Vec<_>>();
+    requests.sort_unstable_by_key(|&(tag, _)| tag);
+    requests
+}
+
 /// Reserve every DeltaNet prefill workspace before a paged graph freezes its first expert LUT.
 /// These buffers are reused across serialized layers; allocating them lazily inside `lower_op`
 /// would let unified VRAM retire an expert slot that an earlier recorded layer still addresses.
-fn preallocate_paged_deltanet_scratch(
+fn paged_deltanet_scratch_requests(
     be_: &VulkanBackend,
     graph: &Graph,
-    pool: &mut ScratchPool,
-) -> Result<()> {
+) -> Vec<(&'static str, usize)> {
     let mut seq = [0usize; 4];
     let mut split = [0usize; 6];
     for op in &graph.ops {
@@ -1351,7 +1595,7 @@ fn preallocate_paged_deltanet_scratch(
             split[5] = split[5].max((nchunk * nv * 32 * 4).max(4));
         }
     }
-    for (tag, bytes) in [
+    [
         ("dn_seq_kn", seq[0]),
         ("dn_seq_qn", seq[1]),
         ("dn_seq_bet", seq[2]),
@@ -1362,12 +1606,30 @@ fn preallocate_paged_deltanet_scratch(
         ("dn_split_dq", split[3]),
         ("dn_split_bg", split[4]),
         ("dn_split_gg", split[5]),
-    ] {
-        if bytes != 0 {
-            pooled(pool, be_, tag, bytes)?;
-        }
+    ]
+    .into_iter()
+    .filter(|(_, bytes)| *bytes != 0)
+    .collect()
+}
+
+fn paged_phase_scratch_requests(
+    be_: &VulkanBackend,
+    graph: &Graph,
+) -> Result<Vec<(&'static str, usize)>> {
+    let mut maxima = HashMap::<&'static str, usize>::new();
+    for (tag, bytes) in paged_qsa_scratch_requests(graph)?
+        .into_iter()
+        .chain(paged_moe_scratch_requests(be_, graph))
+        .chain(paged_deltanet_scratch_requests(be_, graph))
+    {
+        maxima
+            .entry(tag)
+            .and_modify(|capacity| *capacity = (*capacity).max(bytes))
+            .or_insert(bytes);
     }
-    Ok(())
+    let mut requests = maxima.into_iter().collect::<Vec<_>>();
+    requests.sort_unstable_by_key(|&(tag, _)| tag);
+    Ok(requests)
 }
 
 /// Small-m MoE scratch handle: a pooled `(tag, bytes)` key (the default — rides the per-execute
@@ -3291,13 +3553,7 @@ fn lower_op(
                 .then(|| sequence_spans(graph, *rows as usize))
                 .transpose()?;
             let ratio_safe = *ratio.max(&1);
-            let blocks = independent_spans.map_or(*kv_len / ratio_safe, |spans| {
-                spans
-                    .iter()
-                    .map(|span| (span.start_pos + span.rows) / ratio_safe)
-                    .max()
-                    .unwrap_or(0)
-            });
+            let blocks = qsa_indexer_blocks(*kv_len, independent_spans, ratio_safe);
             let first_visible = kv_len.saturating_sub(*rows).saturating_add(1);
             let first_blocks = independent_spans.map_or(first_visible / ratio_safe, |spans| {
                 spans
@@ -3335,16 +3591,17 @@ fn lower_op(
                 "qsa_indexer_scores",
                 *rows as usize * blocks as usize * 4,
             )?;
-            let topk_work = if *rows == 1 && blocks >= QSA_TOPK_PARALLEL_MIN_BLOCKS {
-                Some(pooled(
-                    pool,
-                    be_,
-                    "qsa_indexer_topk_work",
-                    QSA_TOPK_PARALLEL_WORK_BYTES,
-                )?)
-            } else {
-                None
-            };
+            let topk_work =
+                if qsa_topk_workspace_needed(*rows, blocks, independent_spans, ratio_safe) {
+                    Some(pooled(
+                        pool,
+                        be_,
+                        "qsa_indexer_topk_work",
+                        QSA_TOPK_PARALLEL_WORK_BYTES,
+                    )?)
+                } else {
+                    None
+                };
             if graph.independent_rows {
                 if positions4.is_some() {
                     return Err(be(
@@ -3357,6 +3614,10 @@ fn lower_op(
                 let q_row_bytes = *n_head as usize * *head_dim as usize * 2;
                 let dst_row_bytes = *top_blocks as usize * 4;
                 for (lane, span) in spans.iter().enumerate() {
+                    let lane_blocks = (span.start_pos + span.rows) / ratio_safe;
+                    let lane_topk_work = topk_work
+                        .filter(|_| span.rows == 1 && lane_blocks >= QSA_TOPK_PARALLEL_MIN_BLOCKS)
+                        .map(|id| pool[&id].as_ref());
                     let (raw_binding, block_binding, segment_shifts) = match (
                         segmented_kv_view(raw[lane]),
                         segmented_kv_view(compressed[lane]),
@@ -3377,7 +3638,7 @@ fn lower_op(
                         block_binding,
                         r(*k_norm)?,
                         pool[&sk].as_ref(),
-                        None,
+                        lane_topk_work,
                         r(*dst)?,
                         span.rows,
                         span.start_pos + span.rows,
@@ -3578,6 +3839,131 @@ fn lower_op(
                 let q_row_bytes = *n_head as usize * *head_dim as usize * 2;
                 let idx_row_bytes = *top_blocks as usize * 4;
                 let dst_row_bytes = *n_head as usize * *head_dim as usize * 4;
+                // A token-row cohort used to route each lane through qsa_attention_batch. That
+                // kernel owns only four subgroups and scans all selected keys serially; at long
+                // context it makes two independent decode rows slower than two scalar forwards.
+                // Preserve the scalar QSA algorithm instead: gather one lane's selected blocks,
+                // run the established split-K attention, then reuse the same scratch for the next
+                // lane. The surrounding graph (including its aggregated MoE) remains batched.
+                if spans.iter().all(|span| span.rows == 1) {
+                    let row_elems = *n_kv as usize * *head_dim as usize;
+                    let geometries = spans
+                        .iter()
+                        .map(|span| {
+                            let visible = (span.start_pos + 1) as usize;
+                            let complete = visible / ratio_safe as usize;
+                            let tail = visible % ratio_safe as usize;
+                            let selected = (*top_blocks as usize).min(complete);
+                            let keys = selected * ratio_safe as usize + tail;
+                            let chunk = split_k_chunk_count_cap(
+                                keys,
+                                infr_core::tier::adaptive_chunk(keys, &ATTN_SPLIT),
+                            );
+                            let n_chunks = keys.div_ceil(chunk);
+                            (complete, tail, selected, keys, chunk, n_chunks)
+                        })
+                        .collect::<Vec<_>>();
+                    let max_keys = geometries
+                        .iter()
+                        .map(|geometry| geometry.3)
+                        .max()
+                        .unwrap_or(1);
+                    let max_n_chunks = geometries
+                        .iter()
+                        .map(|geometry| geometry.5)
+                        .max()
+                        .unwrap_or(1);
+                    let partials = (*n_head as usize).saturating_mul(max_n_chunks);
+                    let scratch = pooled_batch(
+                        pool,
+                        be_,
+                        &[
+                            (
+                                "qsa_independent_gather_k",
+                                max_keys.saturating_mul(row_elems).saturating_mul(2),
+                            ),
+                            (
+                                "qsa_independent_gather_v",
+                                max_keys.saturating_mul(row_elems).saturating_mul(2),
+                            ),
+                            ("qsa_independent_split_pm", partials.saturating_mul(4)),
+                            ("qsa_independent_split_pl", partials.saturating_mul(4)),
+                            (
+                                "qsa_independent_split_pacc",
+                                partials
+                                    .saturating_mul(*head_dim as usize)
+                                    .saturating_mul(4),
+                            ),
+                        ],
+                    )?;
+                    let (gather_k, gather_v, pm, pl, pacc) =
+                        (scratch[0], scratch[1], scratch[2], scratch[3], scratch[4]);
+
+                    for (lane, (span, geometry)) in spans.iter().zip(&geometries).enumerate() {
+                        let (complete, tail, selected, keys, chunk, n_chunks) = *geometry;
+                        let (k_binding, v_binding, segment_shift) = match (
+                            segmented_kv_view(k_rows[lane]),
+                            segmented_kv_view(v_rows[lane]),
+                        ) {
+                            (Some((k_table, k_shift)), Some((v_table, v_shift)))
+                                if k_shift == v_shift =>
+                            {
+                                (k_table, v_table, Some(k_shift))
+                            }
+                            (Some(_), Some(_)) => {
+                                return Err(be(
+                                    "vulkan independent-row QSA K/V segment geometry differs",
+                                ));
+                            }
+                            (None, None) => (k_rows[lane], v_rows[lane], None),
+                            _ => {
+                                return Err(be(
+                                    "vulkan independent-row QSA K/V caches must both be segmented or both be flat",
+                                ));
+                            }
+                        };
+                        rec.qsa_gather_off(
+                            k_binding,
+                            v_binding,
+                            r(*indices)?,
+                            pool[&gather_k].as_ref(),
+                            pool[&gather_v].as_ref(),
+                            selected as u32,
+                            complete as u32,
+                            tail as u32,
+                            *ratio,
+                            row_elems as u32,
+                            kdt == infr_core::DType::Q8_0,
+                            vdt == infr_core::DType::Q8_0,
+                            graph.desc(*k_cache).numel() as u32,
+                            graph.desc(*v_cache).numel() as u32,
+                            segment_shift,
+                            span.row_start as usize * idx_row_bytes,
+                        );
+                        rec.attention_kv_split_off(
+                            r(*q)?,
+                            span.row_start as usize * q_row_bytes,
+                            pool[&gather_k].as_ref(),
+                            pool[&gather_v].as_ref(),
+                            r(*dst)?,
+                            span.row_start as usize * dst_row_bytes,
+                            pool[&pm].as_ref(),
+                            pool[&pl].as_ref(),
+                            pool[&pacc].as_ref(),
+                            1,
+                            keys - 1,
+                            keys,
+                            *n_head as usize,
+                            *n_kv as usize,
+                            *head_dim as usize,
+                            chunk,
+                            n_chunks,
+                            *scale,
+                            max_keys.saturating_mul(row_elems),
+                        );
+                    }
+                    return Ok(());
+                }
                 for (lane, span) in spans.iter().enumerate() {
                     let (k_binding, v_binding, segment_shift) = match (
                         segmented_kv_view(k_rows[lane]),
@@ -7886,9 +8272,8 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                 }
             }
 
-            if !start.scratch_reused {
-                arena.grow_scratch(be_, &layout)?;
-            }
+            let pool_requests = paged_phase_scratch_requests(be_, graph)?;
+            arena.grow_workspace(be_, &layout, &pool_requests)?;
             Some(arena)
         } else {
             None
@@ -7914,9 +8299,6 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
             &mut local_pool,
         ),
     };
-    if be_.moe_paged() {
-        preallocate_paged_deltanet_scratch(be_, graph, pool)?;
-    }
     if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_part_t0) {
         infr_core::pager_profile::record_backend_setup_part(
             infr_core::pager_profile::BackendSetupKind::PhaseScratch,
@@ -8032,25 +8414,27 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
     // blocks (the small-m split's router readback) when residency actually demands it — see
     // `PagedStream`'s doc. Every non-paged graph (the overwhelming common case) never touches any
     // of this and records exactly like before — one recorder, one submit.
-    // A paged single-token graph already submits at its per-layer router/residency boundaries.
+    // A paged token-row graph already submits at its per-layer router/residency boundaries.
     // On automatic discrete-GPU settings, do not inherit a prefill-calibrated splitter cap and
     // subdivide those bounded decode segments again. This test is deliberately based on the MoE
     // input shape rather than replay eligibility: QSA and other stateful decode ops correctly force
-    // this graph down the static path while still carrying exactly one token row.
+    // this graph down the static path. Independent decode carries one token row per sequence.
     let mut saw_moe = false;
-    let single_token_paged_moe = be_.moe_paged()
+    let token_rows = decode_token_rows(graph);
+    let token_row_paged_moe = be_.moe_paged()
+        && token_rows.is_some()
         && graph.ops.iter().all(|op| {
             let Op::MoeFfn { x, ne, .. } = op else {
                 return true;
             };
             saw_moe = true;
-            graph.desc(*x).numel() == *ne as usize
+            graph.desc(*x).numel() == token_rows.expect("token rows were checked") * *ne as usize
         })
         && saw_moe;
     // Automatic submit calibration owns one complete prefill/batched execute as a sample. Open it
     // before the first recorder so pager-driven recorder rotations are included in the same GPU-
     // time round. Single-token paged decode intentionally does not consume a calibration round.
-    let submit_tune_round = be_.begin_submit_tune_round(single_token_paged_moe);
+    let submit_tune_round = be_.begin_submit_tune_round(token_row_paged_moe);
     let cap = submit_tune_round.cap();
     if let Some(elapsed) = infr_core::pager_profile::elapsed(setup_t0) {
         infr_core::pager_profile::record_backend_setup(elapsed);
@@ -9577,44 +9961,8 @@ fn execute_paged_moe<'a>(
     // Unified VRAM may loan cold expert cells to runtime scratch. Acquire the complete workspace
     // before freezing any LUT address for this op; otherwise a later lazy allocation can retire a
     // slot that the just-recorded LUT still names, turning the expert pointer into scratch memory.
-    let paged_mmq_ok = infr_core::tensor::moe_paged_mmq_ok;
-    let paged_mmq_act_ok = if *fused_gate_up {
-        matches!(act, Activation::Silu | Activation::Gelu)
-    } else {
-        matches!(act, Activation::Silu)
-    };
-    let use_paged_mmq = !parallel_decode
-        && rows > moe_small_m_threshold(be_)
-        && be_.caps().i8_dot
-        && paged_mmq_act_ok
-        && paged_mmq_ok(gdt)
-        && paged_mmq_ok(udt)
-        && paged_mmq_ok(ddt);
-    let moe_scratch = if use_paged_mmq {
-        let n_pairs = n_slots;
-        let npad = n_pairs.div_ceil(64) * 64 + 64;
-        let mut requests = vec![
-            ("moe_pgb_counts", n_expert * 4),
-            ("moe_pgb_offsets", n_expert * 4),
-            ("moe_pgb_fill", n_expert * 4),
-            ("moe_pgb_brows", n_pairs * 4),
-            ("moe_pgb_bwts", n_pairs * 4),
-            ("moe_pgb_ipos", n_pairs * 4),
-            ("moe_pgb_qa", npad * ne),
-            ("moe_pgb_qda", npad * (ne / 32) * 2),
-            ("moe_pgb_qsa", npad * (ne / 32) * 2),
-            ("moe_pgb_ge", npad * gu_width * 4),
-        ];
-        if !*fused_gate_up {
-            requests.push(("moe_pgb_ue", npad * nff * 4));
-        }
-        requests.extend([
-            ("moe_pgb_ae", npad * nff * 4),
-            ("moe_pgb_dqa", npad * nff),
-            ("moe_pgb_dda", npad * (nff / 32) * 2),
-            ("moe_pgb_dsa", npad * (nff / 32) * 2),
-            ("moe_pgb_ye", npad * ne * 4),
-        ]);
+    let mmq_requests = paged_mmq_scratch_requests(be_, graph, op);
+    let moe_scratch = if let Some(requests) = mmq_requests {
         let mut keys = pooled_batch(pool, be_, &requests)?.into_iter();
         let mut next = || {
             keys.next()
@@ -10451,6 +10799,81 @@ mod tests {
     use infr_core::DType;
 
     #[test]
+    fn independent_one_row_sequences_are_decode_token_rows() {
+        let mut graph = Graph::new();
+        assert_eq!(decode_token_rows(&graph), Some(1));
+
+        graph.independent_rows = true;
+        graph.sequence_spans = vec![
+            SequenceSpan {
+                row_start: 0,
+                rows: 1,
+                start_pos: 3_071,
+            },
+            SequenceSpan {
+                row_start: 1,
+                rows: 1,
+                start_pos: 38_511,
+            },
+        ];
+        assert_eq!(decode_token_rows(&graph), Some(2));
+
+        graph.sequence_spans[1].rows = 2;
+        assert_eq!(decode_token_rows(&graph), None);
+    }
+
+    #[test]
+    fn independent_qsa_decode_keeps_parallel_topk_after_the_long_context_threshold() {
+        let below = [
+            SequenceSpan {
+                row_start: 0,
+                rows: 1,
+                start_pos: 16_382,
+            },
+            SequenceSpan {
+                row_start: 1,
+                rows: 1,
+                start_pos: 16_382,
+            },
+        ];
+        assert!(!qsa_topk_workspace_needed(2, 4_095, Some(&below), 4));
+
+        let crossing = [
+            below[0],
+            SequenceSpan {
+                row_start: 1,
+                rows: 1,
+                start_pos: 16_383,
+            },
+        ];
+        assert!(qsa_topk_workspace_needed(2, 4_096, Some(&crossing), 4));
+        assert!(qsa_topk_workspace_needed(1, 4_096, None, 4));
+        assert!(!qsa_topk_workspace_needed(2, 4_096, None, 4));
+    }
+
+    #[test]
+    fn qsa_indexer_workspace_covers_the_deepest_independent_sequence() {
+        let spans = [
+            SequenceSpan {
+                row_start: 0,
+                rows: 1,
+                start_pos: 32_767,
+            },
+            SequenceSpan {
+                row_start: 1,
+                rows: 1,
+                start_pos: 65_535,
+            },
+        ];
+        assert_eq!(qsa_indexer_blocks(0, Some(&spans), 4), 16_384);
+        assert_eq!(qsa_indexer_blocks(65_536, None, 4), 16_384);
+        assert_eq!(
+            qsa_indexer_score_capacity_bytes(3_072, 16_384, 40_960 * 128, 128),
+            3_072 * 40_960 * 4,
+        );
+    }
+
+    #[test]
     fn decode_prefetch_window_calibrates_only_from_clean_samples() {
         let key = DecodePrefetchWindowKey::new(false, 250_000);
         let mut timing = DecodePrefetchTiming::default();
@@ -10758,6 +11181,44 @@ mod tests {
 
         arena.release_phase();
         assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn runtime_phase_prefill_releases_the_previous_scratch_topology() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut arena = RuntimePhaseArena::default();
+        let head = vec![Some(4), None];
+        let tail = vec![None, Some(8)];
+
+        arena.begin_execute(RuntimePhase::Prefill, &head);
+        arena.install_scratch(
+            &head,
+            vec![
+                Some(Box::new(DropCountBuffer {
+                    bytes: 4,
+                    drops: std::sync::Arc::clone(&drops),
+                })),
+                None,
+            ],
+        );
+        arena.pool.buffers.insert(
+            ("prefill_workspace", 16),
+            Box::new(DropCountBuffer {
+                bytes: 16,
+                drops: std::sync::Arc::clone(&drops),
+            }),
+        );
+
+        let start = arena.begin_execute(RuntimePhase::Prefill, &tail);
+
+        assert!(!start.scratch_reused);
+        assert!(!start.reset_retained_scratch);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(arena.parked_scratch.is_none());
+        assert!(arena.pool.buffers.is_empty());
+        assert_eq!(arena.scratch_topology, vec![false, true]);
+        assert_eq!(arena.scratch.len(), tail.len());
+        assert!(arena.scratch.iter().all(Option::is_none));
     }
 
     #[test]
@@ -12749,6 +13210,180 @@ mod tests {
                 (index / hd) % nh,
                 got[index],
                 want[index]
+            );
+        }
+    }
+
+    #[test]
+    fn qsa_independent_decode_matches_distinct_compact_attention() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return;
+        };
+        let (lanes, nh, nkv, hd, ratio, top, cap) =
+            (2usize, 4usize, 2usize, 128usize, 4usize, 64usize, 300usize);
+        let spans = [
+            SequenceSpan {
+                row_start: 0,
+                rows: 1,
+                start_pos: 266,
+            },
+            SequenceSpan {
+                row_start: 1,
+                rows: 1,
+                start_pos: 282,
+            },
+        ];
+        let scale = 1.0 / (hd as f32).sqrt();
+        let group = nh / nkv;
+        let to_f16 = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|&value| half::f16::from_f32(value).to_le_bytes())
+                .collect()
+        };
+        let deq = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .chunks_exact(2)
+                .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+                .collect()
+        };
+
+        let q_values = (0..lanes * nh * hd)
+            .map(|index| (index as f32 * 0.019).sin() * 0.5)
+            .collect::<Vec<_>>();
+        let q_bytes = to_f16(&q_values);
+        let q_values = deq(&q_bytes);
+        let mut indices = Vec::with_capacity(lanes * top);
+        indices.extend((0..top).map(|block| block as u32));
+        indices.extend((1..=top).map(|block| block as u32));
+
+        let mut keys = Vec::with_capacity(lanes);
+        let mut values = Vec::with_capacity(lanes);
+        let mut want = vec![0.0f32; lanes * nh * hd];
+        for lane in 0..lanes {
+            let key_bytes = to_f16(
+                &(0..cap * nkv * hd)
+                    .map(|index| ((index + lane * 31) as f32 * 0.011).cos() * 0.5)
+                    .collect::<Vec<_>>(),
+            );
+            let value_bytes = to_f16(
+                &(0..cap * nkv * hd)
+                    .map(|index| ((index + lane * 47) % 223) as f32 * 0.004 - 0.4)
+                    .collect::<Vec<_>>(),
+            );
+            let key_values = deq(&key_bytes);
+            let value_values = deq(&value_bytes);
+            let visible = spans[lane].start_pos as usize + 1;
+            let complete = visible / ratio;
+            let mut positions = indices[lane * top..(lane + 1) * top]
+                .iter()
+                .flat_map(|&block| {
+                    let start = block as usize * ratio;
+                    start..start + ratio
+                })
+                .collect::<Vec<_>>();
+            positions.extend(complete * ratio..visible);
+
+            for head in 0..nh {
+                let kv_head = head / group;
+                let mut scores = Vec::with_capacity(positions.len());
+                let mut max_score = f32::NEG_INFINITY;
+                for &position in &positions {
+                    let dot = (0..hd)
+                        .map(|dim| {
+                            q_values[(lane * nh + head) * hd + dim]
+                                * key_values[(position * nkv + kv_head) * hd + dim]
+                        })
+                        .sum::<f32>();
+                    let score = dot * scale;
+                    max_score = max_score.max(score);
+                    scores.push(score);
+                }
+                let sum = scores
+                    .iter()
+                    .map(|score| (score - max_score).exp())
+                    .sum::<f32>();
+                for (&position, score) in positions.iter().zip(scores) {
+                    let probability = (score - max_score).exp() / sum;
+                    for dim in 0..hd {
+                        want[(lane * nh + head) * hd + dim] +=
+                            probability * value_values[(position * nkv + kv_head) * hd + dim];
+                    }
+                }
+            }
+            keys.push(key_bytes);
+            values.push(value_bytes);
+        }
+
+        let mut graph = Graph::new();
+        graph.independent_rows = true;
+        graph.sequence_spans = spans.to_vec();
+        let qi = graph.input(TensorDesc::new(vec![lanes, nh, hd], DType::F16));
+        let ki = graph.input(TensorDesc::new(vec![cap, nkv, hd], DType::F16));
+        let vi = graph.input(TensorDesc::new(vec![cap, nkv, hd], DType::F16));
+        let ii = graph.input(TensorDesc::new(vec![lanes, top], DType::I32));
+        let yi = graph.output(TensorDesc::new(vec![lanes, nh, hd], DType::F32));
+        graph.push(Op::QsaBatchAttention {
+            q: qi,
+            k_cache: ki,
+            v_cache: vi,
+            indices: ii,
+            dst: yi,
+            rows: lanes as u32,
+            kv_len: spans.last().unwrap().start_pos + 1,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            top_blocks: top as u32,
+            ratio: ratio as u32,
+            scale,
+        });
+
+        let qb = be_.alloc(q_bytes.len(), BufferUsage::Activations).unwrap();
+        let ib = be_
+            .alloc(indices.len() * 4, BufferUsage::Activations)
+            .unwrap();
+        let yb = be_
+            .alloc(lanes * nh * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        be_.upload(qb.as_ref(), &q_bytes).unwrap();
+        be_.upload(ib.as_ref(), bytemuck::cast_slice(&indices))
+            .unwrap();
+        let mut key_buffers = Vec::with_capacity(lanes);
+        let mut value_buffers = Vec::with_capacity(lanes);
+        for lane in 0..lanes {
+            let kb = be_.alloc(keys[lane].len(), BufferUsage::KvCache).unwrap();
+            let vb = be_.alloc(values[lane].len(), BufferUsage::KvCache).unwrap();
+            be_.upload(kb.as_ref(), &keys[lane]).unwrap();
+            be_.upload(vb.as_ref(), &values[lane]).unwrap();
+            key_buffers.push(kb);
+            value_buffers.push(vb);
+        }
+        let plan = be_.compile(&graph).unwrap();
+        let mut bindings = Bindings::new();
+        bindings.bind(qi, qb.as_ref());
+        bindings.bind(ii, ib.as_ref());
+        bindings.bind_rows(
+            ki,
+            key_buffers.iter().map(|buffer| buffer.as_ref()).collect(),
+        );
+        bindings.bind_rows(
+            vi,
+            value_buffers.iter().map(|buffer| buffer.as_ref()).collect(),
+        );
+        bindings.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bindings).unwrap();
+
+        let mut got = vec![0.0f32; want.len()];
+        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for (index, (&got, &want)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (got - want).abs() < 3e-2,
+                "independent QSA mismatch at lane {}, head {}, dim {}: got {got}, want {want}",
+                index / (nh * hd),
+                (index / hd) % nh,
+                index % hd,
             );
         }
     }

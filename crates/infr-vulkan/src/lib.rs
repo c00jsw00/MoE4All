@@ -564,17 +564,17 @@ impl SubmitTuneRound {
     }
 }
 
-/// Select the cap for one transient/static graph. Automatic single-token paged-MoE decode already
+/// Select the cap for one transient/static graph. Automatic token-row paged-MoE decode already
 /// has mandatory pager submission boundaries between expert layers; inheriting a cap calibrated
 /// from a large prefill only subdivides those bounded segments again. Explicit overrides remain
 /// authoritative, and integrated GPUs retain their established TDR-safe platform cap.
 fn static_submit_mode(
     explicit: bool,
     integrated: bool,
-    single_token_paged_moe: bool,
+    token_row_paged_moe: bool,
     current_cap: usize,
 ) -> (usize, bool) {
-    if single_token_paged_moe && !explicit {
+    if token_row_paged_moe && !explicit {
         (infr_core::initial_submit_dispatch_cap(integrated), false)
     } else {
         (current_cap, true)
@@ -1099,11 +1099,11 @@ impl VulkanShared {
         }
     }
 
-    fn begin_submit_tune_round(self: &Arc<Self>, single_token_paged_moe: bool) -> SubmitTuneRound {
+    fn begin_submit_tune_round(self: &Arc<Self>, token_row_paged_moe: bool) -> SubmitTuneRound {
         let (cap, allow_tuning) = static_submit_mode(
             self.submit_dispatch_cap_explicit,
             self.caps.integrated,
-            single_token_paged_moe,
+            token_row_paged_moe,
             self.submit_dispatch_cap.load(Ordering::Relaxed),
         );
         let token = if allow_tuning && self.submit_tune_active.load(Ordering::Acquire) {
@@ -4251,8 +4251,8 @@ impl VulkanBackend {
         self.shared.submit_dispatch_cap.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn begin_submit_tune_round(&self, single_token_paged_moe: bool) -> SubmitTuneRound {
-        self.shared.begin_submit_tune_round(single_token_paged_moe)
+    pub(crate) fn begin_submit_tune_round(&self, token_row_paged_moe: bool) -> SubmitTuneRound {
+        self.shared.begin_submit_tune_round(token_row_paged_moe)
     }
 
     /// Persistent decode is recorded once and cannot follow a cap that changes during startup.
@@ -5101,6 +5101,23 @@ impl VulkanBackend {
             self.runtime_phase.lock().unwrap().release_phase();
         });
         Ok(())
+    }
+
+    /// Drop the primary LLM's retained Decode high-water workspace after an active batch cohort
+    /// shrinks. Consecutive tokens with the same cohort keep their phase arena; a lane departure is
+    /// a safe boundary at which the next, smaller graph can rebuild once and return the remainder
+    /// to the Expert filler.
+    pub fn release_primary_runtime_after_cohort_shrink(&self) {
+        debug_assert!(
+            self.unified_client.is_none(),
+            "only the primary LLM owns the decode cohort"
+        );
+        self.with_unified_exclusive(|| {
+            self.runtime_phase.lock().unwrap().release_phase();
+            if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+                session.restore_released_unified_slots();
+            }
+        });
     }
 
     /// Hold optional Host DMA imports until a caller has materialized a batch of persistent KV

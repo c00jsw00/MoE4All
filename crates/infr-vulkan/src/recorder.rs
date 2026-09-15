@@ -7046,6 +7046,62 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Bound-SSBO split-K attention over a row view of shared query/output activations. The K/V
+    /// buffers themselves start at row zero; this is used after an independent QSA row has gathered
+    /// its selected blocks into reusable packed-F16 scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_kv_split_off(
+        &self,
+        q: &dyn Buffer,
+        q_byte_off: usize,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        o_byte_off: usize,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        rows: usize,
+        pos: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        cap: usize,
+    ) {
+        self.attention_kv_split_impl(
+            q,
+            kc,
+            vc,
+            o,
+            pm,
+            pl,
+            pacc,
+            rows,
+            pos,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            0,
+            None,
+            false,
+            false,
+            cap,
+            false,
+            None,
+            None,
+            None,
+            Some((q_byte_off, o_byte_off)),
+        );
+    }
+
     /// `-DKV_BDA` twin of [`Self::attention_kv_split`] (#74 slice 2): the flash-decoding partial pass
     /// reads the K/V cache by 64-bit device address (`k_addr`/`v_addr`, kv_addr.glsl) instead of the
     /// bound SSBOs at slots 1/2. Bit-identical to the bound build (proven by kv_addr_parity.rs). `kc`/
@@ -9515,6 +9571,48 @@ impl<'a> Recorder<'a> {
         vcap: u32,
         segment_shift: Option<u32>,
     ) {
+        self.qsa_gather_off(
+            k,
+            v,
+            indices,
+            kd,
+            vd,
+            selected,
+            complete,
+            tail,
+            ratio,
+            row_elems,
+            k_q8,
+            v_q8,
+            kcap,
+            vcap,
+            segment_shift,
+            0,
+        );
+    }
+
+    /// Gather through one row view of a batched QSA index tensor. Packed K/V output starts at zero
+    /// so independent rows can reuse one scratch pair after the preceding attention has consumed it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qsa_gather_off(
+        &self,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        indices: &dyn Buffer,
+        kd: &dyn Buffer,
+        vd: &dyn Buffer,
+        selected: u32,
+        complete: u32,
+        tail: u32,
+        ratio: u32,
+        row_elems: u32,
+        k_q8: bool,
+        v_q8: bool,
+        kcap: u32,
+        vcap: u32,
+        segment_shift: Option<u32>,
+        indices_byte_off: usize,
+    ) {
         let row_pairs = row_elems / 2;
         let total_pairs = (selected * ratio + tail) * row_pairs;
         let segmented = segment_shift.is_some();
@@ -9547,7 +9645,7 @@ impl<'a> Recorder<'a> {
             &[
                 Self::vkb(k),
                 Self::vkb(v),
-                Self::vkb(indices),
+                Self::vkb_byte_off(indices, indices_byte_off),
                 Self::vkb(kd),
                 Self::vkb(vd),
             ],
