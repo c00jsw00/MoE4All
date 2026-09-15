@@ -20,11 +20,12 @@
 
 use std::{
     convert::Infallible,
+    io::{self, Write},
     net::SocketAddr,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -45,6 +46,136 @@ use infr_engine::{ChatMessage, Delta, ToolCall, IMAGE_PART_PLACEHOLDER};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
+
+// ---------------------------------------------------------------------------
+// Coordinated terminal output
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct TerminalState {
+    dashboard: Option<String>,
+    dashboard_lines: usize,
+}
+
+static TERMINAL_COORDINATED: AtomicBool = AtomicBool::new(false);
+static TERMINAL_STATE: OnceLock<Mutex<TerminalState>> = OnceLock::new();
+
+fn terminal_state() -> &'static Mutex<TerminalState> {
+    TERMINAL_STATE.get_or_init(|| Mutex::new(TerminalState::default()))
+}
+
+/// Enable the stderr coordinator used by the CLI's tracing subscriber. A library embedding the
+/// server without this writer keeps the ordinary structured log presentation.
+pub fn configure_terminal_output(enabled: bool) {
+    TERMINAL_COORDINATED.store(enabled, Ordering::Relaxed);
+}
+
+fn terminal_dashboard_available() -> bool {
+    TERMINAL_COORDINATED.load(Ordering::Relaxed)
+}
+
+fn terminal_dashboard_active() -> bool {
+    terminal_dashboard_available()
+        && terminal_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dashboard
+            .is_some()
+}
+
+fn clear_terminal_region(out: &mut dyn Write, lines: usize) -> io::Result<()> {
+    if lines == 0 {
+        return Ok(());
+    }
+    write!(out, "\x1b[{lines}A")?;
+    for row in 0..lines {
+        write!(out, "\r\x1b[2K")?;
+        if row + 1 < lines {
+            write!(out, "\x1b[1B")?;
+        }
+    }
+    if lines > 1 {
+        write!(out, "\x1b[{}A", lines - 1)?;
+    }
+    write!(out, "\r")
+}
+
+fn draw_terminal_frame(out: &mut dyn Write, frame: &str) -> io::Result<usize> {
+    let lines = frame.lines().count();
+    out.write_all(frame.as_bytes())?;
+    if !frame.ends_with('\n') {
+        out.write_all(b"\n")?;
+    }
+    Ok(lines)
+}
+
+fn set_terminal_dashboard(frame: Option<String>) {
+    if !terminal_dashboard_available() {
+        return;
+    }
+    let mut state = terminal_state().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = io::stderr().lock();
+    let _ = clear_terminal_region(&mut out, state.dashboard_lines);
+    state.dashboard_lines = 0;
+    state.dashboard = frame;
+    if let Some(frame) = state.dashboard.as_deref() {
+        state.dashboard_lines = draw_terminal_frame(&mut out, frame).unwrap_or(0);
+    }
+    let _ = out.flush();
+}
+
+fn terminal_write_log(bytes: &[u8]) {
+    if !terminal_dashboard_available() {
+        let mut out = io::stderr().lock();
+        let _ = out.write_all(bytes);
+        let _ = out.flush();
+        return;
+    }
+
+    // Keep the same lock order as `set_terminal_dashboard`: state, then stderr. Tracing may emit
+    // while the reporter redraws, so reversing these two locks could deadlock the terminal.
+    let mut state = terminal_state().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = io::stderr().lock();
+    let _ = clear_terminal_region(&mut out, state.dashboard_lines);
+    let _ = out.write_all(bytes);
+    if !bytes.ends_with(b"\n") {
+        let _ = out.write_all(b"\n");
+    }
+    state.dashboard_lines = 0;
+    if let Some(frame) = state.dashboard.as_deref() {
+        state.dashboard_lines = draw_terminal_frame(&mut out, frame).unwrap_or(0);
+    }
+    let _ = out.flush();
+}
+
+/// One tracing event buffered until its formatter releases the writer, then printed atomically
+/// around the live table. Outside an interactive serve session this is just stderr.
+pub struct TerminalLogWriter {
+    bytes: Vec<u8>,
+}
+
+impl Write for TerminalLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for TerminalLogWriter {
+    fn drop(&mut self) {
+        if !self.bytes.is_empty() {
+            terminal_write_log(&self.bytes);
+        }
+    }
+}
+
+pub fn terminal_log_writer() -> TerminalLogWriter {
+    TerminalLogWriter { bytes: Vec::new() }
+}
 
 /// Why generation ended — the OpenAI `finish_reason`. The generator reports it; the handlers
 /// serialize it (a tool call still overrides to [`Finish::ToolCalls`] at the wire layer).
@@ -966,6 +1097,14 @@ struct FinishedProgress {
     decode: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RequestDisplay {
+    phase: &'static str,
+    speed: f64,
+    context_tokens: Option<u64>,
+    context_limit: Option<u64>,
+}
+
 impl RequestProgress {
     fn new(
         req_id: u64,
@@ -1056,7 +1195,7 @@ impl RequestProgress {
             (emit, state.prefill_elapsed)
         };
 
-        if emit {
+        if emit && !terminal_dashboard_active() {
             self.log(progress, elapsed, prefill_elapsed);
         }
     }
@@ -1094,6 +1233,40 @@ impl RequestProgress {
         );
     }
 
+    fn display_snapshot(&self) -> RequestDisplay {
+        let elapsed = self.started.elapsed();
+        let state = self.state.lock().expect("request progress poisoned");
+        let Some(progress) = state.latest else {
+            return RequestDisplay {
+                phase: "Starting",
+                speed: 0.0,
+                context_tokens: None,
+                context_limit: None,
+            };
+        };
+        let (phase, tokens, phase_time) = match progress.phase {
+            infr_core::GenerationPhase::Prefill => (
+                "Prefill",
+                progress.prefill_tokens,
+                state.prefill_elapsed.unwrap_or(elapsed),
+            ),
+            infr_core::GenerationPhase::Decode => {
+                let prefill = state.prefill_elapsed.unwrap_or(elapsed);
+                (
+                    "Decode",
+                    progress.completion_tokens,
+                    elapsed.saturating_sub(prefill),
+                )
+            }
+        };
+        RequestDisplay {
+            phase,
+            speed: per_second(tokens, phase_time),
+            context_tokens: Some(progress.context_tokens),
+            context_limit: Some(progress.context_limit),
+        }
+    }
+
     /// Reconcile a final count if a backend returned between natural progress callbacks, then
     /// return the exact context snapshot and model-visible phase timings.
     fn finish(&self, outcome: ChatOutcome) -> Option<FinishedProgress> {
@@ -1123,6 +1296,264 @@ impl RequestProgress {
             decode: elapsed.saturating_sub(prefill),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardSlotKind {
+    Chat,
+    Embedding,
+}
+
+#[derive(Clone)]
+enum DashboardActivity {
+    Chat {
+        req_id: u64,
+        progress: Arc<RequestProgress>,
+    },
+    Embedding {
+        req_id: u64,
+        inputs: usize,
+        started: Instant,
+    },
+}
+
+#[derive(Clone)]
+struct DashboardSlot {
+    kind: DashboardSlotKind,
+    ordinal: usize,
+    capacity: usize,
+    model: Arc<str>,
+    activity: Option<DashboardActivity>,
+}
+
+struct ActivityDashboard {
+    slots: Mutex<Vec<DashboardSlot>>,
+}
+
+impl ActivityDashboard {
+    fn new(models: &[ModelEntry], embeddings: &[EmbeddingEntry]) -> Self {
+        let mut slots = Vec::new();
+        for model in models {
+            for ordinal in 1..=model.capacity {
+                slots.push(DashboardSlot {
+                    kind: DashboardSlotKind::Chat,
+                    ordinal,
+                    capacity: model.capacity,
+                    model: model.id.clone(),
+                    activity: None,
+                });
+            }
+        }
+        for model in embeddings {
+            for ordinal in 1..=model.capacity {
+                slots.push(DashboardSlot {
+                    kind: DashboardSlotKind::Embedding,
+                    ordinal,
+                    capacity: model.capacity,
+                    model: model.id.clone(),
+                    activity: None,
+                });
+            }
+        }
+        Self {
+            slots: Mutex::new(slots),
+        }
+    }
+
+    fn claim_chat(
+        self: &Arc<Self>,
+        model: &str,
+        req_id: u64,
+        progress: Arc<RequestProgress>,
+    ) -> DashboardActivityGuard {
+        self.claim(
+            DashboardSlotKind::Chat,
+            model,
+            req_id,
+            DashboardActivity::Chat { req_id, progress },
+        )
+    }
+
+    fn claim_embedding(
+        self: &Arc<Self>,
+        model: &str,
+        req_id: u64,
+        inputs: usize,
+    ) -> DashboardActivityGuard {
+        self.claim(
+            DashboardSlotKind::Embedding,
+            model,
+            req_id,
+            DashboardActivity::Embedding {
+                req_id,
+                inputs,
+                started: Instant::now(),
+            },
+        )
+    }
+
+    fn claim(
+        self: &Arc<Self>,
+        kind: DashboardSlotKind,
+        model: &str,
+        req_id: u64,
+        activity: DashboardActivity,
+    ) -> DashboardActivityGuard {
+        let mut slots = self.slots.lock().expect("activity dashboard poisoned");
+        let index = slots.iter().position(|slot| {
+            slot.kind == kind && slot.model.as_ref() == model && slot.activity.is_none()
+        });
+        if let Some(index) = index {
+            slots[index].activity = Some(activity);
+        }
+        DashboardActivityGuard {
+            dashboard: Arc::clone(self),
+            index,
+            req_id,
+        }
+    }
+
+    fn release(&self, index: usize, req_id: u64) {
+        let mut slots = self.slots.lock().expect("activity dashboard poisoned");
+        if slots
+            .get(index)
+            .and_then(|slot| slot.activity.as_ref())
+            .is_some_and(|activity| match activity {
+                DashboardActivity::Chat { req_id: live, .. }
+                | DashboardActivity::Embedding { req_id: live, .. } => *live == req_id,
+            })
+        {
+            slots[index].activity = None;
+        }
+    }
+
+    fn render(&self, window: &StatsWindow) -> String {
+        render_activity_table(
+            &self
+                .slots
+                .lock()
+                .expect("activity dashboard poisoned")
+                .clone(),
+            window,
+        )
+    }
+}
+
+struct DashboardActivityGuard {
+    dashboard: Arc<ActivityDashboard>,
+    index: Option<usize>,
+    req_id: u64,
+}
+
+impl Drop for DashboardActivityGuard {
+    fn drop(&mut self) {
+        if let Some(index) = self.index {
+            self.dashboard.release(index, self.req_id);
+        }
+    }
+}
+
+fn abbreviated(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_owned();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut out = value.chars().take(keep).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn grouped_u64(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn table_row(slot: &str, work: &str, state: &str, speed: &str, context: &str) -> String {
+    format!(
+        "| {:<13} | {:<31} | {:<9} | {:>13} | {:>21} |\n",
+        abbreviated(slot, 13),
+        abbreviated(work, 31),
+        abbreviated(state, 9),
+        abbreviated(speed, 13),
+        abbreviated(context, 21),
+    )
+}
+
+fn render_activity_table(slots: &[DashboardSlot], window: &StatsWindow) -> String {
+    const BORDER: &str =
+        "+---------------+---------------------------------+-----------+---------------+-----------------------+\n";
+    let mut out = String::new();
+    out.push_str("INFR live resources\n");
+    out.push_str(BORDER);
+    out.push_str(&table_row("Slot", "Work", "State", "Speed", "Context"));
+    out.push_str(BORDER);
+    for slot in slots {
+        let slot_name = match slot.kind {
+            DashboardSlotKind::Chat => format!("KV {}/{}", slot.ordinal, slot.capacity),
+            DashboardSlotKind::Embedding if slot.capacity == 1 => "Embedding".to_owned(),
+            DashboardSlotKind::Embedding => {
+                format!("Embed {}/{}", slot.ordinal, slot.capacity)
+            }
+        };
+        let (work, state, speed, context) = match slot.activity.as_ref() {
+            Some(DashboardActivity::Chat { req_id, progress }) => {
+                let live = progress.display_snapshot();
+                let speed = if live.speed > 0.0 {
+                    format!("{:.1} tok/s", live.speed)
+                } else {
+                    "-".to_owned()
+                };
+                let context = match (live.context_tokens, live.context_limit) {
+                    (Some(current), Some(limit)) => {
+                        format!("{} / {}", grouped_u64(current), grouped_u64(limit))
+                    }
+                    _ => "-".to_owned(),
+                };
+                (
+                    format!("#{req_id} {}", abbreviated(slot.model.as_ref(), 22)),
+                    live.phase.to_owned(),
+                    speed,
+                    context,
+                )
+            }
+            Some(DashboardActivity::Embedding {
+                req_id,
+                inputs,
+                started,
+            }) => (
+                format!("#{req_id} {inputs} input(s)"),
+                "Embedding".to_owned(),
+                format!("{:.1}s", started.elapsed().as_secs_f64()),
+                "-".to_owned(),
+            ),
+            None => (
+                abbreviated(slot.model.as_ref(), 31),
+                "Idle".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+            ),
+        };
+        out.push_str(&table_row(&slot_name, &work, &state, &speed, &context));
+    }
+    out.push_str(BORDER);
+    out.push_str(&format!(
+        "Total: prefill {:.1} tok/s | decode {:.1} tok/s | active {} | queued {} | done {} | failed {}",
+        window.prefill_tps(),
+        window.decode_tps(),
+        window.active,
+        window.queued,
+        window.completed,
+        window.failed,
+    ));
+    out
 }
 
 /// Text-output fallback kept inside the blocking task. Exact runners account model tokens through
@@ -1367,8 +1798,17 @@ fn stats_interval(cfg: &Config) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
-/// The periodic throughput reporter: drain the interval counters every `period` and, IF anything
-/// happened, log one line.
+struct TerminalDashboardGuard;
+
+impl Drop for TerminalDashboardGuard {
+    fn drop(&mut self) {
+        set_terminal_dashboard(None);
+    }
+}
+
+/// The periodic throughput reporter: drain the interval counters every `period`. Interactive
+/// terminals get a one-second live table; redirected/non-terminal stderr keeps the existing
+/// activity-only structured log line.
 ///
 /// **Shutdown.** It polls the same process-wide latch [`shutdown_latched`] does, at the same 50 ms
 /// granularity, so a Ctrl-C ends it at the next poll rather than up to a full period later — and it
@@ -1377,30 +1817,52 @@ fn stats_interval(cfg: &Config) -> Option<Duration> {
 /// tokens generated in the last partial interval are not silently dropped.
 async fn stats_reporter(state: AppState, period: Duration) {
     const POLL: Duration = Duration::from_millis(50);
-    let mut last = Instant::now();
+    const DASHBOARD_REFRESH: Duration = Duration::from_secs(1);
+    let dashboard_enabled = terminal_dashboard_available();
+    let _dashboard_guard = dashboard_enabled.then_some(TerminalDashboardGuard);
+    let mut last_drain = Instant::now();
+    let mut last_draw = Instant::now();
+    let mut latest = StatsWindow::default();
+    (latest.busy_slots, latest.total_slots) = state.slot_occupancy();
+    if dashboard_enabled {
+        set_terminal_dashboard(Some(state.dashboard.render(&latest)));
+    }
+
     loop {
         tokio::time::sleep(POLL).await;
         let shutting_down = infr_core::shutdown::shutdown_requested();
-        if !shutting_down && last.elapsed() < period {
-            continue;
+        let drain_due = shutting_down || last_drain.elapsed() >= period;
+        if drain_due {
+            latest = state.stats.drain(last_drain.elapsed());
+            (latest.busy_slots, latest.total_slots) = state.slot_occupancy();
+            last_drain = Instant::now();
+            if !dashboard_enabled && latest.has_activity() {
+                tracing::info!(
+                    interval_s = format_args!("{:.1}", latest.elapsed.as_secs_f64()),
+                    prefill_tps = format_args!("{:.1}", latest.prefill_tps()),
+                    decode_tps = format_args!("{:.1}", latest.decode_tps()),
+                    gen_tokens = latest.gen_tokens,
+                    prompt_tokens = latest.prompt_tokens,
+                    completed = latest.completed,
+                    failed = latest.failed,
+                    active = latest.active,
+                    queued = latest.queued,
+                    kv_slots = format_args!("{}/{}", latest.busy_slots, latest.total_slots),
+                    "serve stats"
+                );
+            }
         }
-        let mut window = state.stats.drain(last.elapsed());
-        (window.busy_slots, window.total_slots) = state.slot_occupancy();
-        last = Instant::now();
-        if window.has_activity() {
-            tracing::info!(
-                interval_s = format_args!("{:.1}", window.elapsed.as_secs_f64()),
-                prefill_tps = format_args!("{:.1}", window.prefill_tps()),
-                decode_tps = format_args!("{:.1}", window.decode_tps()),
-                gen_tokens = window.gen_tokens,
-                prompt_tokens = window.prompt_tokens,
-                completed = window.completed,
-                failed = window.failed,
-                active = window.active,
-                queued = window.queued,
-                kv_slots = format_args!("{}/{}", window.busy_slots, window.total_slots),
-                "serve stats"
-            );
+
+        if dashboard_enabled && (drain_due || last_draw.elapsed() >= DASHBOARD_REFRESH) {
+            // Between counter drains, refresh only gauges and per-request snapshots. The footer's
+            // rates remain the latest complete interval instead of being distorted by extra drains.
+            if !drain_due {
+                latest.active = state.stats.active.load(Ordering::Relaxed);
+                latest.queued = state.stats.queued.load(Ordering::Relaxed);
+                (latest.busy_slots, latest.total_slots) = state.slot_occupancy();
+            }
+            set_terminal_dashboard(Some(state.dashboard.render(&latest)));
+            last_draw = Instant::now();
         }
         if shutting_down {
             return;
@@ -1488,6 +1950,9 @@ pub struct AppState {
     /// [`stats_reporter`] that `serve_state` spawns; a state built for tests simply has no reporter
     /// draining it.
     stats: Arc<ServeStats>,
+    /// Presentation-only slot registry. It mirrors admission permits but never participates in
+    /// scheduling; request progress is read from each request's existing local state.
+    dashboard: Arc<ActivityDashboard>,
 }
 
 impl AppState {
@@ -1500,13 +1965,16 @@ impl AppState {
         n_parallel: usize,
         cfg: Arc<Config>,
     ) -> Self {
+        let models = Arc::new(vec![ModelEntry::new(
+            &model_id.into(),
+            Some(generator),
+            n_parallel,
+        )]);
+        let embeddings = Arc::new(Vec::new());
         Self {
-            models: Arc::new(vec![ModelEntry::new(
-                &model_id.into(),
-                Some(generator),
-                n_parallel,
-            )]),
-            embeddings: Arc::new(Vec::new()),
+            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
+            models,
+            embeddings,
             cfg,
             stats: Arc::default(),
         }
@@ -1524,13 +1992,17 @@ impl AppState {
             !entries.is_empty(),
             "AppState::multi needs at least one model"
         );
-        let models = entries
-            .into_iter()
-            .map(|(id, gen, n)| ModelEntry::new(&id, Some(gen), n))
-            .collect();
+        let models = Arc::new(
+            entries
+                .into_iter()
+                .map(|(id, gen, n)| ModelEntry::new(&id, Some(gen), n))
+                .collect::<Vec<_>>(),
+        );
+        let embeddings = Arc::new(Vec::new());
         Self {
-            models: Arc::new(models),
-            embeddings: Arc::new(Vec::new()),
+            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
+            models,
+            embeddings,
             cfg,
             stats: Arc::default(),
         }
@@ -1540,9 +2012,12 @@ impl AppState {
     /// so an auth/cap test drives `serve.*` through a `Config` value rather than the environment
     /// (R7).
     pub fn headless(model_id: impl Into<String>, cfg: Arc<Config>) -> Self {
+        let models = Arc::new(vec![ModelEntry::new(&model_id.into(), None, 1)]);
+        let embeddings = Arc::new(Vec::new());
         Self {
-            models: Arc::new(vec![ModelEntry::new(&model_id.into(), None, 1)]),
-            embeddings: Arc::new(Vec::new()),
+            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
+            models,
+            embeddings,
             cfg,
             stats: Arc::default(),
         }
@@ -1582,6 +2057,7 @@ impl AppState {
         let mut embeddings = (*self.embeddings).clone();
         embeddings.push(EmbeddingEntry::new(&model_id.into(), generator, n_parallel));
         self.embeddings = Arc::new(embeddings);
+        self.dashboard = Arc::new(ActivityDashboard::new(&self.models, &self.embeddings));
         self
     }
 
@@ -1592,13 +2068,16 @@ impl AppState {
         n_parallel: usize,
         cfg: Arc<Config>,
     ) -> Self {
+        let models = Arc::new(Vec::new());
+        let embeddings = Arc::new(vec![EmbeddingEntry::new(
+            &model_id.into(),
+            generator,
+            n_parallel,
+        )]);
         Self {
-            models: Arc::new(Vec::new()),
-            embeddings: Arc::new(vec![EmbeddingEntry::new(
-                &model_id.into(),
-                generator,
-                n_parallel,
-            )]),
+            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
+            models,
+            embeddings,
             cfg,
             stats: Arc::default(),
         }
@@ -1713,6 +2192,7 @@ async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
         .await;
     if let Some(h) = reporter {
         h.abort();
+        set_terminal_dashboard(None);
     }
     served?;
     Ok(())
@@ -1822,6 +2302,8 @@ async fn embeddings_handler(
         return json_error(StatusCode::NOT_FOUND, "no embedding model is loaded".into());
     };
     let model_id = entry.id.to_string();
+    let req_id = next_req_id();
+    let input_count = inputs.len();
     let queued = QueuedGuard::new(state.stats.clone());
     let Ok(permit) = entry.slots.clone().acquire_owned().await else {
         state.stats.fold_failure();
@@ -1832,10 +2314,14 @@ async fn embeddings_handler(
     };
     drop(queued);
     let active = ActiveGuard::new(state.stats.clone());
+    let display = state
+        .dashboard
+        .claim_embedding(&model_id, req_id, input_count);
     let engine = entry.engine.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _active = active;
+        let _display = display;
         engine.embed(&inputs)
     })
     .await
@@ -1938,6 +2424,7 @@ async fn chat_completions_handler(
         progress_interval: stats_interval(&state.cfg),
         stream: req.stream,
         stats: state.stats.clone(),
+        dashboard: state.dashboard.clone(),
     };
     log_request_start(
         ctx.id,
@@ -1976,6 +2463,7 @@ struct ReqCtx {
     progress_interval: Option<Duration>,
     stream: bool,
     stats: Arc<ServeStats>,
+    dashboard: Arc<ActivityDashboard>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1999,6 +2487,7 @@ async fn non_streaming(
         progress_interval,
         stream,
         stats,
+        dashboard,
     } = ctx;
     // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
     // this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as
@@ -2024,6 +2513,7 @@ async fn non_streaming(
         progress_interval,
         stats.clone(),
     ));
+    let display = dashboard.claim_chat(&model_id, req_id, progress.clone());
     let progress_blk = progress.clone();
 
     // Per-request abort latch. It lives OUT here, not inside the closure, so the deadline below can
@@ -2040,6 +2530,7 @@ async fn non_streaming(
         // `active` gauge rides along with it, so the two can never disagree.
         let _permit = permit;
         let _active = active;
+        let _display = display;
         let Some(engine) = engine_arc else {
             anyhow::bail!("no engine loaded");
         };
@@ -2210,6 +2701,7 @@ async fn streaming(
         progress_interval,
         stream,
         stats,
+        dashboard,
     } = ctx;
     // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
     // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
@@ -2246,6 +2738,7 @@ async fn streaming(
         progress_interval,
         stats.clone(),
     ));
+    let display = dashboard.claim_chat(&model_id, req_id, progress.clone());
     let progress_cb = progress.clone();
 
     // Per-request abort latch: set as soon as the client-owned SSE response is dropped, with failed
@@ -2272,6 +2765,7 @@ async fn streaming(
         // `active` gauge is released by the same return (or unwind).
         let _permit = permit;
         let _active = active;
+        let _display = display;
         // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
         // deadline was configured, in which case there is no watchdog to disarm.
         let _done_tx = done_tx;
@@ -2869,6 +3363,83 @@ mod tests {
             "test-model",
             Arc::new(Config::default()),
         ))
+    }
+
+    #[test]
+    fn live_table_reports_each_resource_and_releases_finished_slots() {
+        let dashboard = Arc::new(ActivityDashboard {
+            slots: Mutex::new(vec![
+                DashboardSlot {
+                    kind: DashboardSlotKind::Chat,
+                    ordinal: 1,
+                    capacity: 2,
+                    model: Arc::from("Qwen3.8-Flash-Next"),
+                    activity: None,
+                },
+                DashboardSlot {
+                    kind: DashboardSlotKind::Chat,
+                    ordinal: 2,
+                    capacity: 2,
+                    model: Arc::from("Qwen3.8-Flash-Next"),
+                    activity: None,
+                },
+                DashboardSlot {
+                    kind: DashboardSlotKind::Embedding,
+                    ordinal: 1,
+                    capacity: 1,
+                    model: Arc::from("nomic-embed-text"),
+                    activity: None,
+                },
+            ]),
+        });
+        let progress = Arc::new(RequestProgress {
+            req_id: 17,
+            model: "Qwen3.8-Flash-Next".into(),
+            started: Instant::now() - Duration::from_secs(2),
+            log_period: None,
+            stats: Arc::default(),
+            seen: AtomicBool::new(true),
+            state: Mutex::new(RequestProgressState {
+                latest: Some(infr_core::GenerationProgress {
+                    phase: infr_core::GenerationPhase::Decode,
+                    prompt_tokens: 50_000,
+                    cached_prompt_tokens: 49_000,
+                    prefill_tokens: 1_000,
+                    completion_tokens: 57,
+                    context_tokens: 50_057,
+                    context_limit: 160_000,
+                }),
+                prefill_elapsed: Some(Duration::from_secs(1)),
+                last_log_elapsed: Duration::ZERO,
+                accounted_prefill: 1_000,
+                accounted_decode: 57,
+            }),
+        });
+
+        let chat = dashboard.claim_chat("Qwen3.8-Flash-Next", 17, progress);
+        let embedding = dashboard.claim_embedding("nomic-embed-text", 18, 3);
+        let frame = dashboard.render(&StatsWindow {
+            elapsed: Duration::from_secs(5),
+            gen_tokens: 120,
+            active: 2,
+            ..StatsWindow::default()
+        });
+        assert!(frame.contains("KV 1/2"));
+        assert!(frame.contains("KV 2/2"));
+        assert!(frame.contains("Embedding"));
+        assert!(frame.contains("#17 Qwen3.8-Flash-Next"));
+        assert!(frame.contains("Decode"));
+        assert!(frame.contains("57.0 tok/s"));
+        assert!(frame.contains("50,057 / 160,000"));
+        assert!(frame.contains("#18 3 input(s)"));
+        assert!(frame.contains("decode 24.0 tok/s"));
+
+        drop(chat);
+        drop(embedding);
+        let idle = dashboard.render(&StatsWindow::default());
+        assert_eq!(idle.matches("Idle").count(), 3);
+        assert!(!idle.contains("#17"));
+        assert!(!idle.contains("#18"));
     }
 
     // --- HTTP endpoint tests (no Engine required) ---------------------------
@@ -4329,6 +4900,9 @@ mod tests {
             progress_interval: None,
             stream,
             stats: Arc::default(),
+            dashboard: Arc::new(ActivityDashboard {
+                slots: Mutex::new(Vec::new()),
+            }),
         }
     }
 

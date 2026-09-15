@@ -685,9 +685,11 @@ fn main() -> anyhow::Result<()> {
     // `infr compare --sweep` printed `ERR` for all 35 rows. Same hazard for `--man`/`--completions`
     // and for anything piping `infr run`. The split is the contract: stdout = results, stderr =
     // logs.
+    let stderr_is_terminal = std::io::stderr().is_terminal();
+    infr_server::configure_terminal_output(stderr_is_terminal);
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(infr_server::terminal_log_writer)
+        .with_ansi(stderr_is_terminal)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
