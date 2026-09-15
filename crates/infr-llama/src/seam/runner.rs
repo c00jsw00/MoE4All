@@ -8076,10 +8076,12 @@ fn generate_dense_backend_inner(
             let worker = ple_worker
                 .as_ref()
                 .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
-            let mut tickets = Vec::with_capacity(lanes);
-            for (tokens, &position) in curs.iter().zip(&positions) {
-                tickets.push(worker.submit(tokens, position, c.ple_ngram_size)?);
-            }
+            let ple_ticket = worker.submit_batch(
+                curs.iter()
+                    .zip(&positions)
+                    .map(|(tokens, &position)| (tokens.as_slice(), position)),
+                c.ple_ngram_size,
+            )?;
             let sequence_spans = independent_rows.then(|| {
                 positions
                     .iter()
@@ -8140,19 +8142,19 @@ fn generate_dense_backend_inner(
             be.execute(plan0.as_ref(), &b0)
                 .map_err(|e| anyhow!("{e}"))?;
 
-            let mut ple_rows = Vec::with_capacity(lanes * ple_row);
-            for ticket in tickets {
-                let row = ticket.wait()?;
-                if row.len() != ple_row {
-                    return Err(anyhow!(
-                        "parallel PLE produced {} values, expected {ple_row}",
-                        row.len()
-                    ));
-                }
-                ple_rows.extend_from_slice(row.as_slice());
+            let ple_rows = ple_ticket.wait()?;
+            let expected_ple_values = lanes * ple_row;
+            if ple_rows.len() != expected_ple_values {
+                return Err(anyhow!(
+                    "parallel PLE produced {} values, expected {expected_ple_values}",
+                    ple_rows.len()
+                ));
             }
-            be.upload(ple_batch.as_ref(), bytemuck::cast_slice(&ple_rows))
-                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(
+                ple_batch.as_ref(),
+                bytemuck::cast_slice(ple_rows.as_slice()),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
 
             let (g1, h1) = build(
                 lanes,

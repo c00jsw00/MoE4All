@@ -16,16 +16,19 @@ const MAX_GATHER_THREADS: usize = 4;
 const PARALLEL_MIN_UNIQUE_ROWS: usize = 256;
 const OUTPUT_POOL_DEPTH: usize = 2;
 
-struct Job {
+struct JobSpan {
     tokens: Vec<u32>,
     start: usize,
     rows: usize,
+}
+
+struct Job {
+    spans: Vec<JobSpan>,
     reply: SyncSender<Result<PleRows>>,
 }
 
-/// One persistent model-level worker. `SyncSender` keeps submission lock-free at the model layer
-/// and bounds queued random I/O; each job owns its reply channel, so several conversation slots
-/// can share the immutable table safely.
+/// One persistent model-level worker. The bounded channel prevents an unbounded random-I/O queue;
+/// each job owns its reply channel, so several conversation slots can share the immutable table.
 pub(super) struct PleWorker {
     tx: SyncSender<Job>,
 }
@@ -238,9 +241,7 @@ impl PleWorker {
             .spawn(move || {
                 let mut state = state;
                 while let Ok(job) = rx.recv() {
-                    let _ = job
-                        .reply
-                        .send(state.gather_range(&job.tokens, job.start, job.rows));
+                    let _ = job.reply.send(state.gather_spans(&job.spans));
                 }
             })
             .context("spawn qwen4exp PLE worker")?;
@@ -262,18 +263,43 @@ impl PleWorker {
         rows: usize,
         ngram: usize,
     ) -> Result<PleTicket> {
-        let (tokens, local_start) = ple_job_tokens(tokens, start, rows, ngram)?;
+        self.submit_spans(vec![ple_job_span(tokens, start, rows, ngram)?])
+    }
+
+    /// Gather independent conversation rows in one source-sorted job. This lets concurrent decode
+    /// share deduplication and issue mmap faults in parallel instead of serializing one worker job
+    /// per conversation.
+    pub(super) fn submit_batch<'a>(
+        &self,
+        requests: impl IntoIterator<Item = (&'a [u32], usize)>,
+        ngram: usize,
+    ) -> Result<PleTicket> {
+        let spans = requests
+            .into_iter()
+            .map(|(tokens, pos)| ple_job_span(tokens, pos, 1, ngram))
+            .collect::<Result<Vec<_>>>()?;
+        if spans.is_empty() {
+            bail!("qwen4exp PLE batch cannot be empty");
+        }
+        self.submit_spans(spans)
+    }
+
+    fn submit_spans(&self, spans: Vec<JobSpan>) -> Result<PleTicket> {
         let (reply, rx) = mpsc::sync_channel(1);
         self.tx
-            .send(Job {
-                tokens,
-                start: local_start,
-                rows,
-                reply,
-            })
+            .send(Job { spans, reply })
             .map_err(|_| anyhow!("qwen4exp PLE worker is not running"))?;
         Ok(PleTicket(rx))
     }
+}
+
+fn ple_job_span(tokens: &[u32], start: usize, rows: usize, ngram: usize) -> Result<JobSpan> {
+    let (tokens, start) = ple_job_tokens(tokens, start, rows, ngram)?;
+    Ok(JobSpan {
+        tokens,
+        start,
+        rows,
+    })
 }
 
 fn ple_job_tokens(
@@ -299,10 +325,15 @@ fn ple_job_tokens(
 }
 
 impl WorkerState {
-    fn gather_range(&mut self, tokens: &[u32], start: usize, rows: usize) -> Result<PleRows> {
+    fn gather_spans(&mut self, spans: &[JobSpan]) -> Result<PleRows> {
         let profile = pager_profile::active();
         let plan_t0 = profile.then(std::time::Instant::now);
         let heads = (self.ngram - 1) * self.heads_per_ngram;
+        let rows = spans.iter().try_fold(0usize, |total, span| {
+            total
+                .checked_add(span.rows)
+                .context("PLE batch row count overflow")
+        })?;
         let request_count = rows
             .checked_mul(heads)
             .context("PLE row request count overflow")?;
@@ -312,50 +343,54 @@ impl WorkerState {
         let output_bytes = output_len
             .checked_mul(std::mem::size_of::<f32>())
             .context("PLE output byte size overflow")?;
-        let token_end = start
-            .checked_add(rows)
-            .context("PLE local token range overflow")?;
         self.requests.clear();
         self.requests.reserve(request_count);
-        for pos in start..token_end {
-            let recent = tokens
-                .get(..=pos)
-                .context("PLE local token range is inconsistent")?;
-            ple_context_into(recent, self.ngram, self.eos, &mut self.context_scratch)?;
-            ple_row_indices_into(
-                &self.context_scratch,
-                self.ngram,
-                self.heads_per_ngram,
-                &self.multipliers,
-                &self.offsets,
-                &self.vocab_sizes,
-                &mut self.indices_scratch,
-            );
-            for &row in &self.indices_scratch {
-                let row = usize::try_from(row).context("PLE row index overflow")?;
-                if row >= self.rows {
-                    bail!(
-                        "qwen4exp PLE row {row} is outside table with {} rows",
-                        self.rows
-                    );
+        for span in spans {
+            let token_end = span
+                .start
+                .checked_add(span.rows)
+                .context("PLE local token range overflow")?;
+            for pos in span.start..token_end {
+                let recent = span
+                    .tokens
+                    .get(..=pos)
+                    .context("PLE local token range is inconsistent")?;
+                ple_context_into(recent, self.ngram, self.eos, &mut self.context_scratch)?;
+                ple_row_indices_into(
+                    &self.context_scratch,
+                    self.ngram,
+                    self.heads_per_ngram,
+                    &self.multipliers,
+                    &self.offsets,
+                    &self.vocab_sizes,
+                    &mut self.indices_scratch,
+                );
+                for &row in &self.indices_scratch {
+                    let row = usize::try_from(row).context("PLE row index overflow")?;
+                    if row >= self.rows {
+                        bail!(
+                            "qwen4exp PLE row {row} is outside table with {} rows",
+                            self.rows
+                        );
+                    }
+                    let off = row
+                        .checked_mul(self.row_bytes)
+                        .context("PLE byte offset overflow")?;
+                    let end = off
+                        .checked_add(self.row_bytes)
+                        .context("PLE byte range overflow")?;
+                    if end > self.table.len() {
+                        bail!(
+                            "qwen4exp PLE row {row} byte range {off}..{end} exceeds table size {}",
+                            self.table.len()
+                        );
+                    }
+                    self.requests.push(RowRequest {
+                        row,
+                        src_offset: off,
+                        dst_row: self.requests.len(),
+                    });
                 }
-                let off = row
-                    .checked_mul(self.row_bytes)
-                    .context("PLE byte offset overflow")?;
-                let end = off
-                    .checked_add(self.row_bytes)
-                    .context("PLE byte range overflow")?;
-                if end > self.table.len() {
-                    bail!(
-                        "qwen4exp PLE row {row} byte range {off}..{end} exceeds table size {}",
-                        self.table.len()
-                    );
-                }
-                self.requests.push(RowRequest {
-                    row,
-                    src_offset: off,
-                    dst_row: self.requests.len(),
-                });
             }
         }
         debug_assert_eq!(self.requests.len(), request_count);
@@ -369,7 +404,10 @@ impl WorkerState {
             ptr: out.as_mut_slice().as_mut_ptr(),
             len: output_len,
         };
-        let parallel = self.gather_threads > 1 && self.groups.len() >= PARALLEL_MIN_UNIQUE_ROWS;
+        let independent_batch = spans.len() > 1;
+        let parallel = self.gather_threads > 1
+            && (self.groups.len() >= PARALLEL_MIN_UNIQUE_ROWS
+                || (independent_batch && self.groups.len() > 1));
         let work_t0 = profile.then(std::time::Instant::now);
         let table: &[u8] = &self.table;
         let requests = &self.requests;
@@ -378,7 +416,12 @@ impl WorkerState {
         let row_bytes = self.row_bytes;
         let row_dim = self.row_dim;
         if parallel {
-            let groups_per_task = groups.len().div_ceil(self.gather_threads);
+            let task_count = if independent_batch {
+                self.gather_threads.min(spans.len()).min(groups.len())
+            } else {
+                self.gather_threads.min(groups.len())
+            };
+            let groups_per_task = groups.len().div_ceil(task_count);
             self.gather_pool.install(|| {
                 groups
                     .par_chunks(groups_per_task)
@@ -661,6 +704,23 @@ mod tests {
             let scalar = ple_context(&tokens[..=3 + row], 4, 2).unwrap();
             assert_eq!(batched, scalar);
         }
+    }
+
+    #[test]
+    fn independent_spans_preserve_lane_order_and_context() {
+        let lane0 = [3, 5, 7, 11, 13];
+        let lane1 = [17, 19, 23, 29, 31, 37];
+        let spans = [(&lane0[..], 4usize), (&lane1[..], 5usize)]
+            .into_iter()
+            .map(|(tokens, pos)| ple_job_span(tokens, pos, 1, 4).unwrap())
+            .collect::<Vec<_>>();
+
+        let contexts = spans
+            .iter()
+            .map(|span| ple_context(&span.tokens[..=span.start], 4, 2).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(contexts[0], ple_context(&lane0, 4, 2).unwrap());
+        assert_eq!(contexts[1], ple_context(&lane1, 4, 2).unwrap());
     }
 
     #[test]
