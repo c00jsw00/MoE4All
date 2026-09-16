@@ -428,11 +428,14 @@ impl Drop for SchedulerWorker {
 
 impl Drop for ColdWorker {
     fn drop(&mut self) {
+        tracing::info!("cold KV cache: flushing resident sessions before shutdown");
         self.stop.store(true, Ordering::Release);
         self.wake.notify_all();
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() {
                 tracing::warn!("cold KV maintenance thread panicked while shutting down");
+            } else {
+                tracing::info!("cold KV cache: shutdown flush complete");
             }
         }
     }
@@ -456,9 +459,7 @@ fn cold_session_worker(
                 Err(poisoned) => poisoned.into_inner(),
             };
             loop {
-                if stop.load(Ordering::Acquire) {
-                    break None;
-                }
+                let shutting_down = stop.load(Ordering::Acquire);
                 let now = Instant::now();
                 let mut next_wait: Option<Duration> = None;
                 let mut candidate: Option<usize> = None;
@@ -470,7 +471,7 @@ fn cold_session_worker(
                         continue;
                     }
                     let elapsed = now.saturating_duration_since(idle_since);
-                    if elapsed >= idle_for {
+                    if shutting_down || elapsed >= idle_for {
                         if candidate.is_none_or(|old| slot.tick < pool_guard.slots[old].tick) {
                             candidate = Some(index);
                         }
@@ -486,7 +487,10 @@ fn cold_session_worker(
                         .kv
                         .take()
                         .expect("cold candidate has a resident KV slot");
-                    break Some((index, kv));
+                    break Some((index, kv, shutting_down));
+                }
+                if shutting_down {
+                    break None;
                 }
                 pool_guard = match next_wait {
                     Some(timeout) => {
@@ -500,30 +504,31 @@ fn cold_session_worker(
                 };
             }
         };
-        let Some((index, mut kv)) = selected else {
+        let Some((index, mut kv, shutting_down)) = selected else {
             break;
         };
 
-        if !stop.load(Ordering::Acquire) {
-            let _gate = gate.as_deref().map(StepGate::enter);
-            if !stop.load(Ordering::Acquire) {
-                let mut cache = match cache.lock() {
-                    Ok(cache) => cache,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                match cache.spill(&mut kv, backend.as_ref(), &model_cfg) {
-                    Ok(true) => {}
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(
-                        slot = index,
-                        "cold KV idle spill failed; keeping the resident state: {error}"
-                    ),
-                }
-                if let Err(error) = cache.gc() {
-                    tracing::warn!("cold KV cache maintenance failed: {error}");
-                }
+        let _gate = gate.as_deref().map(StepGate::enter);
+        let mut cache = match cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let spill_failed = match cache.spill(&mut kv, backend.as_ref(), &model_cfg) {
+            Ok(true) => false,
+            Ok(false) => kv.cached_len() != 0,
+            Err(error) => {
+                tracing::warn!(
+                    slot = index,
+                    "cold KV idle spill failed; keeping the resident state: {error}"
+                );
+                true
             }
+        };
+        if let Err(error) = cache.gc() {
+            tracing::warn!("cold KV cache maintenance failed: {error}");
         }
+        drop(cache);
+        drop(_gate);
 
         let mut pool_guard = match pool.lock() {
             Ok(pool) => pool,
@@ -532,7 +537,9 @@ fn cold_session_worker(
         let slot = &mut pool_guard.slots[index];
         slot.kv = Some(kv);
         slot.busy = false;
-        slot.idle_since = Some(Instant::now());
+        // A failed final spill must not be selected forever while `ColdWorker::drop` waits to join.
+        let final_shutdown = shutting_down || stop.load(Ordering::Acquire);
+        slot.idle_since = (!final_shutdown || !spill_failed).then(Instant::now);
         drop(pool_guard);
         wake.notify_all();
     }
