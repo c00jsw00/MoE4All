@@ -215,7 +215,7 @@ Q8 Vulkan KV on Qwen3.5/3.6/3.8. A free slot is streamed to one checksummed file
 after `kv.session_idle_secs` (default 120), releasing its dynamic VRAM segments;
 a later request whose token prefix matches restores it instead of re-prefilling
 the saved prefix. `kv.session_cache_max` caps all `.infrkv` files under the root
-directory (default `64GiB`, absolute sizes only), and
+directory (default `5GiB`, absolute sizes only), and
 `kv.session_cache_ttl_hours` removes old files (default 24; 0 disables age
 expiry). The environment aliases are `INFR_KV_SESSION_CACHE_DIR`,
 `INFR_KV_SESSION_IDLE_SECS`, `INFR_KV_SESSION_CACHE_MAX`, and

@@ -189,7 +189,7 @@ cfg_struct! {
         session_idle_secs: u64 = 120,
         /// Maximum bytes retained under [`KvCfg::session_cache_dir`]. Percent values are rejected
         /// by the session store because a disk-cache budget has no meaningful hardware base.
-        session_cache_max: SizeSpec = SizeSpec::Bytes(64u64 << 30),
+        session_cache_max: SizeSpec = SizeSpec::Bytes(5u64 << 30),
         /// Remove cold sessions older than this many hours while opening/maintaining the cache.
         session_cache_ttl_hours: u64 = 24,
         /// `INFR_NO_KV_RING` (inverted): the SWA ring cache.

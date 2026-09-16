@@ -117,7 +117,7 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kv.slots, 4);
     assert_eq!(d.kv.session_cache_dir, None);
     assert_eq!(d.kv.session_idle_secs, 120);
-    assert_eq!(d.kv.session_cache_max, crate::SizeSpec::Bytes(64u64 << 30));
+    assert_eq!(d.kv.session_cache_max, crate::SizeSpec::Bytes(5u64 << 30));
     assert_eq!(d.kv.session_cache_ttl_hours, 24);
     assert!(d.kv.ring);
     assert!(d.kv.dynamic);
