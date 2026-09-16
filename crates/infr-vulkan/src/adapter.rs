@@ -6248,11 +6248,17 @@ fn lower_op(
             u,
             dst,
             n,
+            rows,
             top_k,
             temp,
             top_p,
         } => {
-            let cand = pooled(pool, be_, "sample_cand", 2 * 256 * *top_k as usize * 4)?;
+            let cand = pooled(
+                pool,
+                be_,
+                "sample_cand",
+                2 * *rows as usize * 256 * *top_k as usize * 4,
+            )?;
             match mode {
                 // Record-once/self-advancing path (single-shot `execute` OR chained
                 // `execute_chain` — the same recording serves both): `u` is a 64-slot ring keyed
@@ -6265,6 +6271,7 @@ fn lower_op(
                         *params,
                         r(*dst)?,
                         *n as usize,
+                        *rows as usize,
                         *top_k as usize,
                         *temp,
                         *top_p,
@@ -6278,6 +6285,7 @@ fn lower_op(
                         r(*u)?,
                         r(*dst)?,
                         *n as usize,
+                        *rows as usize,
                         *top_k as usize,
                         *temp,
                         *top_p,

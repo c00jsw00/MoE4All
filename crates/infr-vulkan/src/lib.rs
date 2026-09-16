@@ -3697,6 +3697,7 @@ impl VulkanBackend {
             combined_gu: true,
             embed_gather: true,
             gpu_sample: true,
+            sample_rows: true,
             argmax_rows: true,
             argmax_prob: true,
             // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — the

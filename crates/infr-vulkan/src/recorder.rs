@@ -10748,9 +10748,9 @@ impl<'a> Recorder<'a> {
     pub const SAMPLE_KMAX: usize = crate::gemm::SAMPLE_KMAX;
 
     /// Vocab-scale GPU stochastic sampling (`Op::Sample`): temperature + top-k + top-p over `n`
-    /// logits → token id in `out_id[0]`, with the uniform draw read from the 1-float `u` BUFFER
-    /// (record-once replayable — the host rewrites 4 bytes per token). Two-stage (see
-    /// sample_topk.comp); `cand` = 2*256*top_k f32 scratch. Requires `2 <= top_k <= SAMPLE_KMAX`.
+    /// logits → one token id per row, with one uniform draw per row read from `u`. Two-stage (see
+    /// sample_topk.comp); `cand` = rows*2*256*top_k f32 scratch. Requires
+    /// `2 <= top_k <= SAMPLE_KMAX`.
     #[allow(clippy::too_many_arguments)]
     pub fn sample_topk(
         &self,
@@ -10759,6 +10759,7 @@ impl<'a> Recorder<'a> {
         u: &dyn Buffer,
         out_id: &dyn Buffer,
         n: usize,
+        rows: usize,
         top_k: usize,
         temp: f32,
         top_p: f32,
@@ -10775,7 +10776,13 @@ impl<'a> Recorder<'a> {
             2,
             16,
         );
-        self.dispatch(k1, &[Self::vkb(logits), Self::vkb(cand)], 1, &push, 256);
+        self.dispatch(
+            k1,
+            &[Self::vkb(logits), Self::vkb(cand)],
+            1,
+            &push,
+            (rows * 256) as u32,
+        );
         let mut push2 = [0u8; 16];
         push2[0..4].copy_from_slice(&(256u32 * top_k as u32).to_ne_bytes());
         push2[4..16].copy_from_slice(&push[4..16]);
@@ -10787,7 +10794,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(cand), Self::vkb(u), Self::vkb(out_id)],
             1,
             &push2,
-            1,
+            rows as u32,
         );
     }
 
@@ -10806,11 +10813,13 @@ impl<'a> Recorder<'a> {
         params: &dyn Buffer,
         out_id: &dyn Buffer,
         n: usize,
+        rows: usize,
         top_k: usize,
         temp: f32,
         top_p: f32,
     ) {
         debug_assert!((2..=Self::SAMPLE_KMAX).contains(&top_k));
+        debug_assert_eq!(rows, 1, "chained sampling is single-row");
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(top_k as u32).to_ne_bytes());

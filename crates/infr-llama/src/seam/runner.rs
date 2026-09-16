@@ -6940,14 +6940,15 @@ fn generate_dense_backend_inner(
                     rows: logits_rows as u32,
                 });
                 (Some(tid), None)
-            } else if gpu_sample && logits_rows == 1 {
-                let uin = g.input(f32d(1));
-                let tid = g.output(f32d(1));
+            } else if gpu_sample && logits_rows > 0 {
+                let uin = g.input(f32d(logits_rows));
+                let tid = g.output(f32d(logits_rows));
                 g.push(Op::Sample {
                     x: logits,
                     u: uin,
                     dst: tid,
                     n: c.vocab as u32,
+                    rows: logits_rows as u32,
                     top_k: sampler.top_k as u32,
                     temp: sampler.temp,
                     top_p: sampler.top_p,
@@ -8019,7 +8020,7 @@ fn generate_dense_backend_inner(
                     .map_err(|e| anyhow!("{e}"))?,
                 be.alloc(lanes * 4, BufferUsage::Readback)
                     .map_err(|e| anyhow!("{e}"))?,
-                be.alloc(4, BufferUsage::Staging)
+                be.alloc(lanes * 4, BufferUsage::Staging)
                     .map_err(|e| anyhow!("{e}"))?,
                 be.alloc_uninit(lanes * c.hc_mult * ne * 4, BufferUsage::Activations)
                     .map_err(|e| anyhow!("{e}"))?,
@@ -8049,12 +8050,14 @@ fn generate_dense_backend_inner(
                 && parallel.samplers[sample_from..]
                     .iter()
                     .all(crate::sampling::ParallelSampler::can_gpu_argmax);
-            let batch_gpu_sample = logits_rows == 1
-                && lanes == 1
+            let batch_gpu_sample = logits_rows > 0
+                && (logits_rows == 1 || caps.sample_rows)
                 && caps.gpu_sample
                 && ec.spec.gpu_sample
                 && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
-                && parallel.samplers[0].can_gpu_sample_with(sampler);
+                && parallel.samplers[sample_from..]
+                    .iter()
+                    .all(|lane| lane.can_gpu_sample_with(sampler));
             ensure_kv_depth!(positions[0] + 1);
             for (peer, &position) in parallel.peers.iter_mut().zip(&positions[1..]) {
                 peer.ensure_segmented_depth(be, c, position + 1)?;
@@ -8210,8 +8213,11 @@ fn generate_dense_backend_inner(
                 );
             }
             if batch_gpu_sample {
-                let uniform = parallel.samplers[0].next_uniform();
-                be.upload(sample_u.as_ref(), bytemuck::cast_slice(&[uniform]))
+                let uniforms = parallel.samplers[sample_from..]
+                    .iter_mut()
+                    .map(crate::sampling::ParallelSampler::next_uniform)
+                    .collect::<Vec<_>>();
+                be.upload(sample_u.as_ref(), bytemuck::cast_slice(&uniforms))
                     .map_err(|e| anyhow!("{e}"))?;
                 b1.bind(
                     h1.u_in

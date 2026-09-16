@@ -836,6 +836,7 @@ impl Backend for CpuBackend {
             combined_gu: false,
             embed_gather: true,
             gpu_sample: true,
+            sample_rows: true,
             argmax_rows: true,
             argmax_prob: true,
             // The interpreter implements `Op::GatedRmsNorm` (below) for direct-op parity tests,
@@ -3118,16 +3119,22 @@ impl Backend for CpuBackend {
                     u,
                     dst,
                     n,
+                    rows,
                     top_k,
                     temp,
                     top_p,
                 } => {
                     // Device-side stochastic sampling — see `sample_token` (top_k == 0 = no
                     // truncation; the uniform draw is factored out into the 1-float `u` input).
-                    let logits = &vals[x.0 as usize][..n as usize];
-                    let uu = vals[u.0 as usize][0];
-                    let tok = sample_token(logits, uu, top_k as usize, temp, top_p);
-                    vals[dst.0 as usize] = vec![f32::from_bits(tok)];
+                    let n = n as usize;
+                    let mut out = Vec::with_capacity(rows as usize);
+                    for row in 0..rows as usize {
+                        let logits = &vals[x.0 as usize][row * n..(row + 1) * n];
+                        let uu = vals[u.0 as usize][row];
+                        let tok = sample_token(logits, uu, top_k as usize, temp, top_p);
+                        out.push(f32::from_bits(tok));
+                    }
+                    vals[dst.0 as usize] = out;
                 }
                 Op::Argmax { x, dst, n, rows } => {
                     // Greedy device-side sampling: strict `>` keeps the lowest index on ties —

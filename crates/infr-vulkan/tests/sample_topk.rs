@@ -81,6 +81,7 @@ fn sample_topk_matches_host() {
             ub.as_ref(),
             ob.as_ref(),
             n,
+            1,
             top_k,
             temp,
             top_p,
@@ -91,5 +92,61 @@ fn sample_topk_matches_host() {
         let gpu = u32::from_le_bytes(idb);
         let host = host_sample(&logits, top_k, temp, top_p, u);
         assert_eq!(gpu, host, "u={u}: gpu {gpu} != host {host}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn sample_topk_rows_match_host() {
+    let be = VulkanBackend::new().unwrap();
+    let (rows, n) = (2usize, 151_936usize);
+    let mut state = 0x9E3779B97F4A7C15u64;
+    let logits: Vec<f32> = (0..rows * n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 20.0 - 10.0
+        })
+        .collect();
+    let uniforms = [0.29f32, 0.74f32];
+    let (top_k, temp, top_p) = (20usize, 1.0f32, 0.95f32);
+    let lb = be.alloc(rows * n * 4, BufferUsage::Activations).unwrap();
+    let cand = be
+        .alloc(rows * 2 * 256 * top_k * 4, BufferUsage::Activations)
+        .unwrap();
+    let ub = be.alloc(rows * 4, BufferUsage::Staging).unwrap();
+    let ob = be.alloc(rows * 4, BufferUsage::Readback).unwrap();
+    be.upload(lb.as_ref(), bytemuck::cast_slice(&logits))
+        .unwrap();
+    be.upload(ub.as_ref(), bytemuck::cast_slice(&uniforms))
+        .unwrap();
+
+    let rec = be.recorder().unwrap();
+    rec.sample_topk(
+        lb.as_ref(),
+        cand.as_ref(),
+        ub.as_ref(),
+        ob.as_ref(),
+        n,
+        rows,
+        top_k,
+        temp,
+        top_p,
+    );
+    rec.finish().unwrap();
+
+    let mut ids = [0u32; 2];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut ids))
+        .unwrap();
+    for row in 0..rows {
+        let expected = host_sample(
+            &logits[row * n..(row + 1) * n],
+            top_k,
+            temp,
+            top_p,
+            uniforms[row],
+        );
+        assert_eq!(ids[row], expected, "row={row}");
     }
 }

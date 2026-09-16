@@ -1091,6 +1091,7 @@ pub enum Op {
         u: TensorId,
         dst: TensorId,
         n: u32,
+        rows: u32,
         top_k: u32,
         temp: f32,
         top_p: f32,
