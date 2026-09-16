@@ -1087,8 +1087,8 @@ impl VulkanShared {
             if !pending.is_empty() {
                 let _ = self.device.wait_for_fences(&pending, true, u64::MAX);
             }
-            let pool = *self.cmd_pool.lock().unwrap();
-            self.device.free_command_buffers(pool, &ring.cmds);
+            let pool = self.cmd_pool.lock().unwrap();
+            self.device.free_command_buffers(*pool, &ring.cmds);
             for f in ring.fences.drain(..) {
                 self.device.destroy_fence(f, None);
             }
@@ -1488,8 +1488,8 @@ impl Drop for VulkanShared {
                 queue.into_inner().unwrap().destroy(&self.device);
             }
             // Destroy command pool.
-            let pool = *self.cmd_pool.lock().unwrap();
-            self.device.destroy_command_pool(pool, None);
+            let pool = self.cmd_pool.lock().unwrap();
+            self.device.destroy_command_pool(*pool, None);
             // Drop the allocator *before* destroying the device.
             ManuallyDrop::drop(&mut self.allocator);
             self.device.destroy_device(None);
@@ -6431,7 +6431,8 @@ impl VulkanBackend {
     /// Allocate the staging ring's slots, command buffers and fences — ONCE per load.
     fn make_staging_ring(&self) -> Result<StagingRing> {
         let device = &self.shared.device;
-        let pool = *self.shared.cmd_pool.lock().unwrap();
+        let pool_guard = self.shared.cmd_pool.lock().unwrap();
+        let pool = *pool_guard;
         let cmds = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -6482,7 +6483,10 @@ impl VulkanBackend {
     /// All operations are serialised through the `cmd_pool` mutex.
     fn one_shot(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
         let device = &self.shared.device;
-        let pool = *self.shared.cmd_pool.lock().unwrap();
+        // Vulkan command-pool access is externally synchronized. Keep this guard until
+        // `OneShotCommand` frees the command buffer on every success/error path.
+        let pool_guard = self.shared.cmd_pool.lock().unwrap();
+        let pool = *pool_guard;
 
         let cmd = unsafe {
             device.allocate_command_buffers(

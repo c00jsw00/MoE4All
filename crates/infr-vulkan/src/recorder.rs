@@ -1019,7 +1019,7 @@ impl<'a> Recorder<'a> {
     fn new_inner(backend: &'a VulkanBackend, persistent: bool) -> Result<Self> {
         let profile_acquire_t0 = pager_profile::start();
         let device = &backend.shared.device;
-        let cmd_pool = *backend.shared.cmd_pool.lock().unwrap();
+        let cmd_pool = backend.shared.cmd_pool.lock().unwrap();
         let cmd = match backend.shared.recorder_cmds.lock().unwrap().pop() {
             Some(cmd) => {
                 unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }
@@ -1029,13 +1029,14 @@ impl<'a> Recorder<'a> {
             None => unsafe {
                 device.allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(cmd_pool)
+                        .command_pool(*cmd_pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
                         .command_buffer_count(1),
                 )
             }
             .map_err(|e| be(format!("alloc cmd buffer: {e}")))?[0],
         };
+        drop(cmd_pool);
         let begin_flags = if persistent {
             // SIMULTANEOUS_USE: the chained decode submits the SAME recorded command buffer n
             // times in one vkQueueSubmit (see RecordedCmd::replay_n) — the buffer must be legal
