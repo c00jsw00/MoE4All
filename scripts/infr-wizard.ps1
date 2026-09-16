@@ -637,6 +637,7 @@ $depthTokens = [string](Get-SavedValue 'depth_tokens' '0')
 $reps = [string](Get-SavedValue 'reps' '1')
 $jsonOutput = [bool](Get-SavedValue 'json_output' $false)
 $thinkMode = [string](Get-SavedValue 'think_mode' 'default')
+$reasoningEffort = [string](Get-SavedValue 'reasoning_effort' 'default')
 $maxNew = [string](Get-SavedValue 'max_new' '')
 $configureSampling = [bool](Get-SavedValue 'configure_sampling' $false)
 $temperature = [string](Get-SavedValue 'temperature' '')
@@ -705,6 +706,17 @@ if ($launchMode -eq 'benchmark') {
         [pscustomobject]@{ Key = '2'; Value = 'think'; Label = '强制开启思考 / Force reasoning on' }
         [pscustomobject]@{ Key = '3'; Value = 'no-think'; Label = '关闭思考 / Disable reasoning' }
     )
+    if ($thinkMode -ne 'no-think') {
+        Write-Host 'Qwen3.8: low / medium / xhigh. Other models may support different levels or none.' -ForegroundColor DarkGray
+        $reasoningEffort = Read-Choice -Label '思考强度 / Reasoning effort' -DefaultValue $reasoningEffort -Options @(
+            [pscustomobject]@{ Key = '1'; Value = 'default'; Label = '模板默认 / Template default' }
+            [pscustomobject]@{ Key = '2'; Value = 'low'; Label = 'Low' }
+            [pscustomobject]@{ Key = '3'; Value = 'medium'; Label = 'Medium' }
+            [pscustomobject]@{ Key = '4'; Value = 'xhigh'; Label = 'Xhigh (Qwen3.8)' }
+            [pscustomobject]@{ Key = '5'; Value = 'high'; Label = 'High (only if supported by model)' }
+            [pscustomobject]@{ Key = '6'; Value = 'max'; Label = 'Max (only if supported by model)' }
+        )
+    }
     $maxNew = Read-IntegerValue -Label '每轮最大生成 token，留空为模型默认 / Max new tokens per reply, blank for model default' -Default $maxNew -Minimum 1 -AllowBlank
     $configureSampling = Read-YesNo -Label '设置采样参数？/ Configure sampling?' -Default $configureSampling
     if ($configureSampling) {
@@ -841,6 +853,9 @@ if ($launchMode -eq 'benchmark') {
         'think' { [void]$nativeArgs.Add('--think') }
         'no-think' { [void]$nativeArgs.Add('--no-think') }
     }
+    if ($thinkMode -ne 'no-think' -and $reasoningEffort -ne 'default') {
+        [void]$nativeArgs.Add('--reasoning-effort'); [void]$nativeArgs.Add($reasoningEffort)
+    }
     if ($maxNew) { [void]$nativeArgs.Add('--max-new'); [void]$nativeArgs.Add($maxNew) }
     if ($configureSampling) {
         if ($temperature) { [void]$nativeArgs.Add('--temp'); [void]$nativeArgs.Add($temperature) }
@@ -890,6 +905,7 @@ $state = [ordered]@{
     bench_kind = $benchKind; prompt_tokens = $promptTokens; gen_tokens = $genTokens
     depth_mode = $depthMode; depth_tokens = $depthTokens; reps = $reps; json_output = $jsonOutput
     think_mode = $thinkMode; max_new = $maxNew; configure_sampling = $configureSampling
+    reasoning_effort = $reasoningEffort
     temperature = $temperature; top_k = $topK; top_p = $topP; seed = $seed
     server_addr = $serverAddr; server_parallel = $serverParallel; server_auth = $serverAuth
     server_session_cache = $serverSessionCache; session_cache_dir = $sessionCacheDir

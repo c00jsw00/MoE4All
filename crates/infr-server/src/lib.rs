@@ -42,7 +42,7 @@ use axum::{
     Json, Router,
 };
 use infr_core::config::Config;
-use infr_engine::{ChatMessage, Delta, ToolCall, IMAGE_PART_PLACEHOLDER};
+use infr_engine::{ChatMessage, ChatTemplateOptions, Delta, ToolCall, IMAGE_PART_PLACEHOLDER};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
@@ -280,6 +280,12 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessageDto>,
     #[serde(default)]
     pub stream: bool,
+    /// Native template effort; no global default is imposed on models.
+    #[serde(default)]
+    pub reasoning_effort: Option<infr_core::config::ReasoningEffort>,
+    /// Supported template controls. Kept separate from sampling and never merged into messages.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateOptions>,
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
     /// OpenAI `tool_choice`: `"auto"` | `"required"` | `"none"` | `{"type":"function","function":
@@ -317,6 +323,7 @@ pub struct ChatRequest {
 /// `INFR_TOP_K` / `INFR_TOP_P` / `INFR_MAX_NEW`) in charge for exactly those.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GenParams {
+    pub chat_template_options: ChatTemplateOptions,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -341,6 +348,22 @@ impl GenParams {
     /// silent clamp and never a panic (OpenAI's own ranges: temperature 0..2, top_p 0..1,
     /// presence/frequency -2..2, at most 4 stop sequences).
     pub fn from_request(req: &ChatRequest) -> Result<Self, ParamError> {
+        let mut chat_template_options = req.chat_template_kwargs.clone().unwrap_or_default();
+        if let (Some(top), Some(nested)) =
+            (req.reasoning_effort, chat_template_options.reasoning_effort)
+        {
+            if top != nested {
+                return Err(ParamError {
+                    param: "reasoning_effort",
+                    message:
+                        "reasoning_effort conflicts with chat_template_kwargs.reasoning_effort"
+                            .into(),
+                });
+            }
+        }
+        chat_template_options.reasoning_effort = req
+            .reasoning_effort
+            .or(chat_template_options.reasoning_effort);
         let rng = |param: &'static str,
                    v: Option<f32>,
                    lo: f32,
@@ -411,6 +434,7 @@ impl GenParams {
         }
 
         Ok(Self {
+            chat_template_options,
             // OpenAI renamed `max_tokens` -> `max_completion_tokens`; the new name wins.
             max_tokens: req.max_completion_tokens.or(req.max_tokens),
             temperature: rng("temperature", req.temperature, 0.0, 2.0)?,
@@ -630,6 +654,11 @@ pub struct ChatMessageDto {
     pub role: String,
     #[serde(default)]
     pub content: Option<serde_json::Value>,
+    /// Canonical reasoning field; `reasoning` is accepted as a fallback by dto_to_engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// Assistant's prior tool calls (OpenAI `[{id,type,function:{name,arguments}}]`), replayed on the
     /// next turn so the model sees its own calls.
     #[serde(default)]
@@ -2542,35 +2571,33 @@ async fn non_streaming(
         let mut tally = ReqTally::new();
         let progress_cb = progress_blk.callback();
 
-        let outcome = engine
-            .chat(
-                &messages,
-                tools.as_ref(),
-                tool_choice.as_deref(),
-                &params,
-                &cancel_blk,
-                Some(progress_cb),
-                &mut |delta| match delta {
-                    Delta::Reasoning(t) => {
-                        tally.on_text_delta_progress(&stats_blk, &progress_blk);
-                        reasoning.push_str(&t);
-                    }
-                    Delta::Content(t) => {
-                        tally.on_text_delta_progress(&stats_blk, &progress_blk);
-                        content.push_str(&t);
-                    }
-                    Delta::ToolCall { name, arguments } => {
-                        let idx = tool_calls.len();
-                        tool_calls.push(OAIToolCall {
-                            index: idx,
-                            id: format!("call_{cid_blk}_{idx}"),
-                            kind: "function",
-                            function: OAIFunction { name, arguments },
-                        });
-                    }
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let outcome = engine.chat(
+            &messages,
+            tools.as_ref(),
+            tool_choice.as_deref(),
+            &params,
+            &cancel_blk,
+            Some(progress_cb),
+            &mut |delta| match delta {
+                Delta::Reasoning(t) => {
+                    tally.on_text_delta_progress(&stats_blk, &progress_blk);
+                    reasoning.push_str(&t);
+                }
+                Delta::Content(t) => {
+                    tally.on_text_delta_progress(&stats_blk, &progress_blk);
+                    content.push_str(&t);
+                }
+                Delta::ToolCall { name, arguments } => {
+                    let idx = tool_calls.len();
+                    tool_calls.push(OAIToolCall {
+                        index: idx,
+                        id: format!("call_{cid_blk}_{idx}"),
+                        kind: "function",
+                        function: OAIFunction { name, arguments },
+                    });
+                }
+            },
+        )?;
 
         let finished_progress = progress_blk.finish(outcome);
         Ok((
@@ -2620,7 +2647,11 @@ async fn non_streaming(
         Err(e) => {
             stats.fold_failure();
             tracing::warn!(req = req_id, error = %e, "request failed");
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            if invalid_template_input(&e) {
+                param_error(None, e.to_string())
+            } else {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
         }
         Ok((reasoning, content, tool_calls, outcome, tally, finished_progress)) => {
             // A deadline hit is a TRUNCATION, not a failure: the client keeps the partial reply
@@ -2889,7 +2920,11 @@ async fn streaming(
                 // A mid-stream failure is NOT a clean `stop` — the error frame lets the client tell
                 // this apart from success (matching the non-streaming 500). `[DONE]` still follows,
                 // via `DoneGuard` (audit finding 1).
-                done.fail(&e.to_string());
+                if invalid_template_input(&e) {
+                    done.fail_with_type(&e.to_string(), "invalid_request_error");
+                } else {
+                    done.fail(&e.to_string());
+                }
             }
         }
         // `DoneGuard` drops here (or on an unwinding panic). It sends `[DONE]`, and if nothing
@@ -2973,13 +3008,17 @@ impl DoneGuard {
     /// line cannot drift apart or be emitted twice. Called explicitly by the paths that know why
     /// they failed, and by [`Drop`] for the paths that never got the chance.
     fn fail(&mut self, msg: &str) {
+        self.fail_with_type(msg, "server_error");
+    }
+
+    fn fail_with_type(&mut self, msg: &str, ty: &str) {
         if self.settled {
             return;
         }
         self.settled = true;
         // A failed send just means the client is already gone; the accounting still has to be
         // right, so the fold and the log are NOT conditional on it.
-        let _ = self.tx.send(Ok(sse_error_event(msg)));
+        let _ = self.tx.send(Ok(sse_error_event(msg, ty)));
         self.stats.fold_failure();
         tracing::warn!(req = self.req_id, error = msg, "request failed");
     }
@@ -3004,11 +3043,17 @@ fn error_body(msg: &str, ty: &str) -> serde_json::Value {
     serde_json::json!({"error": {"message": msg, "type": ty}})
 }
 
+fn invalid_template_input(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<infr_engine::TemplateError>()
+        .is_some_and(infr_engine::TemplateError::is_invalid_input)
+}
+
 /// A terminal SSE error frame: `data: {"error":{...}}`. Distinguishable from a normal
 /// `chat.completion.chunk` and from `[DONE]`, so a client can tell a mid-stream failure apart from a
 /// clean completion (audit finding 1).
-fn sse_error_event(msg: &str) -> Event {
-    Event::default().data(error_body(msg, "server_error").to_string())
+fn sse_error_event(msg: &str, ty: &str) -> Event {
+    Event::default().data(error_body(msg, ty).to_string())
 }
 
 /// Serialize a delta payload into an SSE event carrying a `chat.completion.chunk`.
@@ -3316,6 +3361,10 @@ fn dto_to_engine(dto: &ChatMessageDto) -> ChatMessage {
         role: dto.role.clone(),
         content: flatten_content(&dto.content),
         images: collect_images(&dto.content),
+        reasoning_content: dto
+            .reasoning_content
+            .clone()
+            .or_else(|| dto.reasoning.clone()),
         tool_calls: dto.tool_calls.as_ref().and_then(parse_oai_tool_calls),
         tool_call_id: dto.tool_call_id.clone(),
         name: dto.name.clone(),
@@ -3348,6 +3397,9 @@ fn parse_oai_tool_calls(v: &serde_json::Value) -> Option<Vec<ToolCall>> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod thinking_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4911,6 +4963,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
             images: Vec::new(),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,

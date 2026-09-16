@@ -10,13 +10,16 @@
 //! - [`split_channels`] / [`parse_tool_calls`] — parse model output (reasoning vs answer,
 //!   `<|tool_call>` blocks).
 
+mod options;
 mod stream;
 mod template;
 mod tools;
 
+pub use options::ChatTemplateOptions;
 pub use stream::{prompt_prefills_think, ChatStream, Delta};
 pub use template::{
-    render_chat_jinja, render_chat_oai, render_chat_user, render_template, TemplateError,
+    render_chat_jinja, render_chat_oai, render_chat_oai_with_options, render_chat_user,
+    render_template, render_template_with_options, TemplateError,
 };
 pub use tools::{
     parse_any_tool_calls, parse_hermes_tool_calls, parse_tool_calls, split_channels,
@@ -35,6 +38,8 @@ pub struct ChatMessage {
     pub content: String,
     /// Image payloads (`data:` URI or bare base64) in the same order as placeholders in content.
     pub images: Vec<String>,
+    /// Previous assistant reasoning, supplied separately from the visible answer.
+    pub reasoning_content: Option<String>,
     /// The assistant's OUTGOING tool calls (OpenAI `message.tool_calls`), replayed into the prompt on
     /// the next turn so the model sees its own prior calls. Empty/None for non-assistant messages.
     pub tool_calls: Option<Vec<ToolCall>>,

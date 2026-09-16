@@ -19,5 +19,6 @@ subtle.workspace = true
 futures-util = "0.3"
 
 [dev-dependencies]
+infr-chat.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

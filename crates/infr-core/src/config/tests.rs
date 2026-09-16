@@ -44,6 +44,41 @@ fn cli_layer(sets: &[&str]) -> PartialConfig {
     .0
 }
 
+#[test]
+fn thinking_config_file_and_set_have_the_same_typed_values() {
+    let from_file =
+        file_layer("[sampling]\nreasoning_effort = 'medium'\npreserve_thinking = false\n");
+    let from_set = cli_layer(&[
+        "sampling.reasoning_effort=medium",
+        "sampling.preserve_thinking=false",
+    ]);
+    assert_eq!(from_file, from_set);
+    assert_eq!(
+        from_file.sampling.reasoning_effort,
+        Some(Some(super::ReasoningEffort::Medium))
+    );
+    assert_eq!(from_file.sampling.preserve_thinking, Some(Some(false)));
+    assert_eq!(Config::default().sampling.reasoning_effort, None);
+    assert_eq!(Config::default().sampling.preserve_thinking, None);
+}
+
+#[test]
+fn thinking_levels_reject_typos_and_can_be_reset_to_template_default() {
+    for value in ["midium", "height", "auto"] {
+        assert!(PartialConfig::default()
+            .set_path("sampling.reasoning_effort", value)
+            .is_err());
+    }
+    let mut partial = PartialConfig::default();
+    partial
+        .set_path("sampling.reasoning_effort", "low")
+        .unwrap();
+    partial
+        .set_path("sampling.reasoning_effort", "none")
+        .unwrap();
+    assert_eq!(partial.sampling.reasoning_effort, Some(None));
+}
+
 // ── §8.1 ─────────────────────────────────────────────────────────────────────
 
 /// Every default is the shipped behaviour, and an empty stack of layers changes nothing.

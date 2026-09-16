@@ -74,6 +74,10 @@ ignore_eos = false
 
 # Suppress the model's `<think>` block where the template supports one.
 no_think = false
+# Optional native template controls. Omit to retain the template's defaults.
+# Qwen3.8 accepts low / medium / xhigh (NOT high). Other templates differ.
+# reasoning_effort = "medium"
+# preserve_thinking = true
 
 # ── kv cache ─────────────────────────────────────────────────────────────────
 
