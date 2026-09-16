@@ -7996,6 +7996,14 @@ fn generate_dense_backend_inner(
             ));
         }
 
+        let profile_cohort = infr_core::pager_profile::active();
+        let profile_cohort_t0 = profile_cohort.then(std::time::Instant::now);
+        let profile_before = profile_cohort.then(infr_core::pager_profile::snapshot);
+        let profile_timeline_before =
+            profile_cohort.then(infr_core::pager_profile::device_timeline_snapshot);
+        let profile_layers_before =
+            profile_cohort.then(infr_core::pager_profile::paged_moe_layer_snapshot);
+        let profile_once_t0 = profile_cohort.then(std::time::Instant::now);
         let ple_heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
         let ple_row = ple_heads * c.ple_head_dim;
         let (
@@ -8035,8 +8043,20 @@ fn generate_dense_backend_inner(
         let mut prompt_secs = vec![0.0f64; lanes];
         let mut decode_secs = vec![0.0f64; lanes];
         let independent_rows = lanes > 1;
+        let profile_once = profile_once_t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        let mut profile_front = std::time::Duration::ZERO;
+        let mut profile_layer0 = std::time::Duration::ZERO;
+        let mut profile_ple_wait = std::time::Duration::ZERO;
+        let mut profile_ple_upload = std::time::Duration::ZERO;
+        let mut profile_main_setup = std::time::Duration::ZERO;
+        let mut profile_main_execute = std::time::Duration::ZERO;
+        let mut profile_tail = std::time::Duration::ZERO;
+        let mut profile_steps = 0usize;
+        let mut profile_decode_rows = 0usize;
+        let mut profile_prefill_rows = 0usize;
         for step in 0..max_new {
             let step_t0 = std::time::Instant::now();
+            let profile_front_t0 = profile_cohort.then(std::time::Instant::now);
             let _gp = req.and_then(|request| request.gate_pass());
             let positions = lane_starts
                 .iter()
@@ -8142,10 +8162,21 @@ fn generate_dense_backend_inner(
                 None,
                 independent_rows,
             );
+            if let Some(t0) = profile_front_t0 {
+                profile_front += t0.elapsed();
+            }
+            let profile_layer0_t0 = profile_cohort.then(std::time::Instant::now);
             be.execute(plan0.as_ref(), &b0)
                 .map_err(|e| anyhow!("{e}"))?;
+            if let Some(t0) = profile_layer0_t0 {
+                profile_layer0 += t0.elapsed();
+            }
 
+            let profile_ple_wait_t0 = profile_cohort.then(std::time::Instant::now);
             let ple_rows = ple_ticket.wait()?;
+            if let Some(t0) = profile_ple_wait_t0 {
+                profile_ple_wait += t0.elapsed();
+            }
             let expected_ple_values = lanes * ple_row;
             if ple_rows.len() != expected_ple_values {
                 return Err(anyhow!(
@@ -8153,12 +8184,17 @@ fn generate_dense_backend_inner(
                     ple_rows.len()
                 ));
             }
+            let profile_ple_upload_t0 = profile_cohort.then(std::time::Instant::now);
             be.upload(
                 ple_batch.as_ref(),
                 bytemuck::cast_slice(ple_rows.as_slice()),
             )
             .map_err(|e| anyhow!("{e}"))?;
+            if let Some(t0) = profile_ple_upload_t0 {
+                profile_ple_upload += t0.elapsed();
+            }
 
+            let profile_main_setup_t0 = profile_cohort.then(std::time::Instant::now);
             let (g1, h1) = build(
                 lanes,
                 positions[0],
@@ -8229,9 +8265,17 @@ fn generate_dense_backend_inner(
                     ids_out.as_ref(),
                 );
             }
+            if let Some(t0) = profile_main_setup_t0 {
+                profile_main_setup += t0.elapsed();
+            }
+            let profile_main_execute_t0 = profile_cohort.then(std::time::Instant::now);
             be.execute(plan1.as_ref(), &b1)
                 .map_err(|e| anyhow!("{e}"))?;
+            if let Some(t0) = profile_main_execute_t0 {
+                profile_main_execute += t0.elapsed();
+            }
 
+            let profile_tail_t0 = profile_cohort.then(std::time::Instant::now);
             let mut next = vec![0u32; logits_rows];
             if batch_argmax || batch_gpu_sample {
                 be.download(ids_out.as_ref(), bytemuck::cast_slice_mut(&mut next))
@@ -8293,15 +8337,22 @@ fn generate_dense_backend_inner(
                     stop_batch = true;
                 }
             }
-            if stop_batch
+            let should_stop = stop_batch
                 || parallel
                     .yield_requested
-                    .is_some_and(|requested| requested.load(std::sync::atomic::Ordering::Acquire))
-            {
+                    .is_some_and(|requested| requested.load(std::sync::atomic::Ordering::Acquire));
+            if let Some(t0) = profile_tail_t0 {
+                profile_tail += t0.elapsed();
+            }
+            profile_steps += 1;
+            profile_decode_rows += logits_rows;
+            profile_prefill_rows += sample_from;
+            if should_stop {
                 break;
             }
         }
 
+        let profile_teardown_t0 = profile_cohort.then(std::time::Instant::now);
         *cached = resident_after_gen(&curs[0], last_written[0]);
         for ((slot, tokens), written) in parallel
             .peers
@@ -8317,6 +8368,263 @@ fn generate_dense_backend_inner(
             .extend(generated.iter().skip(1).cloned());
         parallel.prompt_secs.extend(prompt_secs);
         parallel.decode_secs.extend(decode_secs);
+        let profile_teardown =
+            profile_teardown_t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        if let (Some(cohort_t0), Some(before), Some(timeline_before), Some(layers_before)) = (
+            profile_cohort_t0,
+            profile_before,
+            profile_timeline_before,
+            profile_layers_before,
+        ) {
+            let wall = cohort_t0.elapsed();
+            let phases = profile_once
+                + profile_front
+                + profile_layer0
+                + profile_ple_wait
+                + profile_ple_upload
+                + profile_main_setup
+                + profile_main_execute
+                + profile_tail
+                + profile_teardown;
+            let after = infr_core::pager_profile::snapshot();
+            let timeline_after = infr_core::pager_profile::device_timeline_snapshot();
+            let layers_after = infr_core::pager_profile::paged_moe_layer_snapshot();
+            let delta = |new: u64, old: u64| new.saturating_sub(old);
+            let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1e3;
+            let ns_ms = |ns: u64| ns as f64 / 1e6;
+            let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
+            let gpu_hits = delta(after.gpu_hits, before.gpu_hits);
+            let gpu_misses = delta(after.gpu_misses, before.gpu_misses);
+            let host_hits = delta(after.host_hits, before.host_hits);
+            let host_misses = delta(after.host_misses, before.host_misses);
+            let main_busy_ns = delta(timeline_after.main_busy_ns, timeline_before.main_busy_ns);
+            let dma_busy_ns = delta(timeline_after.dma_busy_ns, timeline_before.dma_busy_ns);
+            let overlap_ns = delta(timeline_after.overlap_ns, timeline_before.overlap_ns);
+            let gpu_union_ns = main_busy_ns
+                .saturating_add(dma_busy_ns)
+                .saturating_sub(overlap_ns);
+            let backend_execute_ns = delta(after.backend_execute_ns, before.backend_execute_ns);
+            let backend_setup_ns = delta(after.backend_setup_ns, before.backend_setup_ns);
+            let recorder_acquire_ns = delta(
+                after.command_recorder_acquire_ns,
+                before.command_recorder_acquire_ns,
+            );
+            let command_record_ns = delta(after.command_record_ns, before.command_record_ns);
+            let queue_submit_ns = delta(after.queue_submit_ns, before.queue_submit_ns);
+            let sync_wait_ns = delta(after.sync_wait_ns, before.sync_wait_ns);
+            let host_accounted_ns = backend_setup_ns
+                .saturating_add(recorder_acquire_ns)
+                .saturating_add(command_record_ns)
+                .saturating_add(queue_submit_ns)
+                .saturating_add(sync_wait_ns);
+            let backend_gpu_gap_ns = backend_execute_ns.saturating_sub(gpu_union_ns);
+            let backend_residual_ns = backend_execute_ns.saturating_sub(host_accounted_ns);
+            let per_step_ms = |ns: u64| {
+                if profile_steps == 0 {
+                    0.0
+                } else {
+                    ns as f64 / 1e6 / profile_steps as f64
+                }
+            };
+            let rows = profile_decode_rows + profile_prefill_rows;
+            tracing::info!(
+                "[parallel-token-profile] lanes={} steps={} rows={} decode_rows={} prefill_rows={} wall={:.1}ms row_rate={:.1}/s once={:.1}ms front={:.1}ms layer0={:.1}ms ple_wait={:.1}ms ple_upload={:.1}ms main_setup={:.1}ms main_execute={:.1}ms tail={:.1}ms teardown={:.1}ms unaccounted={:.1}ms",
+                lanes,
+                profile_steps,
+                rows,
+                profile_decode_rows,
+                profile_prefill_rows,
+                ms(wall),
+                if wall.is_zero() {
+                    0.0
+                } else {
+                    rows as f64 / wall.as_secs_f64()
+                },
+                ms(profile_once),
+                ms(profile_front),
+                ms(profile_layer0),
+                ms(profile_ple_wait),
+                ms(profile_ple_upload),
+                ms(profile_main_setup),
+                ms(profile_main_execute),
+                ms(profile_tail),
+                ms(profile_teardown),
+                ms(wall.saturating_sub(phases)),
+            );
+            tracing::info!(
+                "[parallel-token-pager] gpu_hits={} gpu_misses={} hit_rate={:.1}% evictions={} lookup={:.1}ms host_hits={} host_misses={} host_wait={:.1}ms host_read={:.1}MiB/{:.1}ms mmap={:.1}MiB/{:.1}ms push={:.1}MiB/{:.1}ms dma={:.1}MiB gpu_copy={:.1}ms gpu_main={:.1}ms gpu_dma={:.1}ms overlap={:.1}ms dma_hidden={:.1}% queue_submits={} submit_cpu={:.1}ms sync={:.1}ms paging_sync={:.1}ms backend_execute={:.1}ms setup={:.1}ms ple_plan={:.1}ms ple_work={:.1}ms ple_wait={:.1}ms ple_upload={:.1}ms",
+                gpu_hits,
+                gpu_misses,
+                if gpu_hits + gpu_misses == 0 {
+                    100.0
+                } else {
+                    100.0 * gpu_hits as f64 / (gpu_hits + gpu_misses) as f64
+                },
+                delta(after.gpu_evictions, before.gpu_evictions),
+                ns_ms(delta(after.gpu_lookup_ns, before.gpu_lookup_ns)),
+                host_hits,
+                host_misses,
+                ns_ms(delta(after.host_wait_ns, before.host_wait_ns)),
+                mib(delta(after.host_read_bytes, before.host_read_bytes)),
+                ns_ms(delta(after.host_read_ns, before.host_read_ns)),
+                mib(delta(after.mmap_fallback_bytes, before.mmap_fallback_bytes)),
+                ns_ms(delta(after.mmap_fallback_ns, before.mmap_fallback_ns)),
+                mib(delta(after.memcpy_bytes, before.memcpy_bytes)),
+                ns_ms(delta(after.memcpy_ns, before.memcpy_ns)),
+                mib(delta(
+                    after.dedicated_transfer_bytes,
+                    before.dedicated_transfer_bytes
+                )),
+                ns_ms(delta(
+                    after.dedicated_transfer_gpu_ns,
+                    before.dedicated_transfer_gpu_ns
+                )),
+                ns_ms(main_busy_ns),
+                ns_ms(dma_busy_ns),
+                ns_ms(overlap_ns),
+                if dma_busy_ns == 0 {
+                    0.0
+                } else {
+                    100.0 * overlap_ns as f64 / dma_busy_ns as f64
+                },
+                delta(after.queue_submits, before.queue_submits),
+                ns_ms(queue_submit_ns),
+                ns_ms(sync_wait_ns),
+                ns_ms(delta(after.paging_sync_wait_ns, before.paging_sync_wait_ns)),
+                ns_ms(backend_execute_ns),
+                ns_ms(backend_setup_ns),
+                ns_ms(delta(after.ple_plan_ns, before.ple_plan_ns)),
+                ns_ms(delta(after.ple_work_ns, before.ple_work_ns)),
+                ns_ms(delta(after.ple_wait_ns, before.ple_wait_ns)),
+                ns_ms(delta(after.ple_upload_ns, before.ple_upload_ns)),
+            );
+            tracing::info!(
+                "[parallel-token-gap] backend={:.1}ms gpu_union={:.1}ms backend_minus_gpu={:.1}ms ({:.3}ms/step) host_accounted={:.1}ms closure={:.1}% setup={:.1}ms acquire={:.1}ms record={:.1}ms submit={:.1}ms sync={:.1}ms residual={:.1}ms ({:.3}ms/step)",
+                ns_ms(backend_execute_ns),
+                ns_ms(gpu_union_ns),
+                ns_ms(backend_gpu_gap_ns),
+                per_step_ms(backend_gpu_gap_ns),
+                ns_ms(host_accounted_ns),
+                if backend_execute_ns == 0 {
+                    100.0
+                } else {
+                    100.0 * host_accounted_ns.min(backend_execute_ns) as f64
+                        / backend_execute_ns as f64
+                },
+                ns_ms(backend_setup_ns),
+                ns_ms(recorder_acquire_ns),
+                ns_ms(command_record_ns),
+                ns_ms(queue_submit_ns),
+                ns_ms(sync_wait_ns),
+                ns_ms(backend_residual_ns),
+                per_step_ms(backend_residual_ns),
+            );
+            tracing::info!(
+                "[parallel-token-host] record_segments={} record_span={:.1}ms recorder_acquires={} acquire={:.1}ms queue_idle={}({:.1}ms) fence={}({:.1}ms) paging_sync={}({:.1}ms) staging_acquire={}({:.1}ms) staging_wait={}({:.1}ms) dma_submit_cpu={:.1}ms dma_slot_wait={}({:.1}ms) dma_timeline_wait={}({:.1}ms) setup_layout={:.1}ms setup_scratch={:.1}ms setup_rope={:.1}ms setup_fusion={:.1}ms setup_moe_scan={:.1}ms",
+                delta(
+                    after.command_record_segments,
+                    before.command_record_segments
+                ),
+                ns_ms(command_record_ns),
+                delta(
+                    after.command_recorder_acquires,
+                    before.command_recorder_acquires
+                ),
+                ns_ms(recorder_acquire_ns),
+                delta(after.queue_idle_waits, before.queue_idle_waits),
+                ns_ms(delta(
+                    after.queue_idle_wait_ns,
+                    before.queue_idle_wait_ns
+                )),
+                delta(after.fence_waits, before.fence_waits),
+                ns_ms(delta(after.fence_wait_ns, before.fence_wait_ns)),
+                delta(after.paging_sync_waits, before.paging_sync_waits),
+                ns_ms(delta(
+                    after.paging_sync_wait_ns,
+                    before.paging_sync_wait_ns
+                )),
+                delta(after.staging_acquires, before.staging_acquires),
+                ns_ms(delta(
+                    after.staging_acquire_ns,
+                    before.staging_acquire_ns
+                )),
+                delta(after.staging_waits, before.staging_waits),
+                ns_ms(delta(after.staging_wait_ns, before.staging_wait_ns)),
+                ns_ms(delta(
+                    after.dedicated_transfer_submit_cpu_ns,
+                    before.dedicated_transfer_submit_cpu_ns
+                )),
+                delta(
+                    after.dedicated_transfer_slot_waits,
+                    before.dedicated_transfer_slot_waits
+                ),
+                ns_ms(delta(
+                    after.dedicated_transfer_slot_wait_ns,
+                    before.dedicated_transfer_slot_wait_ns
+                )),
+                delta(
+                    after.dedicated_transfer_timeline_waits,
+                    before.dedicated_transfer_timeline_waits
+                ),
+                ns_ms(delta(
+                    after.dedicated_transfer_timeline_wait_ns,
+                    before.dedicated_transfer_timeline_wait_ns
+                )),
+                ns_ms(delta(
+                    after.backend_setup_layout_ns,
+                    before.backend_setup_layout_ns
+                )),
+                ns_ms(delta(
+                    after.backend_setup_phase_scratch_ns,
+                    before.backend_setup_phase_scratch_ns
+                )),
+                ns_ms(delta(
+                    after.backend_setup_rope_ns,
+                    before.backend_setup_rope_ns
+                )),
+                ns_ms(delta(
+                    after.backend_setup_fusion_ns,
+                    before.backend_setup_fusion_ns
+                )),
+                ns_ms(delta(
+                    after.backend_setup_paged_moe_scan_ns,
+                    before.backend_setup_paged_moe_scan_ns
+                )),
+            );
+            for (layer, layer_after) in layers_after.into_iter().enumerate() {
+                let layer_before = layers_before.get(layer).copied().unwrap_or_default();
+                let stats = layer_after.saturating_sub(layer_before);
+                if stats.calls == 0 {
+                    continue;
+                }
+                tracing::info!(
+                    "[parallel-token-layer] layer={} calls={} wall={:.1}ms host_outside_sync={:.1}ms paging_sync={}({:.1}ms) main_done={:.1}ms dma_done={:.1}ms gpu_hits={} gpu_misses={} evictions={} push={:.1}MiB/{:.1}ms dma={:.1}MiB dma_submits={} queue_submits={} submit_cpu={:.1}ms record_segments={} record_span={:.1}ms recorder_acquire={:.1}ms staging_wait={:.1}ms dma_slot_wait={:.1}ms dma_timeline_wait={:.1}ms",
+                    layer,
+                    stats.calls,
+                    ns_ms(stats.wall_ns),
+                    ns_ms(stats.wall_ns.saturating_sub(stats.paging_sync_wait_ns)),
+                    stats.paging_sync_waits,
+                    ns_ms(stats.paging_sync_wait_ns),
+                    ns_ms(stats.main_done_ns),
+                    ns_ms(stats.dma_done_ns),
+                    stats.gpu_hits,
+                    stats.gpu_misses,
+                    stats.gpu_evictions,
+                    mib(stats.memcpy_bytes),
+                    ns_ms(stats.memcpy_ns),
+                    mib(stats.dedicated_transfer_bytes),
+                    stats.dedicated_transfer_submits,
+                    stats.queue_submits,
+                    ns_ms(stats.queue_submit_ns),
+                    stats.command_record_segments,
+                    ns_ms(stats.command_record_ns),
+                    ns_ms(stats.command_recorder_acquire_ns),
+                    ns_ms(stats.staging_wait_ns),
+                    ns_ms(stats.dedicated_transfer_slot_wait_ns),
+                    ns_ms(stats.dedicated_transfer_timeline_wait_ns),
+                );
+            }
+        }
         return Ok((
             generated.remove(0),
             GenStats {

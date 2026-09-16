@@ -15,6 +15,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static PRINTED: AtomicBool = AtomicBool::new(false);
 static COUNTERS: Counters = Counters::new();
 static DEVICE_INTERVALS: Mutex<Vec<DeviceInterval>> = Mutex::new(Vec::new());
+static PAGED_MOE_LAYERS: Mutex<Vec<PagedMoeLayerStats>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceIntervalKind {
@@ -41,14 +42,120 @@ struct DeviceInterval {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct DeviceTimelineStats {
-    main_intervals: usize,
-    dma_intervals: usize,
-    span_ns: u64,
-    main_busy_ns: u64,
-    dma_busy_ns: u64,
-    overlap_ns: u64,
-    outside_intervals_ns: u64,
+pub struct DeviceTimelineStats {
+    pub main_intervals: usize,
+    pub dma_intervals: usize,
+    pub span_ns: u64,
+    pub main_busy_ns: u64,
+    pub dma_busy_ns: u64,
+    pub overlap_ns: u64,
+    pub outside_intervals_ns: u64,
+}
+
+/// Lightweight counter sample around one paged-MoE boundary. Unlike [`Snapshot`], this contains
+/// only counters needed to explain the decode critical path, so taking it once per layer stays
+/// cheap enough for an opt-in production-shaped profile.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PagedMoeHotSnapshot {
+    gpu_hits: u64,
+    gpu_misses: u64,
+    gpu_evictions: u64,
+    memcpy_bytes: u64,
+    memcpy_ns: u64,
+    dedicated_transfer_submits: u64,
+    dedicated_transfer_bytes: u64,
+    dedicated_transfer_submit_cpu_ns: u64,
+    dedicated_transfer_slot_wait_ns: u64,
+    dedicated_transfer_timeline_wait_ns: u64,
+    queue_submits: u64,
+    queue_submit_ns: u64,
+    command_record_segments: u64,
+    command_record_ns: u64,
+    command_recorder_acquire_ns: u64,
+    paging_sync_waits: u64,
+    paging_sync_wait_ns: u64,
+    staging_wait_ns: u64,
+    device_main_raw_ns: u64,
+    device_dma_raw_ns: u64,
+}
+
+/// Aggregate for all profiled visits to one model layer. `main_done_ns` and `dma_done_ns` name
+/// queue intervals whose timestamp queries became available while crossing this layer boundary;
+/// pipelining means they describe work completed at the boundary, not necessarily work issued by
+/// the same layer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PagedMoeLayerStats {
+    pub calls: u64,
+    pub wall_ns: u64,
+    pub gpu_hits: u64,
+    pub gpu_misses: u64,
+    pub gpu_evictions: u64,
+    pub memcpy_bytes: u64,
+    pub memcpy_ns: u64,
+    pub dedicated_transfer_submits: u64,
+    pub dedicated_transfer_bytes: u64,
+    pub dedicated_transfer_submit_cpu_ns: u64,
+    pub dedicated_transfer_slot_wait_ns: u64,
+    pub dedicated_transfer_timeline_wait_ns: u64,
+    pub queue_submits: u64,
+    pub queue_submit_ns: u64,
+    pub command_record_segments: u64,
+    pub command_record_ns: u64,
+    pub command_recorder_acquire_ns: u64,
+    pub paging_sync_waits: u64,
+    pub paging_sync_wait_ns: u64,
+    pub staging_wait_ns: u64,
+    pub main_done_ns: u64,
+    pub dma_done_ns: u64,
+}
+
+impl PagedMoeLayerStats {
+    pub fn saturating_sub(self, before: Self) -> Self {
+        Self {
+            calls: self.calls.saturating_sub(before.calls),
+            wall_ns: self.wall_ns.saturating_sub(before.wall_ns),
+            gpu_hits: self.gpu_hits.saturating_sub(before.gpu_hits),
+            gpu_misses: self.gpu_misses.saturating_sub(before.gpu_misses),
+            gpu_evictions: self.gpu_evictions.saturating_sub(before.gpu_evictions),
+            memcpy_bytes: self.memcpy_bytes.saturating_sub(before.memcpy_bytes),
+            memcpy_ns: self.memcpy_ns.saturating_sub(before.memcpy_ns),
+            dedicated_transfer_submits: self
+                .dedicated_transfer_submits
+                .saturating_sub(before.dedicated_transfer_submits),
+            dedicated_transfer_bytes: self
+                .dedicated_transfer_bytes
+                .saturating_sub(before.dedicated_transfer_bytes),
+            dedicated_transfer_submit_cpu_ns: self
+                .dedicated_transfer_submit_cpu_ns
+                .saturating_sub(before.dedicated_transfer_submit_cpu_ns),
+            dedicated_transfer_slot_wait_ns: self
+                .dedicated_transfer_slot_wait_ns
+                .saturating_sub(before.dedicated_transfer_slot_wait_ns),
+            dedicated_transfer_timeline_wait_ns: self
+                .dedicated_transfer_timeline_wait_ns
+                .saturating_sub(before.dedicated_transfer_timeline_wait_ns),
+            queue_submits: self.queue_submits.saturating_sub(before.queue_submits),
+            queue_submit_ns: self.queue_submit_ns.saturating_sub(before.queue_submit_ns),
+            command_record_segments: self
+                .command_record_segments
+                .saturating_sub(before.command_record_segments),
+            command_record_ns: self
+                .command_record_ns
+                .saturating_sub(before.command_record_ns),
+            command_recorder_acquire_ns: self
+                .command_recorder_acquire_ns
+                .saturating_sub(before.command_recorder_acquire_ns),
+            paging_sync_waits: self
+                .paging_sync_waits
+                .saturating_sub(before.paging_sync_waits),
+            paging_sync_wait_ns: self
+                .paging_sync_wait_ns
+                .saturating_sub(before.paging_sync_wait_ns),
+            staging_wait_ns: self.staging_wait_ns.saturating_sub(before.staging_wait_ns),
+            main_done_ns: self.main_done_ns.saturating_sub(before.main_done_ns),
+            dma_done_ns: self.dma_done_ns.saturating_sub(before.dma_done_ns),
+        }
+    }
 }
 
 struct Counters {
@@ -119,6 +226,8 @@ struct Counters {
     dedicated_transfer_slot_wait_ns: AtomicU64,
     dedicated_transfer_timeline_waits: AtomicU64,
     dedicated_transfer_timeline_wait_ns: AtomicU64,
+    device_main_raw_ns: AtomicU64,
+    device_dma_raw_ns: AtomicU64,
 
     queue_submits: AtomicU64,
     queue_submit_ns: AtomicU64,
@@ -253,6 +362,8 @@ impl Counters {
             dedicated_transfer_slot_wait_ns: AtomicU64::new(0),
             dedicated_transfer_timeline_waits: AtomicU64::new(0),
             dedicated_transfer_timeline_wait_ns: AtomicU64::new(0),
+            device_main_raw_ns: AtomicU64::new(0),
+            device_dma_raw_ns: AtomicU64::new(0),
 
             queue_submits: AtomicU64::new(0),
             queue_submit_ns: AtomicU64::new(0),
@@ -897,6 +1008,24 @@ pub fn record_device_interval(
     if valid_bits == 0 || !period_ns.is_finite() || period_ns <= 0.0 {
         return;
     }
+    let mask = if valid_bits >= 64 {
+        u64::MAX as u128
+    } else {
+        (1u128 << valid_bits) - 1
+    };
+    let modulus = mask + 1;
+    let start = start_tick as u128 & mask;
+    let mut end = end_tick as u128 & mask;
+    if end < start {
+        end += modulus;
+    }
+    let elapsed_ns =
+        ((end.saturating_sub(start) as f64 * period_ns as f64).min(u64::MAX as f64)) as u64;
+    match kind {
+        DeviceIntervalKind::MainQueue => &COUNTERS.device_main_raw_ns,
+        DeviceIntervalKind::DedicatedTransfer => &COUNTERS.device_dma_raw_ns,
+    }
+    .fetch_add(elapsed_ns, Ordering::Relaxed);
     DEVICE_INTERVALS.lock().unwrap().push(DeviceInterval {
         kind,
         start_tick,
@@ -1115,6 +1244,96 @@ pub fn record_lru_work(stats: LruWorkStats) {
     COUNTERS
         .lru_victim_max_queue_len
         .fetch_max(stats.victim_max_queue_len, Ordering::Relaxed);
+}
+
+/// Read the counters needed to attribute one paged-MoE boundary. Call only when [`active`] is
+/// true; keeping that branch at the caller avoids dozens of relaxed loads in normal execution.
+pub fn paged_moe_hot_snapshot() -> PagedMoeHotSnapshot {
+    PagedMoeHotSnapshot {
+        gpu_hits: load(&COUNTERS.gpu_hits),
+        gpu_misses: load(&COUNTERS.gpu_misses),
+        gpu_evictions: load(&COUNTERS.gpu_evictions),
+        memcpy_bytes: load(&COUNTERS.memcpy_bytes),
+        memcpy_ns: load(&COUNTERS.memcpy_ns),
+        dedicated_transfer_submits: load(&COUNTERS.dedicated_transfer_submits),
+        dedicated_transfer_bytes: load(&COUNTERS.dedicated_transfer_bytes),
+        dedicated_transfer_submit_cpu_ns: load(&COUNTERS.dedicated_transfer_submit_cpu_ns),
+        dedicated_transfer_slot_wait_ns: load(&COUNTERS.dedicated_transfer_slot_wait_ns),
+        dedicated_transfer_timeline_wait_ns: load(&COUNTERS.dedicated_transfer_timeline_wait_ns),
+        queue_submits: load(&COUNTERS.queue_submits),
+        queue_submit_ns: load(&COUNTERS.queue_submit_ns),
+        command_record_segments: load(&COUNTERS.command_record_segments),
+        command_record_ns: load(&COUNTERS.command_record_ns),
+        command_recorder_acquire_ns: load(&COUNTERS.command_recorder_acquire_ns),
+        paging_sync_waits: load(&COUNTERS.paging_sync_waits),
+        paging_sync_wait_ns: load(&COUNTERS.paging_sync_wait_ns),
+        staging_wait_ns: load(&COUNTERS.staging_wait_ns),
+        device_main_raw_ns: load(&COUNTERS.device_main_raw_ns),
+        device_dma_raw_ns: load(&COUNTERS.device_dma_raw_ns),
+    }
+}
+
+/// Attribute host work and queue intervals completed while crossing one paged-MoE layer boundary.
+pub fn record_paged_moe_layer(
+    layer: u32,
+    wall: Duration,
+    before: PagedMoeHotSnapshot,
+    after: PagedMoeHotSnapshot,
+) {
+    let mut layers = PAGED_MOE_LAYERS.lock().unwrap();
+    let layer = layer as usize;
+    if layers.len() <= layer {
+        layers.resize(layer + 1, PagedMoeLayerStats::default());
+    }
+    let stats = &mut layers[layer];
+    let delta = |new: u64, old: u64| new.saturating_sub(old);
+    stats.calls += 1;
+    stats.wall_ns = stats.wall_ns.saturating_add(ns(wall));
+    stats.gpu_hits += delta(after.gpu_hits, before.gpu_hits);
+    stats.gpu_misses += delta(after.gpu_misses, before.gpu_misses);
+    stats.gpu_evictions += delta(after.gpu_evictions, before.gpu_evictions);
+    stats.memcpy_bytes += delta(after.memcpy_bytes, before.memcpy_bytes);
+    stats.memcpy_ns += delta(after.memcpy_ns, before.memcpy_ns);
+    stats.dedicated_transfer_submits += delta(
+        after.dedicated_transfer_submits,
+        before.dedicated_transfer_submits,
+    );
+    stats.dedicated_transfer_bytes += delta(
+        after.dedicated_transfer_bytes,
+        before.dedicated_transfer_bytes,
+    );
+    stats.dedicated_transfer_submit_cpu_ns += delta(
+        after.dedicated_transfer_submit_cpu_ns,
+        before.dedicated_transfer_submit_cpu_ns,
+    );
+    stats.dedicated_transfer_slot_wait_ns += delta(
+        after.dedicated_transfer_slot_wait_ns,
+        before.dedicated_transfer_slot_wait_ns,
+    );
+    stats.dedicated_transfer_timeline_wait_ns += delta(
+        after.dedicated_transfer_timeline_wait_ns,
+        before.dedicated_transfer_timeline_wait_ns,
+    );
+    stats.queue_submits += delta(after.queue_submits, before.queue_submits);
+    stats.queue_submit_ns += delta(after.queue_submit_ns, before.queue_submit_ns);
+    stats.command_record_segments += delta(
+        after.command_record_segments,
+        before.command_record_segments,
+    );
+    stats.command_record_ns += delta(after.command_record_ns, before.command_record_ns);
+    stats.command_recorder_acquire_ns += delta(
+        after.command_recorder_acquire_ns,
+        before.command_recorder_acquire_ns,
+    );
+    stats.paging_sync_waits += delta(after.paging_sync_waits, before.paging_sync_waits);
+    stats.paging_sync_wait_ns += delta(after.paging_sync_wait_ns, before.paging_sync_wait_ns);
+    stats.staging_wait_ns += delta(after.staging_wait_ns, before.staging_wait_ns);
+    stats.main_done_ns += delta(after.device_main_raw_ns, before.device_main_raw_ns);
+    stats.dma_done_ns += delta(after.device_dma_raw_ns, before.device_dma_raw_ns);
+}
+
+pub fn paged_moe_layer_snapshot() -> Vec<PagedMoeLayerStats> {
+    PAGED_MOE_LAYERS.lock().unwrap().clone()
 }
 
 pub fn snapshot() -> Snapshot {
@@ -1383,7 +1602,7 @@ pub fn print_summary_if_enabled() {
         s.dedicated_transfer_timeline_waits,
         fmt_ns(s.dedicated_transfer_timeline_wait_ns),
     );
-    let timeline = device_timeline_stats();
+    let timeline = device_timeline_snapshot();
     let _ = writeln!(
         out,
         "device queue timeline: span={} main_intervals={} main_busy={} dma_intervals={} dma_busy={} concurrent_overlap={} dma_hidden={:.1}% visible_dma_tail={} outside_timestamped_intervals={}",
@@ -1566,7 +1785,10 @@ fn bandwidth_gib_per_sec(bytes: u64, ns: u64) -> f64 {
     }
 }
 
-fn device_timeline_stats() -> DeviceTimelineStats {
+/// Fold all recorded queue intervals into cumulative busy/overlap totals. Callers may subtract two
+/// snapshots taken at idle cohort boundaries to attribute device work without resetting the
+/// process-wide profiler.
+pub fn device_timeline_snapshot() -> DeviceTimelineStats {
     let intervals = DEVICE_INTERVALS.lock().unwrap();
     if intervals.is_empty() {
         return DeviceTimelineStats::default();

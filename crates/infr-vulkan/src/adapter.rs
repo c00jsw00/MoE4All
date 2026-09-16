@@ -8562,7 +8562,10 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                 )
             });
             if paged {
-                execute_paged_moe(
+                let layer_profile_t0 = infr_core::pager_profile::start();
+                let layer_profile_before =
+                    layer_profile_t0.map(|_| infr_core::pager_profile::paged_moe_hot_snapshot());
+                let layer = execute_paged_moe(
                     be_,
                     graph,
                     op_idx,
@@ -8574,6 +8577,14 @@ fn execute_static_inner(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings)
                     &mut pstream,
                     paged_moe_shared.get(&op_idx).copied(),
                 )?;
+                if let (Some(t0), Some(before)) = (layer_profile_t0, layer_profile_before) {
+                    infr_core::pager_profile::record_paged_moe_layer(
+                        layer,
+                        t0.elapsed(),
+                        before,
+                        infr_core::pager_profile::paged_moe_hot_snapshot(),
+                    );
+                }
                 continue;
             }
         }
@@ -9591,7 +9602,7 @@ fn execute_paged_moe<'a>(
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
     shared: Option<PagedMoeShared>,
-) -> Result<()> {
+) -> Result<u32> {
     use crate::pager::buffer_identity;
     let Op::MoeFfn {
         x,
@@ -10576,7 +10587,7 @@ fn execute_paged_moe<'a>(
         if layer_stream {
             prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
         }
-        return Ok(()); // recorded inline — the ambient segment stays open
+        return Ok(current_layer); // recorded inline; the ambient segment stays open
     }
 
     // ── Small-m id-GEMV arm: the paged expert GEMVs (arena + frozen tape window, LOCAL ids)
@@ -10796,7 +10807,7 @@ fn execute_paged_moe<'a>(
     if layer_stream {
         prefetch_next_moe_layer(be_, rec, ps, gate_id)?;
     }
-    Ok(()) // recorded inline — the ambient segment stays open
+    Ok(current_layer) // recorded inline; the ambient segment stays open
 }
 
 #[cfg(test)]
