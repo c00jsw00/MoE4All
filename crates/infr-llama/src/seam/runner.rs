@@ -167,6 +167,23 @@ fn allocate_parallel_prefill_rows(available: &[usize], ubatch: usize) -> Vec<usi
     rows
 }
 
+fn parallel_prefill_progress(
+    prompt_tokens: usize,
+    cached_prompt_tokens: usize,
+    context_tokens: usize,
+    context_limit: usize,
+) -> infr_core::GenerationProgress {
+    infr_core::GenerationProgress {
+        phase: infr_core::GenerationPhase::Prefill,
+        prompt_tokens: prompt_tokens as u64,
+        cached_prompt_tokens: cached_prompt_tokens as u64,
+        prefill_tokens: context_tokens.saturating_sub(cached_prompt_tokens) as u64,
+        completion_tokens: 0,
+        context_tokens: context_tokens as u64,
+        context_limit: context_limit as u64,
+    }
+}
+
 /// Return the cached-prefix length only when a recurrent model can safely continue from its
 /// existing state. An empty token cache is deliberately NOT reusable: `SeamKv::reset()` clears
 /// the token bookkeeping but cannot synchronously clear device-side DeltaNet conv/S buffers, so
@@ -1008,6 +1025,7 @@ struct ParallelPrefillRequest<'a> {
     peers: &'a mut [SeamKv],
     prepared: &'a [PreparedParallelPrompt],
     peer_stats: &'a mut Vec<GenStats>,
+    on_progress: Option<&'a dyn Fn(usize, infr_core::GenerationProgress)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1163,6 +1181,7 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
     peers: &mut [SeamKv],
     want_ctx: usize,
     prepared: &[PreparedParallelPrompt],
+    on_progress: Option<&dyn Fn(usize, infr_core::GenerationProgress)>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<Vec<GenStats>> {
     if prompts.len() != peers.len() + 1 || prepared.len() != prompts.len() {
@@ -1179,6 +1198,7 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
         peers,
         prepared,
         peer_stats: &mut peer_stats,
+        on_progress,
     };
     let (_, primary_stats) = generate_dense_backend_inner(
         be,
@@ -7011,6 +7031,22 @@ fn generate_dense_backend_inner(
         let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
         let qsa_ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
         let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
+        for lane in 0..lanes {
+            let progress = parallel_prefill_progress(
+                parallel.prompts[lane].len(),
+                starts[lane],
+                cursors[lane],
+                max_ctx,
+            );
+            if lane == 0 {
+                if let Some(request) = req {
+                    request.report_progress(progress);
+                }
+            }
+            if let Some(on_progress) = parallel.on_progress {
+                on_progress(lane, progress);
+            }
+        }
         let t0 = std::time::Instant::now();
 
         while let Some(first_lane) = (0..lanes).find(|&lane| cursors[lane] < targets[lane]) {
@@ -7259,17 +7295,22 @@ fn generate_dense_backend_inner(
                     }
                 }
             }
-            if starts[0] < targets[0] {
-                if let Some(request) = req {
-                    request.report_progress(infr_core::GenerationProgress {
-                        phase: infr_core::GenerationPhase::Prefill,
-                        prompt_tokens: parallel.prompts[0].len() as u64,
-                        cached_prompt_tokens: starts[0] as u64,
-                        prefill_tokens: cursors[0].saturating_sub(starts[0]) as u64,
-                        completion_tokens: 0,
-                        context_tokens: cursors[0] as u64,
-                        context_limit: max_ctx as u64,
-                    });
+            for lane in 0..lanes {
+                if starts[lane] < targets[lane] {
+                    let progress = parallel_prefill_progress(
+                        parallel.prompts[lane].len(),
+                        starts[lane],
+                        cursors[lane],
+                        max_ctx,
+                    );
+                    if lane == 0 {
+                        if let Some(request) = req {
+                            request.report_progress(progress);
+                        }
+                    }
+                    if let Some(on_progress) = parallel.on_progress {
+                        on_progress(lane, progress);
+                    }
                 }
             }
         }
@@ -10047,9 +10088,20 @@ fn generate_dense_backend_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_parallel_prefill_rows, recurrent_extension_start, resident_after_gen,
-        sampling_suffix_start, validate_token_ids,
+        allocate_parallel_prefill_rows, parallel_prefill_progress, recurrent_extension_start,
+        resident_after_gen, sampling_suffix_start, validate_token_ids,
     };
+
+    #[test]
+    fn parallel_prefill_progress_reports_cached_and_evaluated_tokens() {
+        let progress = parallel_prefill_progress(4_096, 1_024, 2_560, 32_768);
+        assert_eq!(progress.phase, infr_core::GenerationPhase::Prefill);
+        assert_eq!(progress.prompt_tokens, 4_096);
+        assert_eq!(progress.cached_prompt_tokens, 1_024);
+        assert_eq!(progress.prefill_tokens, 1_536);
+        assert_eq!(progress.context_tokens, 2_560);
+        assert_eq!(progress.context_limit, 32_768);
+    }
 
     #[test]
     fn parallel_prefill_redistributes_unused_rows() {

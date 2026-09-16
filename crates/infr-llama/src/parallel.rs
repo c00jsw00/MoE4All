@@ -1617,6 +1617,19 @@ impl ParallelSeam {
                 checkpoint_boundary: work.checkpoint_boundary,
             })
             .collect::<Vec<_>>();
+        let progress_senders = long
+            .iter()
+            .map(|work| {
+                work.channels
+                    .as_ref()
+                    .map(|channels| channels.events.clone())
+            })
+            .collect::<Vec<_>>();
+        let report_progress = |lane: usize, progress: infr_core::GenerationProgress| {
+            if let Some(Some(events)) = progress_senders.get(lane) {
+                let _ = events.send(BatchEvent::Progress { progress });
+            }
+        };
         let mut primary = long[0].kv.take();
         let mut peers = long
             .iter_mut()
@@ -1640,6 +1653,7 @@ impl ParallelSeam {
                 &mut peers,
                 self.max_ctx,
                 &prepared,
+                Some(&report_progress),
                 None,
             )
         };

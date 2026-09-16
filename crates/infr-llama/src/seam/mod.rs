@@ -817,6 +817,7 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
     peers: &mut [SeamKv],
     want_ctx: usize,
     prepared: &[runner::PreparedParallelPrompt],
+    on_progress: Option<&dyn Fn(usize, infr_core::GenerationProgress)>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<Vec<GenStats>> {
     if primary.is_none() {
@@ -828,7 +829,20 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
         Err(anyhow!("warm parallel session must not re-bind {name}"))
     });
     let out = runner::generate_dense_backend_parallel_prefill(
-        vk, &*bind, g, cfg, ec, token_embd, ple, prompts, primary, peers, want_ctx, prepared, req,
+        vk,
+        &*bind,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompts,
+        primary,
+        peers,
+        want_ctx,
+        prepared,
+        on_progress,
+        req,
     );
     if out.is_err() {
         if let Some(slot) = primary.as_mut() {
