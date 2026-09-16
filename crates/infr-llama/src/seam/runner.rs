@@ -184,6 +184,19 @@ fn parallel_prefill_progress(
     }
 }
 
+fn dense_request_exceeds_capacity(
+    prompt_tokens: usize,
+    max_new_or_steps: usize,
+    context_limit: usize,
+    parallel_token_step: bool,
+) -> bool {
+    !parallel_token_step
+        && prompt_tokens
+            .saturating_add(max_new_or_steps)
+            .saturating_add(1)
+            > context_limit
+}
+
 /// Return the cached-prefix length only when a recurrent model can safely continue from its
 /// existing state. An empty token cache is deliberately NOT reusable: `SeamKv::reset()` clears
 /// the token bookkeeping but cannot synchronously clear device-side DeltaNet conv/S buffers, so
@@ -2613,7 +2626,10 @@ fn generate_dense_backend_inner(
         ple_worker,
     } = weights.as_ref();
     let max_ctx = *max_ctx;
-    if prompt.len() + max_new + 1 > max_ctx {
+    // In a parallel token call `max_new` is a step budget containing both the uncached prompt tail
+    // and decode. Adding it to the full prompt would count that tail twice. The parallel branch
+    // below validates every lane against its current cached depth instead.
+    if dense_request_exceeds_capacity(prompt.len(), max_new, max_ctx, parallel_decode.is_some()) {
         return Err(anyhow!(
             "prompt {} + gen {} exceeds the session KV capacity {max_ctx}",
             prompt.len(),
@@ -10088,9 +10104,36 @@ fn generate_dense_backend_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_parallel_prefill_rows, parallel_prefill_progress, recurrent_extension_start,
-        resident_after_gen, sampling_suffix_start, validate_token_ids,
+        allocate_parallel_prefill_rows, dense_request_exceeds_capacity, parallel_prefill_progress,
+        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
     };
+
+    #[test]
+    fn parallel_token_steps_do_not_double_count_the_uncached_prompt_tail() {
+        let prompt_tokens = 88_803usize;
+        let cached_tokens = 88_751usize;
+        let generated_tokens = 75_036usize;
+        let max_steps = prompt_tokens
+            .saturating_sub(1)
+            .saturating_sub(cached_tokens)
+            + generated_tokens;
+        let context_limit = 163_840;
+
+        assert_eq!(max_steps, 75_087);
+        assert!(dense_request_exceeds_capacity(
+            prompt_tokens,
+            max_steps,
+            context_limit,
+            false
+        ));
+        assert!(!dense_request_exceeds_capacity(
+            prompt_tokens,
+            max_steps,
+            context_limit,
+            true
+        ));
+        assert!(cached_tokens + max_steps <= context_limit);
+    }
 
     #[test]
     fn parallel_prefill_progress_reports_cached_and_evaluated_tokens() {
