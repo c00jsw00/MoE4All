@@ -139,6 +139,62 @@ fn sampling_suffix_start(positions: &[usize], prompt_ends: &[usize]) -> AResult<
     Ok(start)
 }
 
+/// Whether a contiguous slice of Qwen IMROPE rows is exactly representable by ordinary 1D RoPE.
+/// The Vulkan 1D kernel receives the first position and advances it once per row, so both the
+/// selected IMROPE plane and the row-to-row position sequence must agree with that layout.
+fn mrope_rows_are_plain_rope(
+    positions4: &[i32],
+    start: usize,
+    rows: usize,
+    sections: [u32; 4],
+    rope_pairs: usize,
+) -> bool {
+    let Some(end) = start.checked_add(rows) else {
+        return false;
+    };
+    let Some(values_end) = end.checked_mul(4) else {
+        return false;
+    };
+    if rows == 0 || rope_pairs == 0 || values_end > positions4.len() {
+        return false;
+    }
+    let widths = sections.map(|value| value as usize);
+    let section_total = widths.iter().sum::<usize>();
+    if section_total == 0 {
+        return false;
+    }
+    let first_t = positions4[start * 4];
+    if first_t < 0 {
+        return false;
+    }
+    for row_index in 0..rows {
+        let base = (start + row_index) * 4;
+        let row = &positions4[base..base + 4];
+        let Ok(delta) = i32::try_from(row_index) else {
+            return false;
+        };
+        if first_t.checked_add(delta) != Some(row[0]) {
+            return false;
+        }
+        for pair in 0..rope_pairs {
+            let sector = pair % section_total;
+            let plane = if sector % 3 == 1 && sector < 3 * widths[1] {
+                1
+            } else if sector % 3 == 2 && sector < 3 * widths[2] {
+                2
+            } else if sector % 3 == 0 && sector < 3 * widths[0] {
+                0
+            } else {
+                3
+            };
+            if row[plane] != row[0] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn allocate_parallel_prefill_rows(available: &[usize], ubatch: usize) -> Vec<usize> {
     let mut rows = vec![0; available.len()];
     let mut budget = ubatch.min(available.iter().sum());
@@ -2668,7 +2724,7 @@ fn generate_dense_backend_inner(
     // that compresses blocks from earlier prefill chunks. Future generated rows are deterministic
     // linear text positions, so fill them once now instead of mutating another persistent cache on
     // every decode step. Text-only calls allocate nothing.
-    let mrope_history_buf = if let Some(plan) = mm {
+    let (mrope_history_buf, mrope_positions) = if let Some(plan) = mm {
         if !c.qwen4exp {
             return Err(anyhow!(
                 "multimodal RoPE is currently supported only by qwen4exp"
@@ -2731,9 +2787,9 @@ fn generate_dense_backend_inner(
             .map_err(|e| anyhow!("allocate multimodal QSA position table: {e}"))?;
         be.upload(buffer.as_ref(), bytemuck::cast_slice(&all_positions))
             .map_err(|e| anyhow!("upload multimodal QSA position table: {e}"))?;
-        Some(buffer)
+        (Some(buffer), Some(all_positions))
     } else {
-        None
+        (None, None)
     };
     // Phase-2 DiffusionGemma denoise: capture the prompt length BEFORE the ordinary prefix-diff
     // logic below runs (a denoise call's `prompt`/`max_new` are empty/0 — see `DenoiseReq`'s
@@ -3189,8 +3245,23 @@ fn generate_dense_backend_inner(
             g.input(f32d(batch * ne))
         };
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
-        let positions4 = mm.map(|_| g.input(TensorDesc::new(vec![batch, 4], DType::I32)));
-        let mrope_history = mm.map(|_| g.input(TensorDesc::new(vec![max_ctx, 4], DType::I32)));
+        // Generated/text-only IMROPE rows select the same logical T position in every active
+        // frequency pair. Emit the ordinary RoPE op for those batches; image rows retain the 4D
+        // op. QSA history remains 4D independently because old image blocks still need H/W.
+        let max_rope_pairs = (l_first..l_end)
+            .map(|layer| c.layer_rope_dim(layer) / 2)
+            .max()
+            .unwrap_or(c.rope_dim / 2)
+            .max(c.rope_dim / 2);
+        let positions4 = mrope_positions
+            .as_deref()
+            .is_some_and(|table| {
+                !mrope_rows_are_plain_rope(table, start_pos, batch, c.rope_sections, max_rope_pairs)
+            })
+            .then(|| g.input(TensorDesc::new(vec![batch, 4], DType::I32)));
+        let mrope_history = mrope_positions
+            .as_ref()
+            .map(|_| g.input(TensorDesc::new(vec![max_ctx, 4], DType::I32)));
         let qwen_wide = c.qwen4exp.then(|| g.input(f32d(batch * c.hc_mult * ne)));
         let span_has_ple = c.qwen4exp && (l_first..l_end).any(|l| c.is_ple_layer(l));
         let ple_embd = span_has_ple.then(|| {
@@ -9094,8 +9165,14 @@ fn generate_dense_backend_inner(
                             } else {
                                 None
                             };
-                            // Absolute positions [cstart, ..., cend-1].
-                            let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
+                            // Ordinary RoPE consumes logical T positions. After an image span these
+                            // differ from physical KV rows even though text rows collapse from 4D.
+                            let pf_positions: Vec<i32> = match mrope_positions.as_deref() {
+                                Some(table) => {
+                                    (cstart..cend).map(|token| table[token * 4]).collect()
+                                }
+                                None => (cstart as i32..cend as i32).collect(),
+                            };
                             let pos = be
                                 .alloc(pf_m * 4, BufferUsage::Staging)
                                 .map_err(|e| anyhow!("{e}"))?;
@@ -9631,7 +9708,10 @@ fn generate_dense_backend_inner(
                     .map_err(|e| anyhow!("{e}"))?;
             }
         }
-        be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
+        let rope_pos = mrope_positions
+            .as_deref()
+            .map_or(pos as i32, |table| table[pos * 4]);
+        be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[rope_pos]))
             .map_err(|e| anyhow!("{e}"))?;
         if let (Some(plan), Some(buffer)) = (mm, &pos4_buf) {
             let row: [i32; 4] = if pos < prompt.len() {
@@ -10104,9 +10184,46 @@ fn generate_dense_backend_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_parallel_prefill_rows, dense_request_exceeds_capacity, parallel_prefill_progress,
-        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
+        allocate_parallel_prefill_rows, dense_request_exceeds_capacity, mrope_rows_are_plain_rope,
+        parallel_prefill_progress, recurrent_extension_start, resident_after_gen,
+        sampling_suffix_start, validate_token_ids,
     };
+
+    #[test]
+    fn generated_mrope_rows_collapse_to_plain_rope() {
+        let positions = [3, 4, 5, 0, 100, 100, 100, 0, 101, 101, 101, 0];
+        assert!(mrope_rows_are_plain_rope(
+            &positions,
+            1,
+            2,
+            [11, 11, 10, 0],
+            32
+        ));
+    }
+
+    #[test]
+    fn image_mrope_rows_keep_four_dimensional_rope() {
+        let positions = [100, 4, 7, 0];
+        assert!(!mrope_rows_are_plain_rope(
+            &positions,
+            0,
+            1,
+            [11, 11, 10, 0],
+            32
+        ));
+    }
+
+    #[test]
+    fn plain_rope_requires_consecutive_logical_positions() {
+        let positions = [100, 100, 100, 0, 102, 102, 102, 0];
+        assert!(!mrope_rows_are_plain_rope(
+            &positions,
+            0,
+            2,
+            [11, 11, 10, 0],
+            32
+        ));
+    }
 
     #[test]
     fn parallel_token_steps_do_not_double_count_the_uncached_prompt_tail() {
