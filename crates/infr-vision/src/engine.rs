@@ -11,13 +11,16 @@ use infr_core::{
 };
 use infr_gguf::Gguf;
 use infr_vulkan::VulkanBackend;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 const VIT_THETA: f32 = 10_000.0;
+const EMBEDDING_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const EMBEDDING_CACHE_MAX_IMAGES: usize = 16;
 
 #[derive(Clone)]
 enum WeightPayload {
@@ -95,16 +98,75 @@ struct VitPlan {
 }
 
 /// One image's merged visual tokens, in row-major `[tokens, projection_dim]` order.
+#[derive(Clone)]
 pub struct VisionEmbedding {
-    pub values: Vec<f32>,
+    pub values: Arc<Vec<f32>>,
     pub grid_nx: usize,
     pub grid_ny: usize,
+    pub fingerprint: [u8; 32],
 }
 
 impl VisionEmbedding {
     pub fn n_tokens(&self) -> usize {
         self.grid_nx * self.grid_ny
     }
+}
+
+#[derive(Default)]
+struct VisionEmbeddingCache {
+    entries: VecDeque<([u8; 32], VisionEmbedding)>,
+    bytes: usize,
+}
+
+impl VisionEmbeddingCache {
+    fn get(&mut self, key: &[u8; 32]) -> Option<VisionEmbedding> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| candidate == key)?;
+        let entry = self
+            .entries
+            .remove(index)
+            .expect("cache index came from entries");
+        let value = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: [u8; 32], value: VisionEmbedding) {
+        let bytes = value.values.len().saturating_mul(size_of::<f32>());
+        if bytes > EMBEDDING_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| candidate == &key)
+        {
+            let (_, old) = self
+                .entries
+                .remove(index)
+                .expect("cache index came from entries");
+            self.bytes = self
+                .bytes
+                .saturating_sub(old.values.len().saturating_mul(size_of::<f32>()));
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= EMBEDDING_CACHE_MAX_IMAGES
+                || self.bytes.saturating_add(bytes) > EMBEDDING_CACHE_MAX_BYTES)
+        {
+            let (_, old) = self.entries.pop_front().expect("cache is not empty");
+            self.bytes = self
+                .bytes
+                .saturating_sub(old.values.len().saturating_mul(size_of::<f32>()));
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.push_back((key, value));
+    }
+}
+
+fn image_fingerprint(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
 /// A vision tower attached to the LLM's existing Vulkan device and unified VRAM arena.
@@ -121,6 +183,7 @@ pub struct NativeVisionEngine {
     layout: SpecLayout,
     weight_bytes: u64,
     execution: Mutex<()>,
+    embedding_cache: Mutex<VisionEmbeddingCache>,
     resource: Arc<ResourceTracker>,
 }
 
@@ -501,6 +564,7 @@ impl NativeVisionEngine {
             layout,
             weight_bytes,
             execution: Mutex::new(()),
+            embedding_cache: Mutex::new(VisionEmbeddingCache::default()),
             resource: Arc::new(ResourceTracker::new(
                 format!("vision:{model_id}"),
                 ResourceKind::VisionWeights,
@@ -525,14 +589,40 @@ impl NativeVisionEngine {
         if images.is_empty() {
             return Ok(Vec::new());
         }
-        let prepared = images
-            .iter()
-            .map(|image| prepare_image_bytes(image, &self.cfg, &self.pos_table))
-            .collect::<Result<Vec<_>>>()?;
         let _serial = self
             .execution
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let fingerprints = images
+            .iter()
+            .map(|image| image_fingerprint(image))
+            .collect::<Vec<_>>();
+        let mut output = {
+            let mut cache = self
+                .embedding_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            fingerprints
+                .iter()
+                .map(|fingerprint| cache.get(fingerprint))
+                .collect::<Vec<_>>()
+        };
+        let misses = output
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.is_none().then_some(index))
+            .collect::<Vec<_>>();
+        if misses.is_empty() {
+            tracing::info!(images = images.len(), "vision embedding cache hit");
+            return Ok(output
+                .into_iter()
+                .map(|value| value.expect("all image embeddings were cached"))
+                .collect());
+        }
+        let prepared = misses
+            .iter()
+            .map(|&index| prepare_image_bytes(&images[index], &self.cfg, &self.pos_table))
+            .collect::<Result<Vec<_>>>()?;
         let _lease = self.resource.acquire();
         let gguf = Gguf::open(&self.model_path).map_err(|error| anyhow!(error.to_string()))?;
         let mut resident = Some(load_weight_buffers(&gguf, &self.specs, &self.backend)?);
@@ -540,15 +630,16 @@ impl NativeVisionEngine {
             .set_residency(MemoryTier::Vram, self.weight_bytes);
         tracing::info!(
             weights_mib = self.weight_bytes as f64 / (1u64 << 20) as f64,
-            images = images.len(),
+            images = misses.len(),
+            cached_images = images.len() - misses.len(),
             "vision weights admitted to unified VRAM"
         );
 
         let mut plans = HashMap::new();
         let result = (|| {
             let weights = resident.as_ref().expect("vision weights loaded above");
-            let mut output = Vec::with_capacity(prepared.len());
-            for image in &prepared {
+            let mut encoded = Vec::with_capacity(prepared.len());
+            for (&request_index, image) in misses.iter().zip(&prepared) {
                 let key = (image.n_patches(), image.grid_nx * image.grid_ny);
                 let plan = match plans.entry(key) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -556,13 +647,17 @@ impl NativeVisionEngine {
                         entry.insert(self.build_plan(key.0, key.1)?)
                     }
                 };
-                output.push(VisionEmbedding {
-                    values: self.execute_plan(plan, image, weights)?,
-                    grid_nx: image.grid_nx,
-                    grid_ny: image.grid_ny,
-                });
+                encoded.push((
+                    request_index,
+                    VisionEmbedding {
+                        values: Arc::new(self.execute_plan(plan, image, weights)?),
+                        grid_nx: image.grid_nx,
+                        grid_ny: image.grid_ny,
+                        fingerprint: fingerprints[request_index],
+                    },
+                ));
             }
-            Ok(output)
+            Ok(encoded)
         })();
 
         let sync_result = self
@@ -588,10 +683,21 @@ impl NativeVisionEngine {
                 }
                 Err(error)
             }
-            Ok(output) => {
+            Ok(encoded) => {
                 sync_result.context("synchronize vision execution before releasing residency")?;
                 release_result.context("release vision runtime from unified VRAM")?;
-                Ok(output)
+                let mut cache = self
+                    .embedding_cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                for (index, value) in encoded {
+                    cache.insert(value.fingerprint, value.clone());
+                    output[index] = Some(value);
+                }
+                Ok(output
+                    .into_iter()
+                    .map(|value| value.expect("every requested image has an embedding"))
+                    .collect())
             }
         }
     }

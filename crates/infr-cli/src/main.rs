@@ -2188,6 +2188,7 @@ trait GenBackend: Send + Sync {
     fn generate_multimodal(
         &self,
         _prompt: &str,
+        _stable_prefix: Option<&str>,
         _images: &[String],
         _max_new: usize,
         _req: &infr_llama::sampling::RequestCtx,
@@ -2293,6 +2294,7 @@ impl GenBackend for ParallelGenerator {
     fn generate_multimodal(
         &self,
         prompt: &str,
+        stable_prefix: Option<&str>,
         images: &[String],
         max_new: usize,
         req: &infr_llama::sampling::RequestCtx,
@@ -2313,10 +2315,17 @@ impl GenBackend for ParallelGenerator {
                 values: image.values,
                 grid_nx: image.grid_nx,
                 grid_ny: image.grid_ny,
+                fingerprint: image.fingerprint,
             })
             .collect();
-        self.engine
-            .generate_multimodal_turn(prompt, embeddings, max_new, req, |piece| on_piece(piece))
+        self.engine.generate_multimodal_turn(
+            prompt,
+            stable_prefix,
+            embeddings,
+            max_new,
+            req,
+            |piece| on_piece(piece),
+        )
     }
 }
 
@@ -2551,7 +2560,14 @@ fn run_chat(
                     &mut on_piece,
                 )?
             } else {
-                be.generate_multimodal(&prompt, &images, max_new, &req, &mut on_piece)?
+                be.generate_multimodal(
+                    &prompt,
+                    Some(&stable_prefix),
+                    &images,
+                    max_new,
+                    &req,
+                    &mut on_piece,
+                )?
             };
             // No stop fired: whatever the matcher was holding back was never a stop prefix.
             let tail = stops.flush();

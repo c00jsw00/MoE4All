@@ -1445,6 +1445,7 @@ dependencies = [
  "infr-gguf",
  "infr-vulkan",
  "rayon",
+ "sha2",
  "tracing",
 ]
 

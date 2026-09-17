@@ -37,6 +37,7 @@ use crate::seam::SeamKv;
 use crate::session_cache::SessionCache;
 use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -51,10 +52,25 @@ const SHORT_PREFILL_TOKENS: usize = 96;
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
+#[derive(Clone)]
 pub struct MultimodalEmbedding {
-    pub values: Vec<f32>,
+    pub values: Arc<Vec<f32>>,
     pub grid_nx: usize,
     pub grid_ny: usize,
+    pub fingerprint: [u8; 32],
+}
+
+type MultimodalKey = [u8; 32];
+
+fn multimodal_key(images: &[MultimodalEmbedding]) -> MultimodalKey {
+    let mut hash = Sha256::new();
+    hash.update((images.len() as u64).to_le_bytes());
+    for image in images {
+        hash.update(image.fingerprint);
+        hash.update((image.grid_nx as u64).to_le_bytes());
+        hash.update((image.grid_ny as u64).to_le_bytes());
+    }
+    hash.finalize().into()
 }
 
 fn expand_multimodal_prompt(
@@ -126,7 +142,7 @@ fn expand_multimodal_prompt(
         spans.push(crate::seam::ImageSpanEmbeds {
             start,
             n_tokens,
-            embeds: Arc::new(image.values),
+            embeds: image.values,
         });
     }
     if images.next().is_some() {
@@ -176,6 +192,8 @@ struct Slot {
     /// Set only when the opt-in cold session cache is active. Ordinary serving does not read the
     /// wall clock during slot selection or return.
     idle_since: Option<Instant>,
+    /// Image identity for multimodal KV. `None` marks ordinary token-only state.
+    multimodal_key: Option<MultimodalKey>,
 }
 
 /// The N-slot pool. Deliberately a plain `Mutex` + `Condvar` rather than the sequential
@@ -355,6 +373,7 @@ struct SlotGuard<'a> {
     idx: usize,
     kv: Option<SeamKv>,
     detached: bool,
+    multimodal_key: Option<MultimodalKey>,
 }
 
 impl SlotGuard<'_> {
@@ -389,6 +408,7 @@ impl Drop for SlotGuard<'_> {
         s.kv = self.kv.take();
         s.busy = false;
         s.tick = tick;
+        s.multimodal_key = self.multimodal_key;
         if self.engine.session_cache.is_some() {
             s.idle_since = Some(Instant::now());
         }
@@ -467,7 +487,10 @@ fn cold_session_worker(
                     let Some(idle_since) = slot.idle_since else {
                         continue;
                     };
-                    if slot.busy || slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0) {
+                    if slot.busy
+                        || slot.multimodal_key.is_some()
+                        || slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0)
+                    {
                         continue;
                     }
                     let elapsed = now.saturating_duration_since(idle_since);
@@ -900,6 +923,7 @@ impl ParallelSeam {
                 busy: false,
                 tick: 0,
                 idle_since: None,
+                multimodal_key: None,
             });
         }
         slots.insert(
@@ -909,6 +933,7 @@ impl ParallelSeam {
                 busy: false,
                 tick: 0,
                 idle_since: None,
+                multimodal_key: None,
             },
         );
         self.pool.lock().expect("fresh pool").slots = slots;
@@ -983,16 +1008,25 @@ impl ParallelSeam {
                 p = self.freed.wait(p).expect("pool poisoned");
                 continue;
             }
-            let score = |s: &Slot| s.kv.as_ref().map_or(0, |k| k.prefix_score(prompt));
+            let score = |s: &Slot| {
+                if s.multimodal_key.is_some() {
+                    0
+                } else {
+                    s.kv.as_ref().map_or(0, |k| k.prefix_score(prompt))
+                }
+            };
             // 1. This conversation continuing: the free slot with the LONGEST reusable prefix among
             //    those the prompt extends (or equals) — not merely the first such slot (which would
             //    re-prefill more suffix). Pure decision, unit-tested via `pick_continuation`.
             let cont = pick_continuation(
                 free.iter().filter_map(|&i| {
-                    p.slots[i].kv.as_ref().and_then(|k| {
-                        k.continuation_prefix_len(prompt)
-                            .map(|prefix| (i, prefix, prefix))
-                    })
+                    (p.slots[i].multimodal_key.is_none())
+                        .then_some(p.slots[i].kv.as_ref())
+                        .flatten()
+                        .and_then(|k| {
+                            k.continuation_prefix_len(prompt)
+                                .map(|prefix| (i, prefix, prefix))
+                        })
                 }),
                 prompt.len(),
             );
@@ -1009,7 +1043,7 @@ impl ParallelSeam {
             };
             // Seed the target with the best shared prefix among the other FREE slots (a common
             // system prompt), via a device-side KV copy instead of re-prefilling it.
-            if cont.is_none() {
+            if cont.is_none() && p.slots[target].multimodal_key.is_none() {
                 let best = free
                     .iter()
                     .copied()
@@ -1058,12 +1092,19 @@ impl ParallelSeam {
             let tick = p.tick;
             p.slots[target].busy = true;
             p.slots[target].tick = tick;
-            let kv = p.slots[target].kv.take();
+            let incompatible = p.slots[target].multimodal_key.take().is_some();
+            let mut kv = p.slots[target].kv.take();
+            if incompatible {
+                if let Some(kv) = kv.as_mut() {
+                    kv.reset();
+                }
+            }
             return Ok(SlotGuard {
                 engine: self,
                 idx: target,
                 kv,
                 detached: false,
+                multimodal_key: None,
             });
         }
     }
@@ -1088,10 +1129,13 @@ impl ParallelSeam {
             }
             let continuation = pick_continuation(
                 free.iter().filter_map(|&index| {
-                    pool.slots[index].kv.as_ref().and_then(|kv| {
-                        kv.continuation_prefix_len(prompt)
-                            .map(|prefix| (index, prefix, prefix))
-                    })
+                    (pool.slots[index].multimodal_key.is_none())
+                        .then_some(pool.slots[index].kv.as_ref())
+                        .flatten()
+                        .and_then(|kv| {
+                            kv.continuation_prefix_len(prompt)
+                                .map(|prefix| (index, prefix, prefix))
+                        })
                 }),
                 prompt.len(),
             );
@@ -1119,6 +1163,7 @@ impl ParallelSeam {
             pool.slots[target].busy = true;
             pool.slots[target].tick = tick;
             pool.slots[target].idle_since = None;
+            let incompatible = pool.slots[target].multimodal_key.take().is_some();
             let mut target_kv = pool.slots[target].kv.take();
             drop(pool);
 
@@ -1130,6 +1175,11 @@ impl ParallelSeam {
                     Ok(cache) => cache,
                     Err(poisoned) => poisoned.into_inner(),
                 };
+                if incompatible {
+                    if let Some(kv) = target_kv.as_mut() {
+                        kv.reset();
+                    }
+                }
 
                 let cold_prefix = cache.best_continuation_len(prompt);
                 let cold = (cold_prefix > resident_prefix && target_kv.is_some())
@@ -1191,77 +1241,64 @@ impl ParallelSeam {
                 idx: target,
                 kv: target_kv,
                 detached: false,
+                multimodal_key: None,
             });
         }
     }
 
-    /// Take an LRU free slot without prefix seeding. Image payload identity is not represented by
-    /// the repeated image-pad token ids, so token-prefix reuse would be unsound until slots carry
-    /// an image fingerprint.
-    fn checkout_fresh(&self, req: &RequestCtx) -> SlotGuard<'_> {
+    /// Take a slot whose expanded token prefix and image identity can both be continued.
+    fn checkout_multimodal(
+        &self,
+        prompt: &[u32],
+        key: MultimodalKey,
+        req: &RequestCtx,
+    ) -> SlotGuard<'_> {
         if self.session_cache.is_some() {
-            self.checkout_fresh_with_cold_cache(req)
+            self.checkout_multimodal_with_cold_cache(prompt, key, req)
         } else {
-            self.checkout_fresh_resident()
+            self.checkout_multimodal_resident(prompt, key)
         }
     }
 
-    fn checkout_fresh_resident(&self) -> SlotGuard<'_> {
+    fn checkout_multimodal_resident(&self, prompt: &[u32], key: MultimodalKey) -> SlotGuard<'_> {
         let mut pool = self.pool.lock().expect("pool poisoned");
         loop {
-            if let Some(target) = (0..pool.slots.len())
+            let free = (0..pool.slots.len())
                 .filter(|&index| !pool.slots[index].busy)
-                .min_by_key(|&index| pool.slots[index].tick)
-            {
-                pool.tick += 1;
-                let tick = pool.tick;
-                pool.slots[target].busy = true;
-                pool.slots[target].tick = tick;
-                let kv = pool.slots[target].kv.take();
-                return SlotGuard {
-                    engine: self,
-                    idx: target,
-                    kv,
-                    detached: false,
-                };
-            }
-            pool = self.freed.wait(pool).expect("pool poisoned");
-        }
-    }
-
-    fn checkout_fresh_with_cold_cache(&self, req: &RequestCtx) -> SlotGuard<'_> {
-        let cache_mutex = self
-            .session_cache
-            .as_ref()
-            .expect("cold checkout requires a session cache");
-        let mut pool = self.pool.lock().expect("pool poisoned");
-        loop {
-            if let Some(target) = (0..pool.slots.len())
-                .filter(|&index| !pool.slots[index].busy)
-                .min_by_key(|&index| pool.slots[index].tick)
-            {
+                .collect::<Vec<_>>();
+            if !free.is_empty() {
+                let continuation = pick_continuation(
+                    free.iter().filter_map(|&index| {
+                        (pool.slots[index].multimodal_key == Some(key))
+                            .then_some(pool.slots[index].kv.as_ref())
+                            .flatten()
+                            .and_then(|kv| {
+                                kv.continuation_prefix_len(prompt)
+                                    .map(|prefix| (index, prefix, prefix))
+                            })
+                    }),
+                    prompt.len(),
+                );
+                let target = continuation.unwrap_or_else(|| {
+                    *free
+                        .iter()
+                        .min_by_key(|&&index| {
+                            let slot = &pool.slots[index];
+                            let empty = slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0);
+                            (!empty, slot.tick)
+                        })
+                        .expect("free is not empty")
+                });
                 pool.tick += 1;
                 let tick = pool.tick;
                 pool.slots[target].busy = true;
                 pool.slots[target].tick = tick;
                 pool.slots[target].idle_since = None;
+                let old_key = pool.slots[target].multimodal_key.take();
                 let mut kv = pool.slots[target].kv.take();
-                drop(pool);
-                if let Some(kv) = kv.as_mut().filter(|kv| kv.cached_len() != 0) {
-                    let _gate = req.gate_pass();
-                    let mut cache = match cache_mutex.lock() {
-                        Ok(cache) => cache,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    if let Err(error) = cache.spill(kv, self.vk.as_ref(), self.model.config()) {
-                        tracing::warn!(
-                            slot = target,
-                            "cold KV spill before multimodal reuse failed; forgetting the old conversation: {error}"
-                        );
+                if continuation != Some(target) || old_key != Some(key) {
+                    if let Some(kv) = kv.as_mut() {
                         kv.reset();
-                    }
-                    if let Err(error) = cache.gc() {
-                        tracing::warn!("cold KV cache maintenance failed: {error}");
                     }
                 }
                 return SlotGuard {
@@ -1269,6 +1306,92 @@ impl ParallelSeam {
                     idx: target,
                     kv,
                     detached: false,
+                    multimodal_key: Some(key),
+                };
+            }
+            pool = self.freed.wait(pool).expect("pool poisoned");
+        }
+    }
+
+    fn checkout_multimodal_with_cold_cache(
+        &self,
+        prompt: &[u32],
+        key: MultimodalKey,
+        req: &RequestCtx,
+    ) -> SlotGuard<'_> {
+        let cache_mutex = self
+            .session_cache
+            .as_ref()
+            .expect("multimodal cold checkout requires a session cache");
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            let free = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .collect::<Vec<_>>();
+            if !free.is_empty() {
+                let continuation = pick_continuation(
+                    free.iter().filter_map(|&index| {
+                        (pool.slots[index].multimodal_key == Some(key))
+                            .then_some(pool.slots[index].kv.as_ref())
+                            .flatten()
+                            .and_then(|kv| {
+                                kv.continuation_prefix_len(prompt)
+                                    .map(|prefix| (index, prefix, prefix))
+                            })
+                    }),
+                    prompt.len(),
+                );
+                let target = continuation.unwrap_or_else(|| {
+                    *free
+                        .iter()
+                        .min_by_key(|&&index| {
+                            let slot = &pool.slots[index];
+                            let empty = slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0);
+                            (!empty, slot.tick)
+                        })
+                        .expect("free is not empty")
+                });
+                pool.tick += 1;
+                let tick = pool.tick;
+                pool.slots[target].busy = true;
+                pool.slots[target].tick = tick;
+                pool.slots[target].idle_since = None;
+                let old_key = pool.slots[target].multimodal_key.take();
+                let mut kv = pool.slots[target].kv.take();
+                drop(pool);
+                if continuation != Some(target) || old_key != Some(key) {
+                    if let Some(kv) = kv.as_mut().filter(|kv| kv.cached_len() != 0) {
+                        if old_key.is_some() {
+                            kv.reset();
+                        } else {
+                            let _gate = req.gate_pass();
+                            let mut cache = match cache_mutex.lock() {
+                                Ok(cache) => cache,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            if let Err(error) =
+                                cache.spill(kv, self.vk.as_ref(), self.model.config())
+                            {
+                                tracing::warn!(
+                                    slot = target,
+                                    "cold KV spill before multimodal reuse failed; forgetting the old conversation: {error}"
+                                );
+                                kv.reset();
+                            }
+                            if let Err(error) = cache.gc() {
+                                tracing::warn!("cold KV cache maintenance failed: {error}");
+                            }
+                        }
+                    } else if let Some(kv) = kv.as_mut() {
+                        kv.reset();
+                    }
+                }
+                return SlotGuard {
+                    engine: self,
+                    idx: target,
+                    kv,
+                    detached: false,
+                    multimodal_key: Some(key),
                 };
             }
             pool = self.freed.wait(pool).expect("pool poisoned");
@@ -1300,6 +1423,7 @@ impl ParallelSeam {
         slot.kv = Some(kv);
         slot.busy = false;
         slot.tick = tick;
+        slot.multimodal_key = None;
         if self.session_cache.is_some() {
             slot.idle_since = Some(Instant::now());
         }
@@ -2129,6 +2253,7 @@ impl ParallelSeam {
     pub fn generate_multimodal_turn(
         &self,
         prompt: &str,
+        stable_prefix: Option<&str>,
         images: Vec<MultimodalEmbedding>,
         max_new: usize,
         req: &RequestCtx,
@@ -2140,7 +2265,7 @@ impl ParallelSeam {
             ));
         }
         if images.is_empty() {
-            return self.generate_turn(prompt, None, max_new, None, req, on_piece);
+            return self.generate_turn(prompt, stable_prefix, max_new, None, req, on_piece);
         }
         let image_pad_id = self
             .model
@@ -2149,6 +2274,8 @@ impl ParallelSeam {
             .ok_or_else(|| anyhow!("model tokenizer has no <|image_pad|> token"))?;
         let base_tokens = self.model.encode(prompt)?;
         let image_count = images.len();
+        let key = multimodal_key(&images);
+        let checkpoint_images = stable_prefix.map(|_| images.clone());
         let (prompt_tokens, plan) = expand_multimodal_prompt(
             &base_tokens,
             image_pad_id,
@@ -2162,10 +2289,35 @@ impl ParallelSeam {
                 self.max_ctx
             ));
         }
-        let mut guard = self.checkout_fresh(req);
-        if let Some(kv) = guard.kv.as_mut() {
-            kv.reset();
-        }
+        let turn_checkpoint = stable_prefix.map(|stable| {
+            let boundary = self
+                .model
+                .encode(stable)
+                .ok()
+                .and_then(|tokens| {
+                    expand_multimodal_prompt(
+                        &tokens,
+                        image_pad_id,
+                        checkpoint_images
+                            .clone()
+                            .expect("stable prefix retained checkpoint images"),
+                        self.model.config().n_embd,
+                    )
+                    .ok()
+                    .map(|(tokens, _)| tokens)
+                })
+                .filter(|tokens| {
+                    !tokens.is_empty()
+                        && tokens.len() < prompt_tokens.len()
+                        && prompt_tokens.starts_with(tokens)
+                })
+                .map(|tokens| tokens.len());
+            boundary.map_or(
+                crate::seam::TurnCheckpoint::Enable,
+                crate::seam::TurnCheckpoint::Boundary,
+            )
+        });
+        let mut guard = self.checkout_multimodal(&prompt_tokens, key, req);
         let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
         let mut acc = Vec::new();
         let mut printed = 0usize;
@@ -2197,15 +2349,15 @@ impl ParallelSeam {
             },
             &mut guard.kv,
             self.max_ctx,
-            None,
+            turn_checkpoint,
             None,
             Some(req),
             Some(&plan),
         );
-        // Do not expose image-backed KV to ordinary token-only prefix matching. A later revision
-        // can retain it once slot keys include deterministic image fingerprints.
-        if let Some(kv) = guard.kv.as_mut() {
-            kv.reset();
+        if result.is_err() {
+            if let Some(kv) = guard.kv.as_mut() {
+                kv.reset();
+            }
         }
         let (_, stats) = result?;
         Ok(stats)
@@ -2215,9 +2367,10 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_multimodal_prompt, phase_for_remaining_prefill, pick_continuation, scheduler_mode,
-        BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        expand_multimodal_prompt, multimodal_key, phase_for_remaining_prefill, pick_continuation,
+        scheduler_mode, BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
     };
+    use std::sync::Arc;
 
     #[test]
     fn short_prefill_boundary_is_inclusive_at_96_tokens() {
@@ -2286,14 +2439,16 @@ mod tests {
     fn multimodal_expansion_preserves_order_and_grid_positions() {
         let images = vec![
             MultimodalEmbedding {
-                values: vec![1.0; 2 * 2 * 3],
+                values: Arc::new(vec![1.0; 2 * 2 * 3]),
                 grid_nx: 2,
                 grid_ny: 2,
+                fingerprint: [1; 32],
             },
             MultimodalEmbedding {
-                values: vec![2.0; 3 * 3],
+                values: Arc::new(vec![2.0; 3 * 3]),
                 grid_nx: 3,
                 grid_ny: 1,
+                fingerprint: [2; 32],
             },
         ];
         let (tokens, plan) = expand_multimodal_prompt(&[10, 99, 11, 99, 12], 99, images, 3)
@@ -2313,10 +2468,35 @@ mod tests {
     #[test]
     fn multimodal_expansion_rejects_marker_count_mismatch() {
         let image = MultimodalEmbedding {
-            values: vec![0.0; 4],
+            values: Arc::new(vec![0.0; 4]),
             grid_nx: 1,
             grid_ny: 1,
+            fingerprint: [0; 32],
         };
         assert!(expand_multimodal_prompt(&[1, 2], 99, vec![image], 4).is_err());
+    }
+
+    #[test]
+    fn multimodal_key_covers_image_identity_order_and_grid() {
+        let image = |fingerprint, grid_nx, grid_ny| MultimodalEmbedding {
+            values: Arc::new(Vec::new()),
+            grid_nx,
+            grid_ny,
+            fingerprint,
+        };
+        let a = image([1; 32], 2, 3);
+        let b = image([2; 32], 4, 5);
+        assert_eq!(
+            multimodal_key(&[a.clone(), b.clone()]),
+            multimodal_key(&[a.clone(), b.clone()])
+        );
+        assert_ne!(
+            multimodal_key(&[a.clone(), b.clone()]),
+            multimodal_key(&[b, a.clone()])
+        );
+        assert_ne!(
+            multimodal_key(&[a.clone()]),
+            multimodal_key(&[image([1; 32], 3, 2)])
+        );
     }
 }
