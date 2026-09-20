@@ -45,6 +45,9 @@ at that index. It holds:
 
 ## Backends
 
+- [unified-memory-architecture.md](unified-memory-architecture.md) - 分层统一内存与专家缓存的
+  目标架构：专家簇、尺寸类 LRU、VRAM/RAM/SSD tier、owner 生命周期与物理传输后端；
+  [Mermaid 图](unified-memory-architecture.mmd)单独保存，便于后续实现同步更新。
 - [metal.md](metal.md) — Apple GPU backend (`infr-metal`) architecture: the
   `DEC16` decode kernels, decode-parity campaign, multi-slot serve, native-read
   KV, MTP, and the replay-tape correctness fix.

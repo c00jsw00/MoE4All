@@ -88,7 +88,7 @@ impl CompletionShell {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Backend {
     /// A Vulkan GPU. `Some("Vulkan1")` pins a device (carried as `device.dev`); `None` =
-    /// the default "first discrete GPU, else device 0".
+    /// the default "largest discrete GPU by device-local memory, else device 0".
     Vulkan(Option<String>),
     /// The Apple GPU (`device.dev = "metal"` / `INFR_DEV=metal`).
     Metal,
@@ -141,8 +141,8 @@ fn parse_dev_spec(d: &str) -> anyhow::Result<Backend> {
 /// The SINGLE backend decision, shared by `--dev` resolution and the per-command readers.
 ///
 /// Precedence (mirrors how `--ctx`/`-u`/`-t` relate to their envs): the `--dev` flag > the
-/// `INFR_DEV` env (SAME grammar/parser as `--dev`) > the default (`Vulkan(None)` = first discrete
-/// GPU, else device 0). A garbage `--dev`/`INFR_DEV` errors early. The legacy `INFR_METAL`/`INFR_CPU`
+/// `INFR_DEV` env (SAME grammar/parser as `--dev`) > the default (`Vulkan(None)` = largest discrete
+/// GPU by device-local memory, else device 0). A garbage `--dev`/`INFR_DEV` errors early. The legacy `INFR_METAL`/`INFR_CPU`
 /// flags were removed cleanly — they are no longer read; `INFR_DEV=metal`/`cpu` replaces them.
 fn resolve_backend(dev: Option<&str>, env: BackendEnv) -> anyhow::Result<Backend> {
     // 1. an explicit `--dev` flag wins outright.
@@ -153,7 +153,7 @@ fn resolve_backend(dev: Option<&str>, env: BackendEnv) -> anyhow::Result<Backend
     if let Some(d) = env.dev.as_deref() {
         return parse_dev_spec(d).with_context(|| format!("invalid INFR_DEV `{d}`"));
     }
-    // 3. default: the first discrete Vulkan GPU.
+    // 3. default: the largest discrete Vulkan GPU by device-local memory.
     Ok(Backend::Vulkan(None))
 }
 
@@ -199,8 +199,8 @@ fn nan_safe_ratio_cmp(a: f64, b: f64) -> std::cmp::Ordering {
 #[derive(clap::Args)]
 struct DeviceOpts {
     /// Device for the forward: a Vulkan GPU (`Vulkan0`/`Vulkan1`/…), `metal` (Apple GPU), or `cpu`
-    /// (reference backend). Case-insensitive; matches llama.cpp's --dev. Unset = the first discrete
-    /// Vulkan GPU, else device 0.
+    /// (reference backend). Case-insensitive; matches llama.cpp's --dev. Unset = the largest
+    /// discrete Vulkan GPU by device-local memory, else device 0.
     #[arg(long)]
     dev: Option<String>,
     /// Context window in tokens (`8192`, `256k`, or `50%` of the free-VRAM KV capacity). Config
@@ -224,8 +224,8 @@ impl DeviceOpts {
     ///
     /// PRECEDENCE, unchanged: an explicit `--dev` OVERRIDES an inherited `INFR_DEV` because the CLI
     /// layer beats the env layer in the fold; an UNSET `--dev` specifies nothing, so the inherited
-    /// `INFR_DEV` (or `[device] dev`) survives, and with neither the default is "first discrete GPU,
-    /// else device 0". `--dev`/`INFR_DEV` share the ONE parser ([`parse_dev_spec`],
+    /// `INFR_DEV` (or `[device] dev`) survives, and with neither the default is "largest discrete
+    /// GPU by device-local memory, else device 0". `--dev`/`INFR_DEV` share the ONE parser ([`parse_dev_spec`],
     /// `vulkan*`/`metal`/`cpu`, case-insensitive) and a garbage `--dev` still fails fast
     /// here, before anything is loaded. The deprecated `INFR_METAL`/`INFR_CPU` are still not
     /// written and still not read.
@@ -392,6 +392,10 @@ enum Cmd {
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
         model: String,
+        /// Optional Qwen3.8 vision projector GGUF. Image parts are accepted through the OpenAI
+        /// chat API as data URIs or base64 strings; projector weights are request-scoped.
+        #[arg(long, value_name = "PATH")]
+        mmproj: Option<PathBuf>,
         /// Optional GGUF embedding model hosted natively at /v1/embeddings.
         #[arg(long, value_name = "MODEL")]
         embedding_model: Option<String>,
@@ -408,9 +412,9 @@ enum Cmd {
         /// Concurrent generation slots (llama-server's `-np`). N requests generate at once, each
         /// with its own KV cache, taking turns on the GPU at token granularity; the (N+1)'th queues.
         ///
-        /// Each slot owns a full KV cache, so the DEFAULT per-slot context is the VRAM-fit window
-        /// divided by N: the N slots together stay inside the same VRAM budget one slot is held to,
-        /// and raising `-np` can never OOM a box that `-np 1` fit. The visible cost is a smaller
+        /// Each slot owns independent KV/recurrent state, so the DEFAULT per-slot context is solved
+        /// against all N states plus one shared runtime workspace. Raising `-np` cannot OOM a box
+        /// that `-np 1` fit; the visible cost can be a smaller
         /// per-request window. Pass `--ctx` to pin the per-slot window instead (then `N * ctx` must
         /// fit, and the Vulkan budget guard will say so if it doesn't).
         /// `--np` is accepted as an alias (llama-server spells this `-np`; clap shorts are a single
@@ -687,9 +691,11 @@ fn main() -> anyhow::Result<()> {
     // `infr compare --sweep` printed `ERR` for all 35 rows. Same hazard for `--man`/`--completions`
     // and for anything piping `infr run`. The split is the contract: stdout = results, stderr =
     // logs.
+    let stderr_is_terminal = std::io::stderr().is_terminal();
+    infr_server::configure_terminal_output(stderr_is_terminal);
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(infr_server::terminal_log_writer)
+        .with_ansi(stderr_is_terminal)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -815,6 +821,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         ),
         Cmd::Serve {
             model,
+            mmproj,
             embedding_model,
             embedding_idle_timeout,
             embedding_runner,
@@ -823,6 +830,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             ..
         } => cmd_serve(
             &model,
+            mmproj.as_deref(),
             embedding_model.as_deref(),
             embedding_idle_timeout,
             embedding_runner.as_deref(),
@@ -2105,6 +2113,7 @@ impl SeamGenerator {
 /// [`infr_llama::parallel::ParallelSeam`]. The `infr serve --parallel N` default path.
 struct ParallelGenerator {
     engine: infr_llama::parallel::ParallelSeam,
+    vision: Option<Arc<infr_vision::NativeVisionEngine>>,
     renderer: infr_llama::chat::OaiRenderer,
     watch: infr_llama::WeightWatch,
 }
@@ -2127,10 +2136,12 @@ impl ParallelGenerator {
     fn new(
         gguf_path: &Path,
         engine: infr_llama::parallel::ParallelSeam,
+        vision: Option<Arc<infr_vision::NativeVisionEngine>>,
         cfg: Arc<Config>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             engine,
+            vision,
             renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
             watch: infr_llama::WeightWatch::open(gguf_path)?,
         })
@@ -2173,6 +2184,18 @@ trait GenBackend: Send + Sync {
         req: &infr_llama::sampling::RequestCtx,
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats>;
+
+    fn generate_multimodal(
+        &self,
+        _prompt: &str,
+        _stable_prefix: Option<&str>,
+        _images: &[String],
+        _max_new: usize,
+        _req: &infr_llama::sampling::RequestCtx,
+        _on_piece: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_llama::GenStats> {
+        anyhow::bail!("this backend was not started with native vision support")
+    }
 
     /// Drop the serialised session's persistent KV so the NEXT `generate` re-prefills from scratch.
     /// The forced-tool fallback calls this before its unconstrained retry so the retry can never
@@ -2267,6 +2290,43 @@ impl GenBackend for ParallelGenerator {
                 on_piece(p)
             })
     }
+
+    fn generate_multimodal(
+        &self,
+        prompt: &str,
+        stable_prefix: Option<&str>,
+        images: &[String],
+        max_new: usize,
+        req: &infr_llama::sampling::RequestCtx,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_llama::GenStats> {
+        let vision = self
+            .vision
+            .as_ref()
+            .context("this server was not started with --mmproj")?;
+        let image_bytes = images
+            .iter()
+            .map(|image| infr_vision::decode_image_input(image))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let embeddings = vision
+            .encode_images(&image_bytes)?
+            .into_iter()
+            .map(|image| infr_llama::parallel::MultimodalEmbedding {
+                values: image.values,
+                grid_nx: image.grid_nx,
+                grid_ny: image.grid_ny,
+                fingerprint: image.fingerprint,
+            })
+            .collect();
+        self.engine.generate_multimodal_turn(
+            prompt,
+            stable_prefix,
+            embeddings,
+            max_new,
+            req,
+            |piece| on_piece(piece),
+        )
+    }
 }
 
 /// Map the validated request params onto the seam's per-request sampling scope. An ABSENT request
@@ -2292,10 +2352,20 @@ impl infr_server::ChatGenerator for SeamGenerator {
         tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
-        cancel: &std::sync::atomic::AtomicBool,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<infr_server::ChatOutcome> {
-        run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
+        run_chat(
+            self,
+            messages,
+            tools,
+            tool_choice,
+            params,
+            cancel,
+            progress,
+            on_delta,
+        )
     }
 }
 
@@ -2306,10 +2376,20 @@ impl infr_server::ChatGenerator for ParallelGenerator {
         tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
-        cancel: &std::sync::atomic::AtomicBool,
+        cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<infr_server::ChatOutcome> {
-        run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
+        run_chat(
+            self,
+            messages,
+            tools,
+            tool_choice,
+            params,
+            cancel,
+            progress,
+            on_delta,
+        )
     }
 }
 
@@ -2337,7 +2417,8 @@ fn run_chat(
     tools: Option<&serde_json::Value>,
     tool_choice: Option<&str>,
     params: &infr_server::GenParams,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    progress: Option<infr_core::GenerationProgressCallback>,
     on_delta: &mut dyn FnMut(infr_engine::Delta),
 ) -> anyhow::Result<infr_server::ChatOutcome> {
     {
@@ -2352,6 +2433,10 @@ fn run_chat(
             tools,
             &params.chat_template_options,
         )?;
+        let images = messages
+            .iter()
+            .flat_map(|message| message.images.iter().cloned())
+            .collect::<Vec<_>>();
         // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
         // (INFR_MAX_NEW, default 2048) is the server-side default for requests that don't set one.
         let max_new = params
@@ -2361,12 +2446,19 @@ fn run_chat(
         // THIS sequence's own sampling (temperature/top_p/top_k/seed/penalties) + abort latch + GPU
         // turn. Owned by this call — not installed anywhere ambient — so it cannot be observed by,
         // or leak into, any other in-flight request.
-        let req = be.request_ctx(request_sampling(params));
+        let req = be
+            .request_ctx(request_sampling(params))
+            .with_external_abort(cancel.clone())
+            .with_progress(progress);
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
         // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
         // constrained JSON; on any failure fall back to unconstrained (mirrors LlamaGenerator).
-        if let Some(mut constraint) = be.renderer().tool_constraint(tools, tool_choice)? {
+        let forced_constraint = be.renderer().tool_constraint(tools, tool_choice)?;
+        if !images.is_empty() && forced_constraint.is_some() {
+            anyhow::bail!("forced tool calls are not supported together with image inputs yet");
+        }
+        if let Some(mut constraint) = forced_constraint {
             let primed = format!("{prompt}<tool_call>\n");
             let mut body = String::new();
             let mut tokens = (0u32, 0u32);
@@ -2447,24 +2539,36 @@ fn run_chat(
             if infr_engine::prompt_prefills_think(&prompt) {
                 stream.push("<think>", &mut *od);
             }
-            let stats = be.generate(
-                &prompt,
-                Some(&stable_prefix),
-                max_new,
-                None,
-                &req,
-                &mut |piece: &str| {
-                    let safe = stops.push(piece);
-                    if !safe.is_empty() {
-                        stream.push(&safe, &mut *od);
-                    }
-                    // A stop sequence hit OR a client disconnect (the server latched `cancel`) both
-                    // abort THIS sequence's decode at its next poll, freeing the GPU slot promptly.
-                    if stops.hit() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        req.abort();
-                    }
-                },
-            )?;
+            let mut on_piece = |piece: &str| {
+                let safe = stops.push(piece);
+                if !safe.is_empty() {
+                    stream.push(&safe, &mut *od);
+                }
+                // A stop sequence hit OR a client disconnect (the server latched `cancel`) both
+                // abort THIS sequence's decode at its next poll, freeing the GPU slot promptly.
+                if stops.hit() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    req.abort();
+                }
+            };
+            let stats = if images.is_empty() {
+                be.generate(
+                    &prompt,
+                    Some(&stable_prefix),
+                    max_new,
+                    None,
+                    &req,
+                    &mut on_piece,
+                )?
+            } else {
+                be.generate_multimodal(
+                    &prompt,
+                    Some(&stable_prefix),
+                    &images,
+                    max_new,
+                    &req,
+                    &mut on_piece,
+                )?
+            };
             // No stop fired: whatever the matcher was holding back was never a stop prefix.
             let tail = stops.flush();
             if !tail.is_empty() {
@@ -4404,6 +4508,7 @@ fn apply_model_sampling_defaults(
 
 fn cmd_serve(
     model: &str,
+    mmproj: Option<&Path>,
     embedding_model: Option<&str>,
     embedding_idle_timeout: u64,
     embedding_runner: Option<&Path>,
@@ -4431,6 +4536,14 @@ fn cmd_serve(
     // (`infr_core::parse_size`, which is also what the `INFR_CTX` env layer parses).
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let is_vulkan = !is_dg && matches!(selected_backend(cfg)?, Backend::Vulkan(_));
+    if mmproj.is_some() && !is_vulkan {
+        anyhow::bail!("--mmproj currently requires the Vulkan qwen4exp serve path");
+    }
+    if let Some(path) = mmproj {
+        if !path.is_file() {
+            anyhow::bail!("vision projector does not exist: {}", path.display());
+        }
+    }
 
     let cfg = &apply_model_sampling_defaults(cfg, specified, &gguf);
     preflight_chat_template_controls(&gguf, tok.as_deref(), cfg)?;
@@ -4451,11 +4564,27 @@ fn cmd_serve(
     if is_vulkan {
         let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
         // `--ctx` (or INFR_CTX) is the PER-SLOT window: an explicit token count is used verbatim,
-        // a `%` is a fraction of the whole device's KV capacity split across the slots, and unset
-        // derives it from the VRAM fit divided by N. See `SeamModel::vulkan_slot_ctx`.
+        // a `%` is a fraction of the fitted per-slot context after all slot state is priced, and
+        // unset derives the maximum safe per-slot context. See `SeamModel::vulkan_slot_ctx`.
         let want_ctx = cfg.device.ctx;
         let t0 = std::time::Instant::now();
         let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
+        let vision = mmproj
+            .map(|path| {
+                let backend = engine.fork_vision_backend()?;
+                let vision =
+                    infr_vision::NativeVisionEngine::load_vulkan_with_backend(path, backend)?;
+                let llm_dim = engine.model().config().n_embd;
+                if vision.config().projection_dim != llm_dim {
+                    anyhow::bail!(
+                        "vision projector output width {} does not match LLM embedding width {}",
+                        vision.config().projection_dim,
+                        llm_dim
+                    );
+                }
+                Ok(Arc::new(vision))
+            })
+            .transpose()?;
         let embedding = embedding_model
             .map(|model| {
                 let compatibility_runner =
@@ -4490,12 +4619,13 @@ fn cmd_serve(
         let n_slots = engine.n_slots();
         let max_ctx = engine.max_ctx();
         let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, cfg.clone())?);
+            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, vision, cfg.clone())?);
         let rt = tokio::runtime::Runtime::new()?;
         // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!(
-            "infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, {n_slots} slot{} x {max_ctx} ctx)",
+            "infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, {n_slots} slot{} x {max_ctx} ctx{})",
             if n_slots == 1 { "" } else { "s" },
+            if mmproj.is_some() { ", vision" } else { "" },
         );
         return match embedding {
             Some((embedding_id, embedding)) => rt.block_on(infr_server::serve_with_embedding(
@@ -4813,8 +4943,9 @@ fn cmd_multi(
             infr_llama::parallel::ParallelSeam::new_on(Some(dev), loaded, parallel, want_ctx)?;
         let n_slots = engine.n_slots();
         let dev_name = engine.device_name();
-        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, hosted_cfg.clone())?);
+        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> = std::sync::Arc::new(
+            ParallelGenerator::new(&gguf, engine, None, hosted_cfg.clone())?,
+        );
         routing.push((model_id.clone(), dev, dev_name));
         entries.push((model_id, generator, n_slots));
     }
@@ -4997,7 +5128,7 @@ mod tests {
         let msg = format!("{e:#}");
         assert!(msg.contains("INFR_DEV"), "message names the source: {msg}");
         assert!(msg.contains("foo"), "message echoes the bad value: {msg}");
-        // No env at all → the default, first discrete Vulkan GPU.
+        // No env at all → the default, largest discrete Vulkan GPU by device-local memory.
         assert_eq!(
             resolve_backend(None, BackendEnv::default()).unwrap(),
             Backend::Vulkan(None)
@@ -5294,6 +5425,8 @@ mod tests {
         let cli = Cli::try_parse_from([
             "infr",
             "serve",
+            "--mmproj",
+            "vision.gguf",
             "--embedding-model",
             "embed.gguf",
             "--embedding-idle-timeout",
@@ -5303,6 +5436,7 @@ mod tests {
         .unwrap();
         let Some(Cmd::Serve {
             model,
+            mmproj,
             embedding_model,
             embedding_idle_timeout,
             ..
@@ -5311,6 +5445,7 @@ mod tests {
             panic!("expected serve command");
         };
         assert_eq!(model, "chat.gguf");
+        assert_eq!(mmproj.as_deref(), Some(Path::new("vision.gguf")));
         assert_eq!(embedding_model.as_deref(), Some("embed.gguf"));
         assert_eq!(embedding_idle_timeout, 45);
 

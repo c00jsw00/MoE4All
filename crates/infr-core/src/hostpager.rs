@@ -26,7 +26,7 @@ use crate::blockio::{BlockDesc, BlockIo};
 use crate::error::{Error, Result};
 use crate::pager::{BlockId, Insert, Pager, PagerStats, Resolution};
 use crate::pager_profile;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -374,6 +374,16 @@ pub struct InclusiveHostStats {
     pub bytes_promoted: u64,
 }
 
+/// Non-blocking residency view used by speculative upper-tier scheduling. `Absent` means the
+/// descriptor is known but no RAM slot currently owns it; callers that need the bytes normally
+/// still use [`InclusiveHostCache::promote`] and retain its existing wait/fallback semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InclusiveBlockState {
+    Absent,
+    Loading,
+    Ready,
+}
+
 struct InclusiveInner {
     pager: Option<Pager>,
     state: HashMap<BlockId, SlotState>,
@@ -435,6 +445,96 @@ pub struct InclusiveHostCache {
     bytes_promoted: AtomicU64,
 }
 
+/// One bounded RAM/SSD tier containing every uniform expert size class for a model.
+///
+/// The tier owns capacity planning and class lookup; each [`InclusiveHostCache`] keeps its existing
+/// independent LRU because differently-sized blocks cannot exchange physical slots. The requested
+/// class ratio is therefore soft: [`plan_slots`] apportions bytes proportionally, while rounding at
+/// class boundaries is allowed to leave a small unspent tail.
+pub struct InclusiveHostTier {
+    budget_bytes: usize,
+    arena_bytes: usize,
+    classes: Vec<InclusiveHostClassPlan>,
+    caches: BTreeMap<usize, Arc<InclusiveHostCache>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InclusiveHostClassPlan {
+    pub slot_bytes: usize,
+    pub n_blocks: usize,
+    pub n_slots: usize,
+}
+
+impl InclusiveHostTier {
+    pub fn new(
+        budget_bytes: usize,
+        classes: &[(usize, usize)],
+        io: Arc<dyn BlockIo>,
+    ) -> Result<Self> {
+        let slots = plan_slots(budget_bytes, classes);
+        let mut plans = Vec::with_capacity(classes.len());
+        let mut caches = BTreeMap::new();
+        let mut arena_bytes = 0usize;
+
+        for (&(slot_bytes, n_blocks), &n_slots) in classes.iter().zip(&slots) {
+            if slot_bytes == 0 {
+                return Err(Error::backend(
+                    "inclusive host tier needs non-zero size classes".to_string(),
+                ));
+            }
+            if caches.contains_key(&slot_bytes) {
+                return Err(Error::backend(format!(
+                    "inclusive host tier received duplicate {slot_bytes}-byte size classes"
+                )));
+            }
+            let cache = Arc::new(InclusiveHostCache::new(n_slots, slot_bytes, io.clone())?);
+            arena_bytes = arena_bytes
+                .checked_add(cache.arena_bytes())
+                .ok_or_else(|| Error::backend("inclusive host tier size overflow".to_string()))?;
+            plans.push(InclusiveHostClassPlan {
+                slot_bytes,
+                n_blocks,
+                n_slots,
+            });
+            caches.insert(slot_bytes, cache);
+        }
+
+        debug_assert!(arena_bytes <= budget_bytes);
+        Ok(Self {
+            budget_bytes,
+            arena_bytes,
+            classes: plans,
+            caches,
+        })
+    }
+
+    pub fn budget_bytes(&self) -> usize {
+        self.budget_bytes
+    }
+
+    pub fn arena_bytes(&self) -> usize {
+        self.arena_bytes
+    }
+
+    pub fn classes(&self) -> &[InclusiveHostClassPlan] {
+        &self.classes
+    }
+
+    pub fn cache(&self, slot_bytes: usize) -> Option<Arc<InclusiveHostCache>> {
+        self.caches.get(&slot_bytes).cloned()
+    }
+
+    /// Stable host allocations that a device backend may import once when the model session is
+    /// finalized. Zero-slot SSD-through classes have no arena and are deliberately omitted.
+    pub fn arena_allocations(&self) -> Vec<(Arc<AlignedHostBuffer>, usize)> {
+        self.caches
+            .iter()
+            .filter(|(_, cache)| cache.arena_bytes() != 0)
+            .map(|(&slot_bytes, cache)| (cache.arena_allocation(), slot_bytes))
+            .collect()
+    }
+}
+
 impl InclusiveHostCache {
     /// Build one RAM size class. `n_slots == 0` is a valid SSD-through mode; the one-block
     /// scratch still lets a miss be uploaded without retaining a host shadow.
@@ -488,6 +588,105 @@ impl InclusiveHostCache {
             .descs
             .get(&id)
             .map(BlockDesc::nbytes)
+    }
+
+    /// Inspect one registered block without touching its RAM LRU position.
+    pub fn block_state(&self, id: BlockId) -> Result<InclusiveBlockState> {
+        let inner = self.inner.lock().unwrap();
+        if !inner.descs.contains_key(&id) {
+            return Err(Error::backend(format!(
+                "inclusive host cache: block {id} was never registered"
+            )));
+        }
+        Ok(match inner.state.get(&id) {
+            Some(SlotState::Loading) => InclusiveBlockState::Loading,
+            Some(SlotState::Ready) => InclusiveBlockState::Ready,
+            None => InclusiveBlockState::Absent,
+        })
+    }
+
+    /// Best-effort SSD-to-RAM prefetch inserted at the cold end of the host LRU.
+    ///
+    /// The slot is reserved and pinned under `inner`, but disk I/O runs after releasing the lock.
+    /// Real demand for this same block joins through the existing `Loading` wait, while unrelated
+    /// RAM hits and misses remain free to proceed. A full cache whose every slot is a GPU shadow
+    /// simply declines the speculative admission.
+    pub fn prefetch_cold(&self, id: BlockId) -> Result<bool> {
+        let prof = pager_profile::active();
+        let (slot, desc, host_evicted) = {
+            let mut inner = self.inner.lock().unwrap();
+            let desc = inner.descs.get(&id).cloned().ok_or_else(|| {
+                Error::backend(format!(
+                    "inclusive host cache: block {id} was never registered"
+                ))
+            })?;
+            if inner.state.contains_key(&id) {
+                return Ok(false);
+            }
+            let Some(pager) = inner.pager.as_mut() else {
+                return Ok(false);
+            };
+            match pager.resolve_and_pin(id, Insert::Cold) {
+                Some(Resolution::Miss { slot, evicted }) => {
+                    if let Some(old) = evicted {
+                        let removed = inner.state.remove(&old);
+                        debug_assert_eq!(removed, Some(SlotState::Ready));
+                        self.ram_evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                    inner.state.insert(id, SlotState::Loading);
+                    (slot, desc, evicted.is_some())
+                }
+                Some(Resolution::Hit { .. }) => {
+                    return Err(Error::backend(format!(
+                        "inclusive host cache: block {id} became resident without slot state"
+                    )));
+                }
+                None => return Ok(false),
+            }
+        };
+
+        let len = desc.nbytes();
+        // SAFETY: this call reserved `slot` as Loading and pinned `id` before dropping `inner`.
+        // The ordinary demand path uses the same ownership proof in `HostPager::pin`.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, len), len) };
+        let read_t0 = prof.then(std::time::Instant::now);
+        let read = self.io.read_block(&desc, dst);
+        let read_elapsed = read_t0.map(|started| started.elapsed());
+        let mut inner = self.inner.lock().unwrap();
+        match read {
+            Ok(()) => {
+                inner.state.insert(id, SlotState::Ready);
+                inner
+                    .pager
+                    .as_mut()
+                    .expect("a prefetched block owns a host pager slot")
+                    .unpin(id);
+                self.ssd_reads.fetch_add(1, Ordering::Relaxed);
+                self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
+                if prof {
+                    pager_profile::record_host_miss(len, host_evicted);
+                    if let Some(elapsed) = read_elapsed {
+                        pager_profile::record_host_read(len, elapsed, false);
+                    }
+                }
+                drop(inner);
+                self.ready.notify_all();
+                Ok(true)
+            }
+            Err(error) => {
+                inner.state.remove(&id);
+                let pager = inner
+                    .pager
+                    .as_mut()
+                    .expect("a prefetched block owns a host pager slot");
+                pager.unpin(id);
+                let removed = pager.evict(id);
+                debug_assert_eq!(removed, Some(slot));
+                drop(inner);
+                self.ready.notify_all();
+                Err(error)
+            }
+        }
     }
 
     pub fn arena_bytes(&self) -> usize {
@@ -1767,6 +1966,67 @@ mod tests {
         assert!(plan_slots(1 << 30, &[]).is_empty());
     }
 
+    #[test]
+    fn inclusive_host_tier_owns_the_existing_soft_class_plan() {
+        let classes = [(16usize, 5usize), (32, 3)];
+        let expected = plan_slots(128, &classes);
+        let tier =
+            InclusiveHostTier::new(128, &classes, Arc::new(FakeIo::new())).expect("host tier");
+
+        assert_eq!(tier.budget_bytes(), 128);
+        assert_eq!(
+            tier.classes(),
+            &[
+                InclusiveHostClassPlan {
+                    slot_bytes: 16,
+                    n_blocks: 5,
+                    n_slots: expected[0],
+                },
+                InclusiveHostClassPlan {
+                    slot_bytes: 32,
+                    n_blocks: 3,
+                    n_slots: expected[1],
+                },
+            ]
+        );
+        assert_eq!(
+            tier.arena_bytes(),
+            expected[0] * classes[0].0 + expected[1] * classes[1].0
+        );
+        assert_eq!(
+            tier.cache(16).expect("16-byte class").n_slots(),
+            expected[0]
+        );
+        assert_eq!(
+            tier.cache(32).expect("32-byte class").n_slots(),
+            expected[1]
+        );
+        assert!(tier.cache(64).is_none());
+        assert_eq!(
+            tier.arena_allocations().len(),
+            expected.iter().filter(|&&slots| slots != 0).count()
+        );
+    }
+
+    #[test]
+    fn inclusive_host_tier_keeps_zero_ram_classes_as_ssd_through() {
+        let tier = InclusiveHostTier::new(0, &[(16, 4), (32, 4)], Arc::new(FakeIo::new()))
+            .expect("zero-RAM host tier");
+
+        assert_eq!(tier.arena_bytes(), 0);
+        assert_eq!(tier.cache(16).expect("16-byte class").n_slots(), 0);
+        assert_eq!(tier.cache(32).expect("32-byte class").n_slots(), 0);
+        assert!(tier.arena_allocations().is_empty());
+    }
+
+    #[test]
+    fn inclusive_host_tier_rejects_ambiguous_duplicate_sizes() {
+        let error = InclusiveHostTier::new(128, &[(16, 2), (16, 3)], Arc::new(FakeIo::new()))
+            .err()
+            .expect("duplicate classes must fail");
+        assert!(error.to_string().contains("duplicate 16-byte size classes"));
+    }
+
     /// A `BlockIo` with no file behind it: block `id` is `nbytes` copies of `id as u8`, so a slot
     /// filled from the wrong descriptor, or read at the wrong offset, is a value mismatch.
     struct FakeIo {
@@ -1816,6 +2076,20 @@ mod tests {
         }
     }
 
+    struct GatedIo {
+        entered: std::sync::Barrier,
+        release: std::sync::Barrier,
+    }
+
+    impl BlockIo for GatedIo {
+        fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+            self.entered.wait();
+            self.release.wait();
+            dst[..desc.nbytes()].fill(desc.id as u8);
+            Ok(())
+        }
+    }
+
     fn desc(id: BlockId, len: usize) -> BlockDesc {
         BlockDesc {
             id,
@@ -1861,6 +2135,77 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.ssd_reads, 2);
         assert_eq!(stats.shadow_resident, 2);
+    }
+
+    #[test]
+    fn inclusive_cold_prefetch_releases_the_cache_lock_during_io() {
+        let io = Arc::new(GatedIo {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        });
+        let cache = Arc::new(InclusiveHostCache::new(2, 16, io.clone()).expect("cache"));
+        cache.register(desc(1, 16)).expect("register 1");
+        cache.register(desc(2, 16)).expect("register 2");
+
+        let worker_cache = Arc::clone(&cache);
+        let worker = std::thread::spawn(move || worker_cache.prefetch_cold(1));
+        io.entered.wait();
+
+        let query_cache = Arc::clone(&cache);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let query = std::thread::spawn(move || {
+            tx.send(query_cache.block_state(2)).expect("send state");
+        });
+        let state = rx.recv_timeout(std::time::Duration::from_secs(1));
+        io.release.wait();
+
+        assert_eq!(
+            state
+                .expect("an unrelated RAM query was blocked behind SSD I/O")
+                .expect("query state"),
+            InclusiveBlockState::Absent
+        );
+        assert!(worker.join().expect("prefetch thread").expect("prefetch"));
+        query.join().expect("query thread");
+        assert_eq!(
+            cache.block_state(1).expect("prefetched state"),
+            InclusiveBlockState::Ready
+        );
+    }
+
+    #[test]
+    fn inclusive_cold_prefetch_is_cold_and_rolls_back_failed_io() {
+        let io = Arc::new(FakeIo::new());
+        let cache = InclusiveHostCache::new(2, 16, io).expect("cache");
+        for id in 1..=4 {
+            cache.register(desc(id, 16)).expect("register");
+        }
+        cache.preload(&[1, 2]).expect("preload");
+        assert!(cache.prefetch_cold(3).expect("prefetch 3"));
+        assert_eq!(
+            cache.block_state(3).expect("state 3"),
+            InclusiveBlockState::Ready
+        );
+
+        cache.promote(4, None, |_| Ok(())).expect("promote 4");
+        assert_eq!(
+            cache.block_state(3).expect("state 3 after demand"),
+            InclusiveBlockState::Absent,
+            "the speculative cold insert should be the next ordinary victim"
+        );
+
+        let failing_io = Arc::new(FakeIo {
+            reads: AtomicUsize::new(0),
+            fail_on: Some(9),
+            delay: None,
+        });
+        let failing = InclusiveHostCache::new(1, 16, failing_io).expect("failing cache");
+        failing.register(desc(9, 16)).expect("register 9");
+        assert!(failing.prefetch_cold(9).is_err());
+        assert_eq!(
+            failing.block_state(9).expect("rolled-back state"),
+            InclusiveBlockState::Absent
+        );
     }
 
     #[test]

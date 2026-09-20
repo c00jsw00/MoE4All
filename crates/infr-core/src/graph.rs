@@ -339,6 +339,20 @@ pub enum Op {
         /// asserts.
         backward: bool,
     },
+    /// Qwen3-VL vision RoPE. Q and K are `[rows, n_head, head_dim]` f32 tensors and
+    /// `pos_hw` is `[rows, 2]` I32 `(y, x)` in the same patch order. All head dimensions rotate
+    /// in split-half pairs; each section selects y/x alternately and restarts the frequency ramp.
+    Rope2D {
+        q: TensorId,
+        k: TensorId,
+        pos_hw: TensorId,
+        dst_q: TensorId,
+        dst_k: TensorId,
+        n_head: u32,
+        head_dim: u32,
+        theta: f32,
+        sections: [u32; 4],
+    },
     /// Fused per-head RMSNorm + NEOX RoPE — `QkNorm` immediately followed by `Rope` on the same
     /// tensor (the common qwen3/gemma q/k case). One pass: each head is rmsnormed (`× weight`) then
     /// its first `rope_dim` rotated, dims beyond `rope_dim` passing through normed. Maps 1:1 to the
@@ -357,6 +371,25 @@ pub enum Op {
         eps: f32,
         freq_factors: Option<TensorId>,
         /// Per-row stride in `x`. 0 = packed (stride = n_head * head_dim).
+        x_stride: u32,
+    },
+    /// Fused per-head RMSNorm and interleaved multimodal RoPE. `positions4` contains row-major
+    /// `(T, H, W, E)` coordinates; `sections` follows the model's
+    /// `rope.dimension_sections` metadata.
+    QkNormMrope {
+        x: TensorId,
+        weight: TensorId,
+        positions4: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        sections: [u32; 4],
+        /// Per-row source stride; zero means packed. Qwen3.5's interleaved q+gate projection uses
+        /// a non-zero stride.
         x_stride: u32,
     },
     /// Append `src` (`rows × row_stride`) into the persistent KV `cache` starting at row `pos`,
@@ -440,6 +473,10 @@ pub enum Op {
         k_cache: TensorId,
         block_cache: TensorId,
         k_norm: TensorId,
+        /// Optional full-context row-major `(T, H, W, E)` position table. When present, newly
+        /// compressed block keys use the first token's multimodal position; `None` preserves the
+        /// text-only linear `block * ratio` position exactly.
+        positions4: Option<TensorId>,
         dst: TensorId,
         /// Number of consecutive query rows. Row `r` sees
         /// `kv_len - rows + r + 1` cached tokens.
@@ -456,6 +493,8 @@ pub enum Op {
         theta: f32,
         eps: f32,
         scale: f32,
+        /// IMROPE section widths. Read only when `positions4` is present.
+        sections: [u32; 4],
     },
     /// Gather QSA-selected complete blocks plus the always-visible incomplete tail from the
     /// ordinary full-attention K/V caches into packed F16 scratch consumed by `Op::Attention`.
@@ -926,6 +965,13 @@ pub enum Op {
         n: u32,
         scale: f32,
     },
+    /// Elementwise tanh-approximation GELU used by the Qwen3-VL vision FFN and merger.
+    Gelu {
+        x: TensorId,
+        dst: TensorId,
+        rows: u32,
+        cols: u32,
+    },
     /// Qwen3.8 stream collapse after its low-rank gate projection. `x` and `gate` are
     /// `[rows, hc, n_embd]`; gate contains raw logits. The output is
     /// `mean_h(x[r,h,d] * sigmoid(gate[r,h,d]))`.
@@ -1045,6 +1091,7 @@ pub enum Op {
         u: TensorId,
         dst: TensorId,
         n: u32,
+        rows: u32,
         top_k: u32,
         temp: f32,
         top_p: f32,
@@ -1307,7 +1354,9 @@ impl Op {
             Op::QkNorm { .. } => "QkNorm",
             Op::GatedRmsNorm { .. } => "GatedRmsNorm",
             Op::Rope { .. } => "Rope",
+            Op::Rope2D { .. } => "Rope2D",
             Op::QkNormRope { .. } => "QkNormRope",
+            Op::QkNormMrope { .. } => "QkNormMrope",
             Op::WriteKv { .. } => "WriteKv",
             Op::Dsv4Compress { .. } => "Dsv4Compress",
             Op::Dsv4CacheWrite { .. } => "Dsv4CacheWrite",
@@ -1329,6 +1378,7 @@ impl Op {
             Op::AddBias { .. } => "AddBias",
             Op::Scale { .. } => "Scale",
             Op::Silu { .. } => "Silu",
+            Op::Gelu { .. } => "Gelu",
             Op::QwenHcMix { .. } => "QwenHcMix",
             Op::QwenHcInject { .. } => "QwenHcInject",
             Op::QwenPleGate { .. } => "QwenPleGate",
@@ -1400,6 +1450,14 @@ impl Op {
                 r.extend(freq_factors);
                 (r, vec![dst])
             }
+            Op::Rope2D {
+                q,
+                k,
+                pos_hw,
+                dst_q,
+                dst_k,
+                ..
+            } => (vec![q, k, pos_hw], vec![dst_q, dst_k]),
             Op::QkNormRope {
                 x,
                 weight,
@@ -1412,6 +1470,13 @@ impl Op {
                 r.extend(freq_factors);
                 (r, vec![dst])
             }
+            Op::QkNormMrope {
+                x,
+                weight,
+                positions4,
+                dst,
+                ..
+            } => (vec![x, weight, positions4], vec![dst]),
             Op::WriteKv { src, cache, .. } => (vec![src, cache], vec![cache]),
             Op::Dsv4Compress {
                 values,
@@ -1451,12 +1516,14 @@ impl Op {
                 k_cache,
                 block_cache,
                 k_norm,
+                positions4,
                 dst,
                 ..
-            } => (
-                vec![q, k_cache, block_cache, k_norm],
-                vec![block_cache, dst],
-            ),
+            } => {
+                let mut reads = vec![q, k_cache, block_cache, k_norm];
+                reads.extend(positions4);
+                (reads, vec![block_cache, dst])
+            }
             Op::QsaGather {
                 k_cache,
                 v_cache,
@@ -1538,6 +1605,7 @@ impl Op {
             Op::AddBias { x, bias, dst, .. } => (vec![x, bias], vec![dst]),
             Op::Scale { x, dst, .. } => (vec![x], vec![dst]),
             Op::Silu { x, dst, .. } => (vec![x], vec![dst]),
+            Op::Gelu { x, dst, .. } => (vec![x], vec![dst]),
             Op::QwenHcMix { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
             Op::QwenHcInject {
                 residual,
@@ -1632,6 +1700,41 @@ impl Op {
     }
 }
 
+/// Maximum ordered next-layer expert candidates carried by a decode prefetch hint. The backend
+/// filters already-resident experts and admits only complete candidates that fit its calibrated
+/// transfer window, so this is an upper bound on ranking information rather than transfer depth.
+pub const EXPERT_PREFETCH_CANDIDATES: usize = 32;
+
+/// Optional scheduling metadata attached to one [`Op::MoeFfn`]. It names the next layer's router
+/// and expert banks without turning prediction into model math: backends that cannot overlap
+/// transfer simply ignore the hint, and every ordinary graph op remains unchanged.
+#[derive(Clone, Copy, Debug)]
+pub struct MoePrefetchHint {
+    pub source_op: usize,
+    pub source_layer: u32,
+    pub target_layer: u32,
+    pub target_router: TensorId,
+    pub target_gate_exps: TensorId,
+    pub target_up_exps: TensorId,
+    pub target_down_exps: TensorId,
+    pub target_fused_gate_up: bool,
+    pub target_n_expert: u32,
+    /// QSA's useful overlap window grows with context depth; GDN's recurrent body does not.
+    pub target_qsa: bool,
+    pub context_tokens: u32,
+}
+
+/// A contiguous sequence inside a shared activation batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequenceSpan {
+    /// First row of this sequence in the shared activation batch.
+    pub row_start: u32,
+    /// Number of consecutive rows belonging to this sequence.
+    pub rows: u32,
+    /// Absolute model position of the first row.
+    pub start_pos: u32,
+}
+
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].
 #[derive(Clone, Default)]
 pub struct Graph {
@@ -1640,6 +1743,15 @@ pub struct Graph {
     pub inputs: Vec<TensorId>,
     pub weights: Vec<TensorId>,
     pub outputs: Vec<TensorId>,
+    /// Each logical row is an independent sequence with its own persistent state bindings.
+    /// Stateless activations remain one ordinary row-major batch.
+    pub independent_rows: bool,
+    /// Contiguous sequence ranges inside an independent activation batch. Decode has one row per
+    /// span; concurrent prefill has several rows per span. Empty on ordinary single-sequence
+    /// graphs. The ranges must partition every stateful op's row domain in ascending order.
+    pub sequence_spans: Vec<SequenceSpan>,
+    /// Decode-only scheduling hints. Empty for models without a validated next-layer predictor.
+    pub moe_prefetch_hints: Vec<MoePrefetchHint>,
     /// Producer-set opt-out of the Vulkan record-once decode replay: `true` forces the
     /// per-execute STATIC path even for an otherwise replay-eligible single-token decode.
     ///

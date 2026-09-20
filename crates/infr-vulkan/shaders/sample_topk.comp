@@ -58,8 +58,9 @@ uint f2ui(float x) {
 }
 
 #ifdef PASS2
-float val_at(uint i) { return cand[i]; }
-uint idx_at(uint i) { return floatBitsToUint(cand[pc.n + i]); }
+uint cand_row_base() { return gl_WorkGroupID.x * (2u * pc.n); }
+float val_at(uint i) { return cand[cand_row_base() + i]; }
+uint idx_at(uint i) { return floatBitsToUint(cand[cand_row_base() + pc.n + i]); }
 #endif
 
 void main() {
@@ -69,8 +70,10 @@ void main() {
     uint lo = 0u;
     uint hi = pc.n;
 #else
+    uint row = gl_WorkGroupID.x / 256u;
+    uint slice = gl_WorkGroupID.x % 256u;
     uint chunk = (pc.n + 255u) / 256u;
-    uint lo = gl_WorkGroupID.x * chunk;
+    uint lo = slice * chunk;
     uint hi = min(lo + chunk, pc.n);
 #endif
 
@@ -87,7 +90,7 @@ void main() {
 #ifdef PASS2
             uint key = f2ui(val_at(i));
 #else
-            uint key = f2ui(logits[i]);
+            uint key = f2ui(logits[row * pc.n + i]);
 #endif
             if ((key & himask) == pfix) {
                 atomicAdd(bucket[(key >> shift) & 0xFu], 1u);
@@ -119,7 +122,7 @@ void main() {
 #ifdef PASS2
         float v = val_at(i);
 #else
-        float v = logits[i];
+        float v = logits[row * pc.n + i];
 #endif
         if (f2ui(v) >= thresh) {
             uint slot = atomicAdd(gcnt, 1u);
@@ -169,7 +172,7 @@ void main() {
 #ifdef CHAIN
         float u = u_buf[params[0] & 63u];
 #else
-        float u = u_buf[0];
+        float u = u_buf[gl_WorkGroupID.x];
 #endif
         float r = u * total;
         uint tok = gidx[cutoff - 1u];
@@ -178,18 +181,20 @@ void main() {
             acc += gval[j];
             if (r <= acc) { tok = gidx[j]; break; }
         }
-        out_id[0] = tok;
+        out_id[gl_WorkGroupID.x] = tok;
     }
 #else
     // Stage-1 epilogue (single lane): write this slice's ≤k candidates, padding to exactly k so
     // stage 2 reads a dense [256*k] grid. -1e30 pads rank below every real logit.
     if (tid == 0u) {
         uint m = min(gcnt, k);
-        uint base = gl_WorkGroupID.x * k;
+        uint row_base = row * (2u * 256u * k);
+        uint base = row_base + slice * k;
         uint ncand = 256u * k;
         for (uint j = 0u; j < k; j++) {
             cand[base + j] = (j < m) ? gval[j] : -1e30;
-            cand[ncand + base + j] = uintBitsToFloat((j < m) ? gidx[j] : 0u);
+            cand[row_base + ncand + slice * k + j] =
+                uintBitsToFloat((j < m) ? gidx[j] : 0u);
         }
     }
 #endif

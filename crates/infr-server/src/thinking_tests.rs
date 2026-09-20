@@ -15,7 +15,8 @@ impl ChatGenerator for TemplateGen {
         tools: Option<&serde_json::Value>,
         _tool_choice: Option<&str>,
         params: &GenParams,
-        _cancel: &AtomicBool,
+        _cancel: &Arc<AtomicBool>,
+        _progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome> {
         // The production generator uses OaiRenderer over a GGUF. This adapter feeds the same raw

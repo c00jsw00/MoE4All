@@ -137,8 +137,14 @@ pub struct RequestCtx {
     /// Latched by [`abort`](Self::abort) from inside a streaming callback (the server's
     /// stop-sequence matcher); polled once per decoded token by the decode loop.
     abort: std::sync::atomic::AtomicBool,
+    /// Frontend-owned cancellation latch. Unlike a text callback, this can fire while prefill is
+    /// running and is polled by the same natural work-boundary checks as `abort`.
+    external_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// This sequence's turn-taking baton on the GPU (`None` = sole user, e.g. `infr run`).
     gate: Option<std::sync::Arc<StepGate>>,
+    /// Optional frontend observer for exact token/context progress. Server requests install one;
+    /// run/bench/tests leave it absent and pay only the branch in [`Self::report_progress`].
+    progress: Option<infr_core::GenerationProgressCallback>,
 }
 
 impl RequestCtx {
@@ -147,7 +153,9 @@ impl RequestCtx {
         Self {
             sampling,
             abort: std::sync::atomic::AtomicBool::new(false),
+            external_abort: None,
             gate: None,
+            progress: None,
         }
     }
 
@@ -157,8 +165,29 @@ impl RequestCtx {
         Self {
             sampling,
             abort: std::sync::atomic::AtomicBool::new(false),
+            external_abort: None,
             gate: Some(gate),
+            progress: None,
         }
+    }
+
+    /// Attach live generation telemetry before this request enters the runner.
+    pub fn with_progress(
+        mut self,
+        progress: Option<infr_core::GenerationProgressCallback>,
+    ) -> Self {
+        self.progress = progress;
+        self
+    }
+
+    /// Attach the server request's cancellation latch so disconnects and deadlines are visible
+    /// during prefill as well as after the first decoded text callback.
+    pub fn with_external_abort(
+        mut self,
+        abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.external_abort = Some(abort);
+        self
     }
 
     pub fn sampling(&self) -> &RequestSampling {
@@ -173,9 +202,13 @@ impl RequestCtx {
         self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Polled by the decode loop once per token (one relaxed atomic load — no allocation, no lock).
+    /// Polled at prefill-chunk and decode-token boundaries (relaxed atomic loads, no lock).
     pub(crate) fn aborted(&self) -> bool {
         self.abort.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .external_abort
+                .as_ref()
+                .is_some_and(|abort| abort.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Take this sequence's turn on the GPU, blocking until the baton reaches it. `None` (no gate)
@@ -189,6 +222,14 @@ impl RequestCtx {
     /// chunks so decodes aren't starved, a sole one wants big chunks for prefill throughput.
     pub(crate) fn shares_gpu(&self) -> bool {
         self.gate.is_some()
+    }
+
+    /// Publish one cumulative progress snapshot. The callback itself owns presentation throttling;
+    /// the runner calls this only at natural work boundaries.
+    pub(crate) fn report_progress(&self, progress: infr_core::GenerationProgress) {
+        if let Some(observer) = &self.progress {
+            observer(progress);
+        }
     }
 }
 
@@ -251,7 +292,7 @@ impl StepGate {
 
     /// Block until this caller's ticket comes up. The returned [`GatePass`] releases the baton to
     /// the next ticket-holder on drop.
-    fn enter(&self) -> GatePass<'_> {
+    pub(crate) fn enter(&self) -> GatePass<'_> {
         let mut g = self.inner.lock().expect("step gate poisoned");
         let ticket = g.next;
         g.next += 1;
@@ -396,6 +437,55 @@ impl Penalties {
                 self.recent.pop_front();
             }
         }
+    }
+}
+
+/// Sampling state owned by one lane of a layer-synchronous decode batch. It reuses the ordinary
+/// sampler, RNG and penalties so batching changes graph shape, not token-selection semantics.
+pub(crate) struct ParallelSampler {
+    sampler: Sampler,
+    rng: u64,
+    penalties: Option<Penalties>,
+}
+
+impl ParallelSampler {
+    pub(crate) fn new(req: &RequestCtx, cfg: &infr_core::config::SamplingCfg) -> Self {
+        Self {
+            sampler: Sampler::resolve(Some(req), cfg),
+            rng: resolve_seed(Some(req), cfg),
+            penalties: Penalties::resolve(Some(req)),
+        }
+    }
+
+    pub(crate) fn can_gpu_argmax(&self) -> bool {
+        (self.sampler.temp <= 0.0 || self.sampler.top_k == 1) && self.penalties.is_none()
+    }
+
+    /// Whether a one-row parallel graph may bake `graph_sampler` into `Op::Sample`. The graph is
+    /// built from the scheduler driver's `RequestCtx`, so a surviving peer with request-local
+    /// overrides must fall back to host sampling unless its effective parameters are identical.
+    pub(crate) fn can_gpu_sample_with(&self, graph_sampler: Sampler) -> bool {
+        self.sampler.temp > 0.0
+            && self.penalties.is_none()
+            && self.sampler.temp.to_bits() == graph_sampler.temp.to_bits()
+            && self.sampler.top_k == graph_sampler.top_k
+            && self.sampler.top_p.to_bits() == graph_sampler.top_p.to_bits()
+    }
+
+    /// Draw from this lane's own stream for a device-side inverse-CDF sample.
+    pub(crate) fn next_uniform(&mut self) -> f32 {
+        next_uniform(&mut self.rng)
+    }
+
+    pub(crate) fn sample(&mut self, logits: &mut [f32]) -> u32 {
+        if let Some(penalties) = self.penalties.as_ref() {
+            penalties.apply(logits);
+        }
+        let token = sample_logits(logits, self.sampler, &mut self.rng);
+        if let Some(penalties) = self.penalties.as_mut() {
+            penalties.observe(token);
+        }
+        token
     }
 }
 
@@ -793,6 +883,19 @@ mod tests {
         assert!(!abort_requested(None));
     }
 
+    #[test]
+    fn frontend_abort_latch_is_observed_at_runner_boundaries() {
+        let frontend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let req = RequestCtx::new(cfg(0.0, 42)).with_external_abort(frontend.clone());
+
+        assert!(!abort_requested(Some(&req)));
+        frontend.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            abort_requested(Some(&req)),
+            "a frontend disconnect must reach existing prefill/decode abort checks"
+        );
+    }
+
     /// `seed: 42` must reproduce byte-identically no matter how many other sequences are in flight.
     /// Each sequence carries its OWN xorshift state, so interleaving another sequence's draws
     /// between two of ours cannot perturb our stream.
@@ -830,6 +933,59 @@ mod tests {
             alone, interleaved,
             "a seeded sequence must draw the same tokens whether or not it shares the engine"
         );
+    }
+
+    #[test]
+    fn parallel_sampler_matches_the_ordinary_host_sampler() {
+        let request = RequestCtx::new(RequestSampling {
+            temp: Some(0.8),
+            top_k: Some(12),
+            top_p: Some(0.9),
+            seed: Some(42),
+            ..Default::default()
+        });
+        let config = scfg();
+        let sampler = Sampler::resolve(Some(&request), &config);
+        let mut rng = resolve_seed(Some(&request), &config);
+        let mut parallel = ParallelSampler::new(&request, &config);
+        let logits: Vec<f32> = (0..96)
+            .map(|index| (index as f32 * 0.173).sin() * 3.0)
+            .collect();
+
+        for step in 0..32 {
+            let expected = sample_logits(&logits, sampler, &mut rng);
+            let mut row = logits.clone();
+            assert_eq!(
+                parallel.sample(&mut row),
+                expected,
+                "batched lane diverged from the ordinary sampler at step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_row_gpu_sampling_keeps_lane_parameters_and_rng() {
+        let req = RequestCtx::new(cfg(1.0, 42));
+        let baked = Sampler::resolve(Some(&req), &scfg());
+        let mut lane = ParallelSampler::new(&req, &scfg());
+        assert!(lane.can_gpu_sample_with(baked));
+
+        let mut expected_rng = resolve_seed(Some(&req), &scfg());
+        assert_eq!(lane.next_uniform(), next_uniform(&mut expected_rng));
+
+        assert!(!lane.can_gpu_sample_with(Sampler {
+            top_p: 0.9,
+            ..baked
+        }));
+
+        let penalized = RequestCtx::new(RequestSampling {
+            temp: Some(1.0),
+            seed: Some(42),
+            presence_penalty: 0.25,
+            ..Default::default()
+        });
+        let penalized_baked = Sampler::resolve(Some(&penalized), &scfg());
+        assert!(!ParallelSampler::new(&penalized, &scfg()).can_gpu_sample_with(penalized_baked));
     }
 
     /// Penalties are per-sequence state (their token history is), and a sequence that sets none must

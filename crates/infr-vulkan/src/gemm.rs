@@ -2613,6 +2613,26 @@ pub(crate) fn silu_scale_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/silu_scale.spv"))))
 }
+/// SPIR-V for standalone GELU used by the vision FFN and merger.
+pub(crate) fn gelu_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/gelu.spv"))))
+}
+/// SPIR-V for Qwen3-VL vision RoPE.
+pub(crate) fn rope2d_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/rope2d.spv"))))
+}
+/// SPIR-V for fused QK-norm and interleaved multimodal RoPE.
+pub(crate) fn qk_norm_rope_mrope_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qk_norm_rope_mrope.spv"
+        )))
+    })
+}
 /// SPIR-V for Qwen3.8's gated residual stream collapse.
 pub(crate) fn qwen_hc_mix_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -3331,6 +3351,11 @@ qsa_spv!(qsa_indexer_topk_hist_spv, "qsa_indexer_topk_hist");
 qsa_spv!(qsa_indexer_topk_select_spv, "qsa_indexer_topk_select");
 qsa_spv!(qsa_indexer_topk_collect_spv, "qsa_indexer_topk_collect");
 qsa_spv!(qsa_indexer_compress_seg_spv, "qsa_indexer_compress_seg");
+qsa_spv!(qsa_indexer_compress_mrope_spv, "qsa_indexer_compress_mrope");
+qsa_spv!(
+    qsa_indexer_compress_mrope_seg_spv,
+    "qsa_indexer_compress_mrope_seg"
+);
 qsa_spv!(qsa_indexer_score_seg_spv, "qsa_indexer_score_seg");
 qsa_spv!(
     qsa_indexer_score_decode8_seg_spv,

@@ -460,7 +460,7 @@ impl Pager {
             *self.pinned.entry(id).or_insert(0) += 1;
             return Some(Resolution::Hit { slot });
         }
-        let (slot, evicted) = self.take_slot_opt()?;
+        let (slot, evicted) = self.take_slot_opt(true)?;
         self.epoch.insert(id, self.cur_epoch);
         self.stats.misses += 1;
         self.resident.insert(id, slot);
@@ -678,6 +678,24 @@ impl Pager {
         Resolution::Miss { slot, evicted }
     }
 
+    /// Speculatively admit `id` at the cold end without changing demand statistics.
+    ///
+    /// A resident prediction keeps its exact LRU position. Both hits and successful admissions
+    /// join the current batch epoch, so later predictions cannot evict current-dispatch weights or
+    /// an earlier prediction. `None` means every remaining slot is protected; speculative work
+    /// simply stops instead of weakening the within-batch safety invariant.
+    pub fn prefetch_cold(&mut self, id: BlockId) -> Option<Resolution> {
+        if let Some(&slot) = self.resident.get(&id) {
+            self.epoch.insert(id, self.cur_epoch);
+            return Some(Resolution::Hit { slot });
+        }
+        let (slot, evicted) = self.take_slot_opt(false)?;
+        self.epoch.insert(id, self.cur_epoch);
+        self.resident.insert(id, slot);
+        self.push_front_lru(slot, id);
+        Some(Resolution::Miss { slot, evicted })
+    }
+
     /// Cold-path counterpart of [`Self::take_slot`]. Within one batch it resumes from the node
     /// after the previous victim instead of restarting at `lru_head`: nodes it passes are current-
     /// epoch protected, the victim is removed, and newly admitted cold blocks are inserted before
@@ -746,7 +764,7 @@ impl Pager {
     /// A free slot, evicting if none remain, or `None` when every resident block is protected
     /// (pinned, or touched by the current batch). [`Self::take_slot`] is the infallible form the
     /// unpinned callers use.
-    fn take_slot_opt(&mut self) -> Option<(u32, Option<BlockId>)> {
+    fn take_slot_opt(&mut self, count_eviction: bool) -> Option<(u32, Option<BlockId>)> {
         if let Some(s) = self.free.pop() {
             return Some((s, None));
         }
@@ -780,7 +798,9 @@ impl Pager {
         // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
         // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.
         self.epoch.remove(&victim);
-        self.stats.evictions += 1;
+        if count_eviction {
+            self.stats.evictions += 1;
+        }
         Some((vslot, Some(victim)))
     }
 
@@ -1178,6 +1198,48 @@ mod tests {
         for id in [7u32, 8, 9] {
             assert!(p.slot_of(id).is_some(), "batch sibling {id} was evicted");
         }
+    }
+
+    #[test]
+    fn cold_prefetch_preserves_order_safety_and_demand_stats() {
+        let mut p = Pager::new(3);
+        p.begin_batch();
+        for id in [1u32, 2, 3] {
+            p.touch(id);
+        }
+
+        p.begin_batch();
+        p.touch(3); // current dispatch protects 3
+        let before = p.stats();
+        assert_eq!(p.lru_order(), vec![1, 2, 3]);
+
+        assert!(matches!(p.prefetch_cold(2), Some(Resolution::Hit { .. })));
+        assert_eq!(p.lru_order(), vec![1, 2, 3], "a predicted hit stays put");
+        assert!(matches!(
+            p.prefetch_cold(4),
+            Some(Resolution::Miss {
+                evicted: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(p.lru_order(), vec![4, 2, 3]);
+        assert_eq!(
+            p.prefetch_cold(5),
+            None,
+            "current demand and admitted predictions exhaust safe victims"
+        );
+        let after = p.stats();
+        assert_eq!(
+            (after.hits, after.misses, after.evictions),
+            (before.hits, before.misses, before.evictions),
+            "speculation must not pollute demand cache statistics"
+        );
+
+        p.begin_batch();
+        let hits = p.stats().hits;
+        assert!(matches!(p.touch(4), Resolution::Hit { .. }));
+        assert_eq!(p.stats().hits, hits + 1);
+        assert_eq!(p.lru_order(), vec![2, 3, 4]);
     }
 
     #[test]

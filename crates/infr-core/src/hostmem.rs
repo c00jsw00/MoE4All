@@ -81,6 +81,23 @@ pub fn total_bytes() -> Option<u64> {
     })
 }
 
+/// Bytes the current process may still commit before the system commit limit is reached.
+///
+/// Windows/WDDM charges Vulkan device-memory allocations against this limit even when the bytes
+/// live in dedicated VRAM. Callers that allocate a large host arena after their Vulkan heaps are
+/// committed therefore need the raw commit headroom, independently from [`available_bytes`]'s
+/// physical-RAM minimum. Other platforms do not need this WDDM-specific second ceiling.
+pub fn commit_available_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        Some(windows_memory_status()?.ullAvailPageFile)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 fn platform_total_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -150,6 +167,27 @@ fn windows_process_resident_bytes() -> Option<u64> {
         GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb).ok()?;
     }
     Some(counters.WorkingSetSize as u64)
+}
+
+/// Ask Windows to evict clean pages from this process's working set at a load-phase boundary.
+///
+/// The Vulkan loader touches GGUF source pages while uploading fixed weights. Those pages are no
+/// longer needed once the upload queue is drained, but Windows may otherwise keep them resident
+/// while the anonymous MoE host arena is filled. This is deliberately an explicit one-shot hook:
+/// calling it after the host arena exists would evict useful expert pages too. Other platforms do
+/// nothing and preserve their existing VM behaviour.
+pub fn trim_reclaimable_working_set() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+        use windows::Win32::System::Threading::GetCurrentProcess;
+
+        unsafe { EmptyWorkingSet(GetCurrentProcess()).is_ok() }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -593,6 +631,7 @@ mod tests {
             status.ullTotalPhys
         );
         assert_eq!(total_bytes(), Some(status.ullTotalPhys));
+        assert_eq!(commit_available_bytes(), Some(status.ullAvailPageFile));
         assert!(
             avail <= status.ullAvailPageFile,
             "available {avail} exceeds commit headroom {}",

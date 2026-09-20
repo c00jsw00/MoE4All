@@ -210,6 +210,21 @@ spills KV to system RAM when VRAM runs out. The two `_mb` path names and their
 `INFR_*_MB` environment aliases are frozen compatibility spellings; their numeric
 values have always represented MiB.
 
+`kv.session_cache_dir` opt-in enables disk-backed idle conversations for dynamic
+Q8 Vulkan KV on Qwen3.5/3.6/3.8. A free slot is streamed to one checksummed file
+after `kv.session_idle_secs` (default 120), releasing its dynamic VRAM segments;
+a later request whose token prefix matches restores it instead of re-prefilling
+the saved prefix. `kv.session_cache_max` caps all `.infrkv` files under the root
+directory (default `5GiB`, absolute sizes only), and
+`kv.session_cache_ttl_hours` removes old files (default 24; 0 disables age
+expiry). The environment aliases are `INFR_KV_SESSION_CACHE_DIR`,
+`INFR_KV_SESSION_IDLE_SECS`, `INFR_KV_SESSION_CACHE_MAX`, and
+`INFR_KV_SESSION_CACHE_TTL_HOURS`. The feature is off when the directory is
+unset or the size cap is zero. Cache files include token IDs and model state, so
+the directory should be private. `--parallel` continues to mean simultaneously
+active resident slots; cold sessions extend retained history, not compute
+parallelism.
+
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),
 `ring` overrides the upload staging ring, `stats` prints per-pool
@@ -276,23 +291,34 @@ all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 gates `/v1/chat/completions`, `/v1/embeddings`, and `/v1/models`, never `/health`),
 `max_tokens_cap`, `request_timeout_secs` (per-request wall-clock deadline in
 seconds; `0`, the default, means no deadline — a deadline truncates a legitimate
-slow reply, so it is opt-in), and `stats_interval_secs` (`INFR_SERVE_STATS_SECS`
-— how often the server logs its throughput line, default `5`; `0` switches the
-line off). `shutdown_file` (`INFR_SHUTDOWN_FILE`) is an optional supervisor IPC
+slow reply, so it is opt-in), and `stats_interval_secs` (`INFR_SERVE_STATS_SECS`,
+which controls how often the server logs aggregate throughput and per-request progress,
+default `5`; `0` switches periodic lines off). `shutdown_file`
+(`INFR_SHUTDOWN_FILE`) is an optional supervisor IPC
 path: creating that file requests the same graceful drain as SIGTERM, including
 during model loading. `embedding_runner` (`INFR_EMBEDDING_RUNNER`) optionally
 selects the managed llama-server executable; otherwise INFR discovers a compatible
 runner from its own directory, `PATH`, or LM Studio. Per-request sampling is not
 here — it stays on the request.
 
-The throughput line is **activity-only**: an interval in which nothing happened
-emits nothing, so an idle server leaves a clean log and there is no heartbeat to
-mistake for load. Its `prefill_tps`/`decode_tps` are the whole server's tokens
-divided by the WALL time of that one interval — not cumulative, and not the same
-number as the per-request `prefill_tps`/`decode_tps` on the `request done` line,
-which are that one request's own speeds (`prompt_tokens / TTFT` and
-`gen_tokens / (total - TTFT)`). Request logging carries **counts only, never
-prompt text**.
+The aggregate `serve stats` line is **activity-only**: an interval in which
+nothing happened emits nothing, so an idle server leaves a clean log and there
+is no heartbeat to mistake for load. Its `prefill_tps`/`decode_tps` are the whole
+server's model tokens divided by the WALL time of that interval, not
+cumulative. Each active request also emits a throttled `request progress` line
+at completed Prefill chunks and during Decode. It reports the exact model-token
+`context_tokens/context_limit`, uncached Prefill progress, cached prefix,
+generated tokens (including reasoning), and request-local rates. Phase changes
+and `request done` are still logged when periodic lines are disabled. Request
+logging carries **counts only, never prompt text**.
+
+Successful non-streaming responses, and the terminal finish frame of streaming
+responses, include authoritative `usage` plus a llama.cpp-compatible `timings`
+object. `timings.context_n` is the full prompt plus completion depth,
+`context_limit` is the KV slot capacity, and `cached_n` separates reused prompt
+tokens from `prompt_n` tokens actually evaluated. Streaming metrics are emitted
+unconditionally so clients that do not send `stream_options.include_usage` do
+not silently record zero tokens.
 
 **`[hub]`** — model acquisition (`infr pull`, and the auto-pull `infr run` /
 `infr serve` do when a model is missing). `endpoint` (`INFR_HF_ENDPOINT`) selects the

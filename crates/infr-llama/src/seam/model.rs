@@ -848,6 +848,7 @@ impl SeamModel {
             turn_checkpoint,
             constraint,
             req,
+            None, // multimodal plan
         )?;
         // The cold init may have re-clamped the window against the memory the device reported free
         // once the weights were resident (`crate::seam::reclamp_ctx_to_live_room`), so the slot's
@@ -934,23 +935,22 @@ impl SeamModel {
 
     /// The PER-SLOT context for an N-slot `infr serve --parallel N` session.
     ///
-    /// N slots means N KV caches, so the derived per-slot window is the VRAM-fit window DIVIDED by
-    /// N: `min(n_ctx_train, kv_fit / N)`.
+    /// N slots means N independent KV/recurrent states. The fit solver prices all N states and one
+    /// shared runtime workspace directly, and returns the maximum PER-SLOT context.
     ///
     /// **The invariant this buys is "cannot OOM", NOT "same VRAM".** Total KV across the N slots is
-    /// `N * (kv_fit / N) = kv_fit` at most — i.e. it is bounded by exactly the same VRAM fit a
-    /// 1-slot server is bounded by, so raising `-np` can never overflow a device that `-np 1` fit.
+    /// `N * state(per_slot) + shared_runtime` stays inside the same device budget, so raising `-np`
+    /// cannot overflow a device that `-np 1` fit.
     /// It does NOT mean the footprint is unchanged: when the model's trained window sits BELOW the
-    /// fit (Qwen3-14B: trained 40960, fit ~84000 on a 24 GiB card), `-np 1` only allocates the
-    /// trained 40960 while `-np 4` allocates 4 x 21097 — more total KV, but still inside budget.
-    /// The visible cost of parallelism is the per-request window shrinking (40960 -> 21097 here).
+    /// fit, one slot may stop at the trained context while several slots collectively consume more
+    /// state, but never more than the common budget. The visible cost may be a smaller per-request
+    /// window.
     ///
     /// `want` (from `--ctx` / `INFR_CTX`, sharing `infr_core::parse_size`'s grammar):
     /// - `None` — derive as above.
     /// - `Bytes(c)` — an explicit token count, used VERBATIM per slot and never clamped (the Vulkan
     ///   alloc-time budget guard errors cleanly if `N * c` truly doesn't fit — the user asked).
-    /// - `Percent(f)` — `f` of the free-VRAM KV capacity IN TOTAL, split across the N slots
-    ///   (`kv_fit * f / N`), so `--ctx 50%` means the same total VRAM at any `-np`.
+    /// - `Percent(f)` — `f` of the fitted per-slot context after all N states have been priced.
     ///
     /// `n_slots <= 1` with `want: None` is EXACTLY [`clamp_default_ctx`](Self::clamp_default_ctx) —
     /// byte-for-byte today's default sizing, auto-q8 rung and all.
@@ -972,13 +972,13 @@ impl SeamModel {
         let Some(fit) = self.kv_fit_ctx(vk) else {
             return Ok(trained); // pure recurrent-state arch: no per-token KV to divide.
         };
-        let budget = match want {
+        let fitted = match want {
             Some(infr_core::SizeSpec::Percent(f)) => (fit as f64 * f) as usize,
             _ => fit,
         };
         // `MIN_SESSION_CTX` is the runner's own floor — below it a slot is useless and the alloc
         // guard's clear error is the better outcome than a silently-crippled window.
-        let per_slot = (budget / n_slots).max(crate::seam::MIN_SESSION_CTX);
+        let per_slot = fitted.max(crate::seam::MIN_SESSION_CTX);
         let ctx = trained.min(per_slot);
         if ctx < trained {
             tracing::warn!(
@@ -1399,6 +1399,7 @@ impl SeamModel {
                 None, // turn checkpoint boundary
                 None, // constraint
                 None, // req: bench is a sole sequence — env sampling, no gate
+                None, // multimodal plan
             )?;
             Ok(stats)
         };
@@ -1916,7 +1917,9 @@ impl SeamModel {
         .map(|_| ())
         .map_err(|e| match e {
             infr_chat::TemplateError::NoTemplate => no_template_err(),
-            e @ infr_chat::TemplateError::Render(_) => anyhow::Error::new(e),
+            e @ (infr_chat::TemplateError::Render(_) | infr_chat::TemplateError::Vision(_)) => {
+                anyhow::Error::new(e)
+            }
         })
     }
 
@@ -2095,6 +2098,8 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         Ok(())
     }
@@ -2145,6 +2150,8 @@ impl DiffusionGemmaCpuSession {
             }),
             None,
             None,
+            None,
+            None,
         )?;
         Ok(out_logits)
     }
@@ -2159,7 +2166,7 @@ impl DiffusionGemmaVulkanSession {
     /// into per-byte-size pools (see `infr_vulkan::pager`'s MoE-session doc).
     pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
-        let bind = crate::seam::vulkan_moe_binder(
+        let (bind, finish_fixed_allocations) = crate::seam::vulkan_moe_binder(
             &self.be,
             &model.gguf,
             &model.cfg,
@@ -2187,6 +2194,8 @@ impl DiffusionGemmaVulkanSession {
             None,
             None,
             None,
+            None,
+            finish_fixed_allocations.as_deref(),
             None,
         )?;
         // Once per prefill (a denoise step would print per step — far too noisy).
@@ -2220,7 +2229,7 @@ impl DiffusionGemmaVulkanSession {
         // The shared placement-aware binder (see `prefill`): only ever CALLED when this denoise
         // is the session's first load (no prior `prefill` — a direct-denoise test), where it must
         // make the same placement decision prefill would have.
-        let bind = crate::seam::vulkan_moe_binder(
+        let (bind, finish_fixed_allocations) = crate::seam::vulkan_moe_binder(
             &self.be,
             &model.gguf,
             &model.cfg,
@@ -2257,6 +2266,8 @@ impl DiffusionGemmaVulkanSession {
             }),
             None,
             None,
+            finish_fixed_allocations.as_deref(),
+            None,
         )?;
         Ok(match reduced {
             Some(r) => crate::seam::DenoiseOutcome::Reduced(r),
@@ -2291,6 +2302,7 @@ impl DiffusionGemmaMetalSession {
             |_| {},
             &mut self.state,
             self.max_ctx,
+            None,
             None,
             None,
             None,
@@ -2340,6 +2352,8 @@ impl DiffusionGemmaMetalSession {
                 sample_temp_inv: 0.0,
                 reduced: &mut reduced,
             }),
+            None,
+            None,
             None,
         )?;
         Ok(out_logits)

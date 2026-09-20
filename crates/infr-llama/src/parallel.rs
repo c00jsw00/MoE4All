@@ -2,45 +2,163 @@
 //!
 //! # What this is (and what it is not)
 //!
-//! It is **interleaved concurrent generation**: N sequences are in flight at once, each on its own
-//! thread with its own KV slot, and they take turns on the GPU at TOKEN granularity via a fair
-//! round-robin baton ([`crate::sampling::StepGate`]). A request is never head-of-line blocked
-//! behind another request's whole generation — only behind one step of it.
-//!
-//! It is **not** continuous batching. llama.cpp gathers the N active sequences' next tokens into
-//! ONE forward at `m = n_active`, which amortises the weight traffic across them and makes
-//! aggregate throughput RISE with concurrency. We cannot express that today: [`infr_core::Op`]'s
-//! `Attention` binds exactly one `k_cache`/`v_cache`, one `kv_len` and one `pos` for all its query
-//! rows, so N rows cannot attend to N different KV caches in one dispatch. Getting there needs a
-//! per-row `(cache, kv_len, pos)` indirection (a block table) plumbed through ~8 recorder attention
-//! entry points and ~12 Vulkan shaders, plus the CPU/Metal backends, plus inverting this crate's
-//! monolithic `generate_dense_backend` into a per-step API. That is a real project, and it is the
-//! ONLY thing standing between this engine and the mrow-kernel throughput win.
-//!
-//! So: aggregate throughput here is roughly FLAT in N (each sequence still re-streams the whole
-//! weight matrix for its own decode step). What N buys is *fairness and latency* — 4 agent tool
-//! calls finish in ~the time of the slowest, not the sum. That is the difference between usable and
-//! unusable for a fan-out coding agent, and it is an honest fraction of the win.
+//! Every sequence owns one KV slot. Qwen3.8 text requests register with one persistent compute
+//! worker before tokenization, then enqueue their prepared task and remain under that scheduler
+//! through completion; no request thread doubles as the cohort leader. Decode rows run
+//! layer-synchronously. Up to 96 uncached prompt tokens advance as teacher-forced rows in the same
+//! Decode-LRU graphs; longer prompts share the configured ubatch in one exclusive Prefill-ring
+//! phase before decode resumes. Stateless work and paged expert traffic are shared while every
+//! sequence retains independent positions, KV/recurrent state and sampling. Dense/sparse QSA rows
+//! form compatible subgroups but never fall back to independent request loops. Other architectures
+//! and constrained generation retain the established interleaved path through
+//! [`crate::sampling::StepGate`].
 //!
 //! # VRAM: how `-np` interacts with `--ctx`
 //!
-//! N slots means N KV caches. The per-slot context is therefore `min(n_ctx_train, kv_fit_ctx / N)`
-//! by default, so the N slots TOGETHER are bounded by exactly the VRAM fit that bounds one slot:
-//! raising `-np` can never OOM a device that `-np 1` fit. (It is NOT the same footprint — when the
-//! trained window is below the fit, `-np 4` does allocate more total KV than `-np 1`; what it
-//! cannot do is exceed the budget. The visible cost is the per-request window shrinking.) An
+//! N slots means N independent KV/recurrent states. The fit solver prices all N states plus one
+//! shared runtime workspace and returns the maximum per-slot context, so raising `-np` cannot OOM
+//! a device that `-np 1` fit. (It is NOT the same footprint — when the trained window is below the
+//! fit, `-np 4` may allocate more total state than `-np 1`; what it cannot do is exceed the budget.
+//! The visible cost can be a smaller per-request window.) An
 //! explicit `--ctx C` is used verbatim per slot, and the Vulkan alloc-time budget guard is left to
 //! fail it cleanly if `N * C` truly doesn't fit.
 //!
 //! Slots are forked EAGERLY at startup (weights are shared through `Arc<SeamWeights>`; a fork costs
 //! only its own KV + IO buffers). That means a VRAM refusal happens at boot with a clear message,
 //! never halfway through serving.
+//!
+//! When `kv.session_cache_dir` is explicitly set, a background worker streams idle dynamic Q8 KV
+//! state to checksummed files and releases its physical 32K segments. A later prefix match restores
+//! that state into any free resident slot. This extends the number of retained conversations; it
+//! does not alter the scheduler policy described above.
 
-use crate::sampling::{RequestCtx, StepGate};
+use crate::sampling::{ParallelSampler, RequestCtx, RequestSampling, StepGate};
 use crate::seam::SeamKv;
+use crate::session_cache::SessionCache;
 use crate::{Config, GenStats, SeamModel};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const DECODE_BATCH_WAIT: Duration = Duration::from_secs(1);
+const PREFILL_COHORT_WAIT: Duration = Duration::from_millis(50);
+const MAX_DECODE_BATCH: usize = 8;
+const SHORT_PREFILL_TOKENS: usize = 96;
+
+/// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
+/// depend on the optional vision crate.
+#[derive(Clone)]
+pub struct MultimodalEmbedding {
+    pub values: Arc<Vec<f32>>,
+    pub grid_nx: usize,
+    pub grid_ny: usize,
+    pub fingerprint: [u8; 32],
+}
+
+type MultimodalKey = [u8; 32];
+
+fn multimodal_key(images: &[MultimodalEmbedding]) -> MultimodalKey {
+    let mut hash = Sha256::new();
+    hash.update((images.len() as u64).to_le_bytes());
+    for image in images {
+        hash.update(image.fingerprint);
+        hash.update((image.grid_nx as u64).to_le_bytes());
+        hash.update((image.grid_ny as u64).to_le_bytes());
+    }
+    hash.finalize().into()
+}
+
+fn expand_multimodal_prompt(
+    tokens: &[u32],
+    image_pad_id: u32,
+    images: Vec<MultimodalEmbedding>,
+    n_embd: usize,
+) -> Result<(Vec<u32>, crate::seam::MropePlan)> {
+    let mut expanded = Vec::new();
+    let mut positions4 = Vec::new();
+    let mut spans = Vec::with_capacity(images.len());
+    let mut images = images.into_iter();
+    let mut used = 0usize;
+    let mut cursor = 0i32;
+
+    for &token in tokens {
+        if token != image_pad_id {
+            expanded.push(token);
+            positions4.extend_from_slice(&[cursor, cursor, cursor, 0]);
+            cursor = cursor
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("multimodal position overflow"))?;
+            continue;
+        }
+
+        let image = images.next().ok_or_else(|| {
+            anyhow!("rendered prompt contains more <|image_pad|> markers than image payloads")
+        })?;
+        used += 1;
+        let n_tokens = image
+            .grid_nx
+            .checked_mul(image.grid_ny)
+            .ok_or_else(|| anyhow!("image #{used} token grid overflows"))?;
+        let expected_values = n_tokens
+            .checked_mul(n_embd)
+            .ok_or_else(|| anyhow!("image #{used} embedding size overflows"))?;
+        if n_tokens == 0 || image.values.len() != expected_values {
+            return Err(anyhow!(
+                "image #{used} projector output has {} values for a {}x{} grid; expected {}",
+                image.values.len(),
+                image.grid_nx,
+                image.grid_ny,
+                expected_values
+            ));
+        }
+        let start = expanded.len();
+        for index in 0..n_tokens {
+            let y = i32::try_from(index / image.grid_nx)
+                .map_err(|_| anyhow!("image #{used} row exceeds i32"))?;
+            let x = i32::try_from(index % image.grid_nx)
+                .map_err(|_| anyhow!("image #{used} column exceeds i32"))?;
+            expanded.push(image_pad_id);
+            positions4.extend_from_slice(&[
+                cursor,
+                cursor
+                    .checked_add(y)
+                    .ok_or_else(|| anyhow!("image #{used} row position overflow"))?,
+                cursor
+                    .checked_add(x)
+                    .ok_or_else(|| anyhow!("image #{used} column position overflow"))?,
+                0,
+            ]);
+        }
+        let extent = i32::try_from(image.grid_nx.max(image.grid_ny))
+            .map_err(|_| anyhow!("image #{used} grid exceeds i32"))?;
+        cursor = cursor
+            .checked_add(extent)
+            .ok_or_else(|| anyhow!("image #{used} position overflow"))?;
+        spans.push(crate::seam::ImageSpanEmbeds {
+            start,
+            n_tokens,
+            embeds: image.values,
+        });
+    }
+    if images.next().is_some() {
+        return Err(anyhow!(
+            "request carries more image payloads than rendered <|image_pad|> markers"
+        ));
+    }
+    Ok((
+        expanded,
+        crate::seam::MropePlan {
+            prompt_pos4: positions4,
+            spans,
+            decode_base: cursor,
+        },
+    ))
+}
 
 /// Pure continuation-slot selection (the "this conversation continuing" case of [`checkout`], and
 /// the twin of `seam::model::SlotPool::pick`'s first arm). Given `(slot_idx, prefix_score,
@@ -71,6 +189,11 @@ struct Slot {
     busy: bool,
     /// LRU stamp.
     tick: u64,
+    /// Set only when the opt-in cold session cache is active. Ordinary serving does not read the
+    /// wall clock during slot selection or return.
+    idle_since: Option<Instant>,
+    /// Image identity for multimodal KV. `None` marks ordinary token-only state.
+    multimodal_key: Option<MultimodalKey>,
 }
 
 /// The N-slot pool. Deliberately a plain `Mutex` + `Condvar` rather than the sequential
@@ -84,14 +207,197 @@ struct Pool {
 
 /// A checked-out slot. Returns its KV to the pool on drop — including on error or panic, so a
 /// failed request can never permanently burn a slot.
+enum BatchEvent {
+    Progress {
+        progress: infr_core::GenerationProgress,
+    },
+    Token {
+        id: u32,
+        progress: infr_core::GenerationProgress,
+    },
+    Complete {
+        kv: SeamKv,
+        stats: GenStats,
+    },
+    Failed {
+        kv: SeamKv,
+        error: String,
+    },
+}
+
+impl BatchEvent {
+    fn into_kv(self) -> Option<SeamKv> {
+        match self {
+            Self::Progress { .. } | Self::Token { .. } => None,
+            Self::Complete { kv, .. } | Self::Failed { kv, .. } => Some(kv),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchPhase {
+    Unprepared,
+    ShortPrefill,
+    LongPrefill,
+    Decode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchedulerMode {
+    DecodeRows,
+    ShortPrefillRows,
+    DecodeAndShortPrefillRows,
+    LongPrefill,
+}
+
+fn scheduler_mode(phases: impl IntoIterator<Item = BatchPhase>) -> Option<SchedulerMode> {
+    let mut decode = false;
+    let mut short_prefill = false;
+    let mut any = false;
+    for phase in phases {
+        any = true;
+        match phase {
+            BatchPhase::Unprepared => unreachable!("scheduler classified an unprepared task"),
+            BatchPhase::LongPrefill => return Some(SchedulerMode::LongPrefill),
+            BatchPhase::ShortPrefill => short_prefill = true,
+            BatchPhase::Decode => decode = true,
+        }
+    }
+    match (any, decode, short_prefill) {
+        (false, _, _) => None,
+        (true, true, true) => Some(SchedulerMode::DecodeAndShortPrefillRows),
+        (true, true, false) => Some(SchedulerMode::DecodeRows),
+        (true, false, true) => Some(SchedulerMode::ShortPrefillRows),
+        (true, false, false) => unreachable!("a prepared batch has a known phase"),
+    }
+}
+
+fn phase_for_remaining_prefill(tokens: usize) -> BatchPhase {
+    if tokens == 0 {
+        BatchPhase::Decode
+    } else if tokens <= SHORT_PREFILL_TOKENS {
+        BatchPhase::ShortPrefill
+    } else {
+        BatchPhase::LongPrefill
+    }
+}
+
+struct BatchWork {
+    slot: usize,
+    kv: Option<SeamKv>,
+    prompt: Vec<u32>,
+    prompt_end: usize,
+    max_new: usize,
+    generated: usize,
+    stats: GenStats,
+    phase: BatchPhase,
+    prefill_start: usize,
+    checkpoint_boundary: Option<usize>,
+    turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
+    finished: bool,
+    sampling: RequestSampling,
+    sampler: Option<ParallelSampler>,
+    channels: Option<BatchChannels>,
+}
+
+impl BatchWork {
+    fn kv(&self) -> &SeamKv {
+        self.kv.as_ref().expect("batch work owns a KV slot")
+    }
+
+    fn remaining_prefill(&self) -> usize {
+        self.prompt_end
+            .saturating_sub(1)
+            .saturating_sub(self.kv().cached_len())
+    }
+
+    fn next_qsa_position(&self) -> usize {
+        self.kv().cached_len() + 1
+    }
+}
+
+struct BatchChannels {
+    events: SyncSender<BatchEvent>,
+    acknowledgements: Receiver<bool>,
+}
+
+#[derive(Default)]
+struct DecodeBatchQueue {
+    /// Eligible requests registered before tokenization/checkout but not yet ready for scheduling.
+    arriving: usize,
+    waiting: VecDeque<BatchWork>,
+}
+
+struct BatchRegistration<'a> {
+    engine: &'a ParallelSeam,
+    active: bool,
+}
+
+impl<'a> BatchRegistration<'a> {
+    fn new(engine: &'a ParallelSeam) -> Self {
+        engine
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned")
+            .arriving += 1;
+        Self {
+            engine,
+            active: true,
+        }
+    }
+
+    fn arrive(&mut self, queue: &mut DecodeBatchQueue) {
+        debug_assert!(self.active);
+        queue.arriving = queue.arriving.saturating_sub(1);
+        self.active = false;
+    }
+}
+
+impl Drop for BatchRegistration<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut queue = match self.engine.decode_batch.lock() {
+            Ok(queue) => queue,
+            Err(error) => error.into_inner(),
+        };
+        queue.arriving = queue.arriving.saturating_sub(1);
+        drop(queue);
+        self.engine.decode_ready.notify_all();
+    }
+}
+
 struct SlotGuard<'a> {
     engine: &'a ParallelSeam,
     idx: usize,
     kv: Option<SeamKv>,
+    detached: bool,
+    multimodal_key: Option<MultimodalKey>,
+}
+
+impl SlotGuard<'_> {
+    fn detach(&mut self) -> SeamKv {
+        self.detached = true;
+        self.kv.take().expect("checked-out slot has KV")
+    }
+
+    fn reattach(&mut self, kv: SeamKv) {
+        self.kv = Some(kv);
+        self.detached = false;
+    }
+
+    fn abandon_detached(&mut self) {
+        self.kv = None;
+        self.detached = false;
+    }
 }
 
 impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
         let mut p = match self.engine.pool.lock() {
             Ok(p) => p,
             Err(e) => e.into_inner(),
@@ -102,21 +408,190 @@ impl Drop for SlotGuard<'_> {
         s.kv = self.kv.take();
         s.busy = false;
         s.tick = tick;
+        s.multimodal_key = self.multimodal_key;
+        if self.engine.session_cache.is_some() {
+            s.idle_since = Some(Instant::now());
+        }
         drop(p);
-        self.engine.freed.notify_one();
+        if self.engine.session_cache.is_some() {
+            // Both a queued request and the deadline worker may be asleep on this condition.
+            self.engine.freed.notify_all();
+        } else {
+            self.engine.freed.notify_one();
+        }
     }
 }
 
-/// The concurrent seam engine. `Sync`: `&self` is all a request needs, so N of them run at once.
+struct ColdWorker {
+    stop: Arc<AtomicBool>,
+    wake: Arc<Condvar>,
+    thread: Option<JoinHandle<()>>,
+}
+
+struct SchedulerWorker {
+    stop: Arc<AtomicBool>,
+    wake: Arc<Condvar>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for SchedulerWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!("parallel scheduler thread panicked while shutting down");
+            }
+        }
+    }
+}
+
+impl Drop for ColdWorker {
+    fn drop(&mut self) {
+        tracing::info!("cold KV cache: flushing resident sessions before shutdown");
+        self.stop.store(true, Ordering::Release);
+        self.wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!("cold KV maintenance thread panicked while shutting down");
+            } else {
+                tracing::info!("cold KV cache: shutdown flush complete");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cold_session_worker(
+    pool: Arc<Mutex<Pool>>,
+    wake: Arc<Condvar>,
+    cache: Arc<Mutex<SessionCache>>,
+    backend: Arc<infr_vulkan::VulkanBackend>,
+    gate: Option<Arc<StepGate>>,
+    model_cfg: Config,
+    idle_for: Duration,
+    stop: Arc<AtomicBool>,
+) {
+    loop {
+        let selected = {
+            let mut pool_guard = match pool.lock() {
+                Ok(pool) => pool,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            loop {
+                let shutting_down = stop.load(Ordering::Acquire);
+                let now = Instant::now();
+                let mut next_wait: Option<Duration> = None;
+                let mut candidate: Option<usize> = None;
+                for (index, slot) in pool_guard.slots.iter().enumerate() {
+                    let Some(idle_since) = slot.idle_since else {
+                        continue;
+                    };
+                    if slot.busy
+                        || slot.multimodal_key.is_some()
+                        || slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0)
+                    {
+                        continue;
+                    }
+                    let elapsed = now.saturating_duration_since(idle_since);
+                    if shutting_down || elapsed >= idle_for {
+                        if candidate.is_none_or(|old| slot.tick < pool_guard.slots[old].tick) {
+                            candidate = Some(index);
+                        }
+                    } else {
+                        let remaining = idle_for - elapsed;
+                        next_wait = Some(next_wait.map_or(remaining, |old| old.min(remaining)));
+                    }
+                }
+                if let Some(index) = candidate {
+                    pool_guard.slots[index].busy = true;
+                    pool_guard.slots[index].idle_since = None;
+                    let kv = pool_guard.slots[index]
+                        .kv
+                        .take()
+                        .expect("cold candidate has a resident KV slot");
+                    break Some((index, kv, shutting_down));
+                }
+                if shutting_down {
+                    break None;
+                }
+                pool_guard = match next_wait {
+                    Some(timeout) => {
+                        wake.wait_timeout(pool_guard, timeout)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .0
+                    }
+                    None => wake
+                        .wait(pool_guard)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                };
+            }
+        };
+        let Some((index, mut kv, shutting_down)) = selected else {
+            break;
+        };
+
+        let _gate = gate.as_deref().map(StepGate::enter);
+        let mut cache = match cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let spill_failed = match cache.spill(&mut kv, backend.as_ref(), &model_cfg) {
+            Ok(true) => false,
+            Ok(false) => kv.cached_len() != 0,
+            Err(error) => {
+                tracing::warn!(
+                    slot = index,
+                    "cold KV idle spill failed; keeping the resident state: {error}"
+                );
+                true
+            }
+        };
+        if let Err(error) = cache.gc() {
+            tracing::warn!("cold KV cache maintenance failed: {error}");
+        }
+        drop(cache);
+        drop(_gate);
+
+        let mut pool_guard = match pool.lock() {
+            Ok(pool) => pool,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let slot = &mut pool_guard.slots[index];
+        slot.kv = Some(kv);
+        slot.busy = false;
+        // A failed final spill must not be selected forever while `ColdWorker::drop` waits to join.
+        let final_shutdown = shutting_down || stop.load(Ordering::Acquire);
+        slot.idle_since = (!final_shutdown || !spill_failed).then(Instant::now);
+        drop(pool_guard);
+        wake.notify_all();
+    }
+}
+
+/// The concurrent seam engine. Request threads own tokenization, streaming and one checked-out
+/// session; a persistent worker exclusively owns batched compute scheduling.
 pub struct ParallelSeam {
-    model: SeamModel,
-    vk: infr_vulkan::VulkanBackend,
-    pool: Mutex<Pool>,
+    /// Declared first so `Drop` joins both workers before model/backend fields drop.
+    scheduler_worker: Option<SchedulerWorker>,
+    cold_worker: Option<ColdWorker>,
+    model: Arc<SeamModel>,
+    vk: Arc<infr_vulkan::VulkanBackend>,
+    pool: Arc<Mutex<Pool>>,
     /// Signalled when a slot is returned — a queued request waits here.
-    freed: Condvar,
+    freed: Arc<Condvar>,
+    decode_batch: Arc<Mutex<DecodeBatchQueue>>,
+    /// Wakes the dedicated scheduler when a registered request becomes ready or abandons arrival.
+    decode_ready: Arc<Condvar>,
+    /// Set only when the scheduler has new work to admit. The runner polls it once per
+    /// aggregated token; an empty steady-state decode takes no queue lock.
+    batch_interrupt: Arc<AtomicBool>,
     /// The GPU baton. `None` when `n_slots == 1`: a lone sequence must not pay even a mutex per
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
+    /// Opt-in disk-backed conversation catalog. `None` keeps the pre-existing checkout path
+    /// byte-for-byte isolated from file I/O and cache locking.
+    session_cache: Option<Arc<Mutex<SessionCache>>>,
+    session_idle: Duration,
     max_ctx: usize,
     /// This model's OWN placement pins (pinned prefill chunk / auto-q8 KV — see
     /// [`crate::seam::PlacementPins`]). Per-engine so a multi-model host (`infr multi` runs N of
@@ -127,6 +602,24 @@ pub struct ParallelSeam {
 }
 
 impl ParallelSeam {
+    fn batch_decode_progress(
+        &self,
+        prompt_tokens: usize,
+        cached_prompt_tokens: usize,
+        completion_tokens: usize,
+    ) -> infr_core::GenerationProgress {
+        let cached_prompt_tokens = cached_prompt_tokens.min(prompt_tokens);
+        infr_core::GenerationProgress {
+            phase: infr_core::GenerationPhase::Decode,
+            prompt_tokens: prompt_tokens as u64,
+            cached_prompt_tokens: cached_prompt_tokens as u64,
+            prefill_tokens: prompt_tokens.saturating_sub(cached_prompt_tokens) as u64,
+            completion_tokens: completion_tokens as u64,
+            context_tokens: prompt_tokens.saturating_add(completion_tokens) as u64,
+            context_limit: self.max_ctx as u64,
+        }
+    }
+
     /// Build an N-slot engine: upload the weights once (via a warmup generation on slot 0, which is
     /// also what compiles every lazily-built pipeline), then fork N-1 sibling slots off it.
     ///
@@ -175,32 +668,168 @@ impl ParallelSeam {
         // This engine's own placement pins, entered as the current scope for the whole
         // placement phase (the clamp inside `vulkan_slot_ctx` + the `init_slots` warmup, which is
         // where the binder pins the prefill chunk / auto-q8 KV). See `PlacementPins`.
-        let pins = Arc::new(crate::seam::PlacementPins::default());
+        let pins = Arc::new(crate::seam::PlacementPins::for_slots(n_slots));
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
+        let session_idle = Duration::from_secs(model.engine_cfg().kv.session_idle_secs);
         let mut engine = Self {
-            model,
-            vk,
-            pool: Mutex::new(Pool {
+            scheduler_worker: None,
+            cold_worker: None,
+            model: Arc::new(model),
+            vk: Arc::new(vk),
+            pool: Arc::new(Mutex::new(Pool {
                 slots: Vec::new(),
                 tick: 0,
-            }),
-            freed: Condvar::new(),
+            })),
+            freed: Arc::new(Condvar::new()),
+            decode_batch: Arc::new(Mutex::new(DecodeBatchQueue::default())),
+            decode_ready: Arc::new(Condvar::new()),
+            batch_interrupt: Arc::new(AtomicBool::new(false)),
             // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
+            session_cache: None,
+            session_idle,
             max_ctx,
             pins,
         };
         engine.init_slots(n_slots)?;
+        engine.init_session_cache()?;
         drop(scope);
+        engine.start_cold_worker()?;
+        engine.start_scheduler_worker()?;
         Ok(engine)
+    }
+
+    fn init_session_cache(&mut self) -> Result<()> {
+        if self.model.engine_cfg().kv.session_cache_dir.is_none() {
+            return Ok(());
+        }
+        let (supports_release, meta) = {
+            let pool = self.pool.lock().expect("fresh pool");
+            let kv = pool
+                .slots
+                .first()
+                .and_then(|slot| slot.kv.as_ref())
+                .ok_or_else(|| anyhow!("cold KV cache initialized before slot 0"))?;
+            (kv.can_release_session_state(), kv.session_state_meta())
+        };
+        if !supports_release {
+            return Err(anyhow!(
+                "kv.session_cache_dir requires dynamic segmented KV; use Qwen3.5/3.6/3.8 with Q8 KV and leave kv.dynamic enabled"
+            ));
+        }
+        self.session_cache = SessionCache::open(self.model.engine_cfg(), self.model.gguf(), &meta)?
+            .map(|cache| Arc::new(Mutex::new(cache)));
+        if self.session_cache.is_some() {
+            let now = Instant::now();
+            for slot in &mut self.pool.lock().expect("fresh pool").slots {
+                slot.idle_since = Some(now);
+            }
+        }
+        Ok(())
+    }
+
+    fn start_cold_worker(&mut self) -> Result<()> {
+        let Some(cache) = self.session_cache.as_ref().map(Arc::clone) else {
+            return Ok(());
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let pool = Arc::clone(&self.pool);
+        let wake = Arc::clone(&self.freed);
+        let backend = Arc::clone(&self.vk);
+        let gate = self.gate.as_ref().map(Arc::clone);
+        let model_cfg = self.model.config().clone();
+        let idle = self.session_idle;
+        let thread = std::thread::Builder::new()
+            .name("infr-kv-cold".into())
+            .spawn(move || {
+                cold_session_worker(
+                    pool,
+                    wake,
+                    cache,
+                    backend,
+                    gate,
+                    model_cfg,
+                    idle,
+                    worker_stop,
+                )
+            })
+            .context("start cold KV maintenance thread")?;
+        self.cold_worker = Some(ColdWorker {
+            stop,
+            wake: Arc::clone(&self.freed),
+            thread: Some(thread),
+        });
+        Ok(())
+    }
+
+    /// Build the shallow engine handle owned by the scheduler thread. It shares all model,
+    /// allocator and queue state but owns neither background worker, avoiding a self-reference.
+    fn scheduler_handle(&self) -> Self {
+        Self {
+            scheduler_worker: None,
+            cold_worker: None,
+            model: Arc::clone(&self.model),
+            vk: Arc::clone(&self.vk),
+            pool: Arc::clone(&self.pool),
+            freed: Arc::clone(&self.freed),
+            decode_batch: Arc::clone(&self.decode_batch),
+            decode_ready: Arc::clone(&self.decode_ready),
+            batch_interrupt: Arc::clone(&self.batch_interrupt),
+            gate: self.gate.as_ref().map(Arc::clone),
+            session_cache: self.session_cache.as_ref().map(Arc::clone),
+            session_idle: self.session_idle,
+            max_ctx: self.max_ctx,
+            pins: Arc::clone(&self.pins),
+        }
+    }
+
+    fn start_scheduler_worker(&mut self) -> Result<()> {
+        if self.gate.is_none() || !self.model.config().qwen4exp {
+            return Ok(());
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let wake = Arc::clone(&self.decode_ready);
+        let scheduler = self.scheduler_handle();
+        let thread = std::thread::Builder::new()
+            .name("infr-parallel".into())
+            .spawn(move || scheduler.scheduler_loop(worker_stop))
+            .context("start parallel scheduler thread")?;
+        self.scheduler_worker = Some(SchedulerWorker {
+            stop,
+            wake,
+            thread: Some(thread),
+        });
+        Ok(())
+    }
+
+    fn scheduler_loop(self, stop: Arc<AtomicBool>) {
+        let gate = self
+            .gate
+            .as_ref()
+            .expect("parallel scheduler requires a shared GPU gate")
+            .clone();
+        let req = RequestCtx::with_gate(crate::sampling::RequestSampling::default(), gate);
+        let _scope = crate::seam::PlacementScope::enter(Arc::clone(&self.pins));
+        while let Some(work) = self.wait_for_scheduler_work(stop.as_ref()) {
+            self.run_unified_batch(work, &req);
+        }
+        self.close_decode_batch(Some("parallel scheduler is shutting down"));
     }
 
     pub fn fork_embedding_backend(&self) -> Result<infr_vulkan::VulkanBackend> {
         self.vk
             .fork_embedding_client()
             .map_err(|error| anyhow!("derive unified Embedding backend: {error}"))
+    }
+
+    pub fn fork_vision_backend(&self) -> Result<infr_vulkan::VulkanBackend> {
+        self.vk
+            .fork_vision_client()
+            .map_err(|error| anyhow!("derive unified Vision backend: {error}"))
     }
 
     pub fn unified_vram_stats(&self) -> Option<infr_vulkan::unified::UnifiedVramStats> {
@@ -246,6 +875,7 @@ impl ParallelSeam {
                 Some(crate::seam::TurnCheckpoint::Enable),
                 None, // constraint
                 None, // req: startup, not a request — env sampling, no gate
+                None, // multimodal plan
             )
         })?;
         let mut slot0 = slot0.ok_or_else(|| anyhow!("warmup did not initialize a KV slot"))?;
@@ -258,24 +888,42 @@ impl ParallelSeam {
         // of forking off a garbage prefix.
         slot0.reset();
 
+        let preallocated = slot0.take_preallocated_siblings();
+        if !preallocated.is_empty() && preallocated.len() != n_slots.saturating_sub(1) {
+            return Err(anyhow!(
+                "startup materialized {} sibling slots, expected {}",
+                preallocated.len(),
+                n_slots.saturating_sub(1),
+            ));
+        }
+        let mut preallocated = preallocated.into_iter();
         let mut slots = Vec::with_capacity(n_slots);
         for i in 1..n_slots {
             // A fork shares the `Arc<SeamWeights>` — it costs only its own KV + IO buffers. If VRAM
             // refuses, say so HERE, at boot, with the two knobs that fix it. Never mid-request.
-            let kv = slot0
-                .fork(&self.vk, self.model.config(), self.model.engine_cfg())
-                .map_err(|e| {
-                    anyhow!(
-                        "could not allocate KV slot {}/{n_slots} at ctx {}: {e}\n\
-                     lower --parallel, or lower --ctx (each slot owns a full context of KV cache)",
-                        i + 1,
-                        self.max_ctx,
+            let kv = match preallocated.next() {
+                Some(kv) => kv,
+                None => slot0
+                    .fork(
+                        self.vk.as_ref(),
+                        self.model.config(),
+                        self.model.engine_cfg(),
                     )
-                })?;
+                    .map_err(|e| {
+                        anyhow!(
+                            "could not allocate KV slot {}/{n_slots} at ctx {}: {e}\n\
+                         lower --parallel, or lower --ctx (each slot owns a full context of KV cache)",
+                            i + 1,
+                            self.max_ctx,
+                        )
+                    })?,
+            };
             slots.push(Slot {
                 kv: Some(kv),
                 busy: false,
                 tick: 0,
+                idle_since: None,
+                multimodal_key: None,
             });
         }
         slots.insert(
@@ -284,9 +932,11 @@ impl ParallelSeam {
                 kv: Some(slot0),
                 busy: false,
                 tick: 0,
+                idle_since: None,
+                multimodal_key: None,
             },
         );
-        self.pool.get_mut().expect("fresh pool").slots = slots;
+        self.pool.lock().expect("fresh pool").slots = slots;
         tracing::info!(
             "slots: {n_slots} x {} ctx ready in {:.1}s",
             self.max_ctx,
@@ -335,6 +985,16 @@ impl ParallelSeam {
     /// recycled. So under load the prefix cache degrades gracefully (fewer candidate slots) rather
     /// than corrupting an in-flight sequence.
     fn checkout(&self, prompt: &[u32], req: &RequestCtx) -> Result<SlotGuard<'_>> {
+        if self.session_cache.is_some() {
+            self.checkout_with_cold_cache(prompt, req)
+        } else {
+            self.checkout_resident(prompt, req)
+        }
+    }
+
+    /// Original resident-only checkout path. Keeping it separate means an unset cold-cache path
+    /// does not add a file-cache mutex or wall-clock query to ordinary serving.
+    fn checkout_resident(&self, prompt: &[u32], req: &RequestCtx) -> Result<SlotGuard<'_>> {
         /// Seeding shorter prefixes than this isn't worth the copy submit.
         const MIN_SEED: usize = 16;
         let cfg: &Config = self.model.config();
@@ -348,16 +1008,25 @@ impl ParallelSeam {
                 p = self.freed.wait(p).expect("pool poisoned");
                 continue;
             }
-            let score = |s: &Slot| s.kv.as_ref().map_or(0, |k| k.prefix_score(prompt));
+            let score = |s: &Slot| {
+                if s.multimodal_key.is_some() {
+                    0
+                } else {
+                    s.kv.as_ref().map_or(0, |k| k.prefix_score(prompt))
+                }
+            };
             // 1. This conversation continuing: the free slot with the LONGEST reusable prefix among
             //    those the prompt extends (or equals) — not merely the first such slot (which would
             //    re-prefill more suffix). Pure decision, unit-tested via `pick_continuation`.
             let cont = pick_continuation(
                 free.iter().filter_map(|&i| {
-                    p.slots[i].kv.as_ref().and_then(|k| {
-                        k.continuation_prefix_len(prompt)
-                            .map(|prefix| (i, prefix, prefix))
-                    })
+                    (p.slots[i].multimodal_key.is_none())
+                        .then_some(p.slots[i].kv.as_ref())
+                        .flatten()
+                        .and_then(|k| {
+                            k.continuation_prefix_len(prompt)
+                                .map(|prefix| (i, prefix, prefix))
+                        })
                 }),
                 prompt.len(),
             );
@@ -374,7 +1043,7 @@ impl ParallelSeam {
             };
             // Seed the target with the best shared prefix among the other FREE slots (a common
             // system prompt), via a device-side KV copy instead of re-prefilling it.
-            if cont.is_none() {
+            if cont.is_none() && p.slots[target].multimodal_key.is_none() {
                 let best = free
                     .iter()
                     .copied()
@@ -397,7 +1066,7 @@ impl ParallelSeam {
                         let r = {
                             let _gp = req.gate_pass();
                             match dst.as_mut() {
-                                Some(dst) => dst.seed_from(&self.vk, cfg, ec, &src, best_s),
+                                Some(dst) => dst.seed_from(self.vk.as_ref(), cfg, ec, &src, best_s),
                                 None => Ok(()),
                             }
                         };
@@ -423,22 +1092,1047 @@ impl ParallelSeam {
             let tick = p.tick;
             p.slots[target].busy = true;
             p.slots[target].tick = tick;
-            let kv = p.slots[target].kv.take();
+            let incompatible = p.slots[target].multimodal_key.take().is_some();
+            let mut kv = p.slots[target].kv.take();
+            if incompatible {
+                if let Some(kv) = kv.as_mut() {
+                    kv.reset();
+                }
+            }
             return Ok(SlotGuard {
                 engine: self,
                 idx: target,
                 kv,
+                detached: false,
+                multimodal_key: None,
             });
         }
     }
 
+    /// Disk-extended slot checkout. Cold storage is deliberately serialized independently of the
+    /// slot pool: a target is reserved under `pool`, then all GPU/file work runs after that lock is
+    /// dropped. The maintenance thread handles timeout eviction independently.
+    fn checkout_with_cold_cache(&self, prompt: &[u32], req: &RequestCtx) -> Result<SlotGuard<'_>> {
+        let cache_mutex = self
+            .session_cache
+            .as_ref()
+            .expect("cold checkout requires a session cache");
+        let cfg: &Config = self.model.config();
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            let free = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .collect::<Vec<_>>();
+            if free.is_empty() {
+                pool = self.freed.wait(pool).expect("pool poisoned");
+                continue;
+            }
+            let continuation = pick_continuation(
+                free.iter().filter_map(|&index| {
+                    (pool.slots[index].multimodal_key.is_none())
+                        .then_some(pool.slots[index].kv.as_ref())
+                        .flatten()
+                        .and_then(|kv| {
+                            kv.continuation_prefix_len(prompt)
+                                .map(|prefix| (index, prefix, prefix))
+                        })
+                }),
+                prompt.len(),
+            );
+            let resident_prefix = continuation
+                .and_then(|index| {
+                    pool.slots[index]
+                        .kv
+                        .as_ref()
+                        .and_then(|kv| kv.continuation_prefix_len(prompt))
+                })
+                .unwrap_or(0);
+            let target = continuation.unwrap_or_else(|| {
+                *free
+                    .iter()
+                    .min_by_key(|&&index| {
+                        let slot = &pool.slots[index];
+                        let empty = slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0);
+                        (!empty, slot.tick)
+                    })
+                    .expect("free is non-empty")
+            });
+
+            pool.tick += 1;
+            let tick = pool.tick;
+            pool.slots[target].busy = true;
+            pool.slots[target].tick = tick;
+            pool.slots[target].idle_since = None;
+            let incompatible = pool.slots[target].multimodal_key.take().is_some();
+            let mut target_kv = pool.slots[target].kv.take();
+            drop(pool);
+
+            {
+                // One pass owns both the inference baton and the cache catalog. No other request
+                // can submit against a state buffer while it is being downloaded or restored.
+                let _gate = req.gate_pass();
+                let mut cache = match cache_mutex.lock() {
+                    Ok(cache) => cache,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if incompatible {
+                    if let Some(kv) = target_kv.as_mut() {
+                        kv.reset();
+                    }
+                }
+
+                let cold_prefix = cache.best_continuation_len(prompt);
+                let cold = (cold_prefix > resident_prefix && target_kv.is_some())
+                    .then(|| cache.take_best_continuation(prompt))
+                    .flatten();
+                if let (Some(entry), Some(kv)) = (cold, target_kv.as_mut()) {
+                    let mut released = false;
+                    if kv.cached_len() != 0 {
+                        match cache.spill(kv, self.vk.as_ref(), cfg) {
+                            Ok(true) => released = true,
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    slot = target,
+                                    "cold KV replacement spill failed; recycling the slot: {error}"
+                                );
+                                kv.reset();
+                            }
+                        }
+                    }
+                    if !released {
+                        released = kv.release_session_state(self.vk.as_ref(), cfg).is_ok()
+                            || kv.release_session_state(self.vk.as_ref(), cfg).is_ok();
+                    }
+                    if released {
+                        match cache.restore(entry, kv, self.vk.as_ref(), cfg) {
+                            Ok(()) => {}
+                            Err(error) => tracing::warn!(
+                                slot = target,
+                                "cold KV restore failed; re-prefilling the request: {error}"
+                            ),
+                        }
+                    } else {
+                        tracing::warn!(
+                            slot = target,
+                            "could not release the target KV slot for cold restore; re-prefilling"
+                        );
+                        cache.return_entry(entry);
+                        kv.reset();
+                    }
+                } else if continuation.is_none() {
+                    if let Some(kv) = target_kv.as_mut().filter(|kv| kv.cached_len() != 0) {
+                        if let Err(error) = cache.spill(kv, self.vk.as_ref(), cfg) {
+                            tracing::warn!(
+                                slot = target,
+                                "cold KV replacement spill failed; forgetting the old conversation: {error}"
+                            );
+                            kv.reset();
+                        }
+                    }
+                }
+                if let Err(error) = cache.gc() {
+                    tracing::warn!("cold KV cache maintenance failed: {error}");
+                }
+            }
+
+            return Ok(SlotGuard {
+                engine: self,
+                idx: target,
+                kv: target_kv,
+                detached: false,
+                multimodal_key: None,
+            });
+        }
+    }
+
+    /// Take a slot whose expanded token prefix and image identity can both be continued.
+    fn checkout_multimodal(
+        &self,
+        prompt: &[u32],
+        key: MultimodalKey,
+        req: &RequestCtx,
+    ) -> SlotGuard<'_> {
+        if self.session_cache.is_some() {
+            self.checkout_multimodal_with_cold_cache(prompt, key, req)
+        } else {
+            self.checkout_multimodal_resident(prompt, key)
+        }
+    }
+
+    fn checkout_multimodal_resident(&self, prompt: &[u32], key: MultimodalKey) -> SlotGuard<'_> {
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            let free = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .collect::<Vec<_>>();
+            if !free.is_empty() {
+                let continuation = pick_continuation(
+                    free.iter().filter_map(|&index| {
+                        (pool.slots[index].multimodal_key == Some(key))
+                            .then_some(pool.slots[index].kv.as_ref())
+                            .flatten()
+                            .and_then(|kv| {
+                                kv.continuation_prefix_len(prompt)
+                                    .map(|prefix| (index, prefix, prefix))
+                            })
+                    }),
+                    prompt.len(),
+                );
+                let target = continuation.unwrap_or_else(|| {
+                    *free
+                        .iter()
+                        .min_by_key(|&&index| {
+                            let slot = &pool.slots[index];
+                            let empty = slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0);
+                            (!empty, slot.tick)
+                        })
+                        .expect("free is not empty")
+                });
+                pool.tick += 1;
+                let tick = pool.tick;
+                pool.slots[target].busy = true;
+                pool.slots[target].tick = tick;
+                pool.slots[target].idle_since = None;
+                let old_key = pool.slots[target].multimodal_key.take();
+                let mut kv = pool.slots[target].kv.take();
+                if continuation != Some(target) || old_key != Some(key) {
+                    if let Some(kv) = kv.as_mut() {
+                        kv.reset();
+                    }
+                }
+                return SlotGuard {
+                    engine: self,
+                    idx: target,
+                    kv,
+                    detached: false,
+                    multimodal_key: Some(key),
+                };
+            }
+            pool = self.freed.wait(pool).expect("pool poisoned");
+        }
+    }
+
+    fn checkout_multimodal_with_cold_cache(
+        &self,
+        prompt: &[u32],
+        key: MultimodalKey,
+        req: &RequestCtx,
+    ) -> SlotGuard<'_> {
+        let cache_mutex = self
+            .session_cache
+            .as_ref()
+            .expect("multimodal cold checkout requires a session cache");
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            let free = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .collect::<Vec<_>>();
+            if !free.is_empty() {
+                let continuation = pick_continuation(
+                    free.iter().filter_map(|&index| {
+                        (pool.slots[index].multimodal_key == Some(key))
+                            .then_some(pool.slots[index].kv.as_ref())
+                            .flatten()
+                            .and_then(|kv| {
+                                kv.continuation_prefix_len(prompt)
+                                    .map(|prefix| (index, prefix, prefix))
+                            })
+                    }),
+                    prompt.len(),
+                );
+                let target = continuation.unwrap_or_else(|| {
+                    *free
+                        .iter()
+                        .min_by_key(|&&index| {
+                            let slot = &pool.slots[index];
+                            let empty = slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0);
+                            (!empty, slot.tick)
+                        })
+                        .expect("free is not empty")
+                });
+                pool.tick += 1;
+                let tick = pool.tick;
+                pool.slots[target].busy = true;
+                pool.slots[target].tick = tick;
+                pool.slots[target].idle_since = None;
+                let old_key = pool.slots[target].multimodal_key.take();
+                let mut kv = pool.slots[target].kv.take();
+                drop(pool);
+                if continuation != Some(target) || old_key != Some(key) {
+                    if let Some(kv) = kv.as_mut().filter(|kv| kv.cached_len() != 0) {
+                        if old_key.is_some() {
+                            kv.reset();
+                        } else {
+                            let _gate = req.gate_pass();
+                            let mut cache = match cache_mutex.lock() {
+                                Ok(cache) => cache,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            if let Err(error) =
+                                cache.spill(kv, self.vk.as_ref(), self.model.config())
+                            {
+                                tracing::warn!(
+                                    slot = target,
+                                    "cold KV spill before multimodal reuse failed; forgetting the old conversation: {error}"
+                                );
+                                kv.reset();
+                            }
+                            if let Err(error) = cache.gc() {
+                                tracing::warn!("cold KV cache maintenance failed: {error}");
+                            }
+                        }
+                    } else if let Some(kv) = kv.as_mut() {
+                        kv.reset();
+                    }
+                }
+                return SlotGuard {
+                    engine: self,
+                    idx: target,
+                    kv,
+                    detached: false,
+                    multimodal_key: Some(key),
+                };
+            }
+            pool = self.freed.wait(pool).expect("pool poisoned");
+        }
+    }
+
     /// Render an OpenAI conversation through the model's own chat template.
+    /// Return a KV whose request thread no longer owns it while a decode cohort is active.
+    fn return_detached_slot(&self, index: usize, kv: SeamKv) {
+        let mut pool = match self.pool.lock() {
+            Ok(pool) => pool,
+            Err(error) => error.into_inner(),
+        };
+        pool.tick += 1;
+        let tick = pool.tick;
+        let Some(slot) = pool.slots.get_mut(index) else {
+            tracing::error!(slot = index, "decode batch returned an unknown KV slot");
+            return;
+        };
+        if !slot.busy || slot.kv.is_some() {
+            tracing::error!(
+                slot = index,
+                busy = slot.busy,
+                has_kv = slot.kv.is_some(),
+                "decode batch found an inconsistent detached KV slot"
+            );
+            return;
+        }
+        slot.kv = Some(kv);
+        slot.busy = false;
+        slot.tick = tick;
+        slot.multimodal_key = None;
+        if self.session_cache.is_some() {
+            slot.idle_since = Some(Instant::now());
+        }
+        drop(pool);
+        if self.session_cache.is_some() {
+            self.freed.notify_all();
+        } else {
+            self.freed.notify_one();
+        }
+    }
+
+    fn deliver_batch_state(&self, slot: usize, tx: SyncSender<BatchEvent>, event: BatchEvent) {
+        if let Err(mpsc::SendError(event)) = tx.send(event) {
+            if let Some(kv) = event.into_kv() {
+                self.return_detached_slot(slot, kv);
+            }
+        }
+    }
+
+    fn fail_batch_work(&self, mut work: BatchWork, error: &str) {
+        let kv = work.kv.take().expect("active decode work owns a KV slot");
+        let Some(channels) = work.channels.take() else {
+            self.return_detached_slot(work.slot, kv);
+            return;
+        };
+        self.deliver_batch_state(
+            work.slot,
+            channels.events,
+            BatchEvent::Failed {
+                kv,
+                error: error.to_owned(),
+            },
+        );
+    }
+
+    fn complete_batch_work(&self, mut work: BatchWork) {
+        let kv = work
+            .kv
+            .take()
+            .expect("completed decode work owns a KV slot");
+        let Some(channels) = work.channels.take() else {
+            self.return_detached_slot(work.slot, kv);
+            return;
+        };
+        self.deliver_batch_state(
+            work.slot,
+            channels.events,
+            BatchEvent::Complete {
+                kv,
+                stats: work.stats,
+            },
+        );
+    }
+
+    /// Fail and drain work that has not entered the active cohort. Used after a batch error and
+    /// when the persistent worker shuts down.
+    fn close_decode_batch(&self, error: Option<&str>) {
+        let waiting = {
+            let mut queue = self
+                .decode_batch
+                .lock()
+                .expect("decode batch queue poisoned");
+            let waiting = queue.waiting.drain(..).collect::<Vec<_>>();
+            self.batch_interrupt.store(false, Ordering::Release);
+            waiting
+        };
+        for work in waiting {
+            if let Some(error) = error {
+                self.fail_batch_work(work, error);
+            } else {
+                self.fail_batch_work(work, "parallel scheduler closed with queued work");
+            }
+        }
+    }
+
+    fn take_pending_batch_work(&self, capacity: usize, force: bool) -> Vec<BatchWork> {
+        if capacity == 0 || (!force && !self.batch_interrupt.swap(false, Ordering::AcqRel)) {
+            return Vec::new();
+        }
+        let accepted = {
+            let mut queue = self
+                .decode_batch
+                .lock()
+                .expect("decode batch queue poisoned");
+            let take = capacity.min(queue.waiting.len());
+            let accepted = queue.waiting.drain(..take).collect::<Vec<_>>();
+            if !queue.waiting.is_empty() {
+                self.batch_interrupt.store(true, Ordering::Release);
+            }
+            accepted
+        };
+        if !accepted.is_empty() {
+            tracing::debug!(
+                lanes = accepted.len(),
+                "admitting work into the unified Qwen3.8 scheduler"
+            );
+        }
+        accepted
+    }
+
+    fn wait_for_scheduler_work(&self, stop: &AtomicBool) -> Option<Vec<BatchWork>> {
+        let mut queue = self
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned");
+        while queue.waiting.is_empty() && !stop.load(Ordering::Acquire) {
+            queue = self
+                .decode_ready
+                .wait(queue)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+
+        if queue.arriving > 0 && queue.waiting.len() < MAX_DECODE_BATCH {
+            (queue, _) = self
+                .decode_ready
+                .wait_timeout_while(queue, DECODE_BATCH_WAIT, |queue| {
+                    !stop.load(Ordering::Acquire)
+                        && queue.arriving > 0
+                        && queue.waiting.len() < MAX_DECODE_BATCH
+                })
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let take = MAX_DECODE_BATCH.min(queue.waiting.len());
+        let work = queue.waiting.drain(..take).collect::<Vec<_>>();
+        self.batch_interrupt
+            .store(!queue.waiting.is_empty(), Ordering::Release);
+        Some(work)
+    }
+
+    fn take_prefill_cohort_peers(&self, capacity: usize) -> Vec<BatchWork> {
+        if capacity == 0 {
+            return Vec::new();
+        }
+        let queue = self
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned");
+        let timeout = if queue.arriving > 0 {
+            DECODE_BATCH_WAIT
+        } else {
+            PREFILL_COHORT_WAIT
+        };
+        let (mut queue, _) = self
+            .decode_ready
+            .wait_timeout_while(queue, timeout, |queue| queue.waiting.is_empty())
+            .expect("decode batch queue poisoned");
+        let take = capacity.min(queue.waiting.len());
+        let peers = queue.waiting.drain(..take).collect::<Vec<_>>();
+        self.batch_interrupt
+            .store(!queue.waiting.is_empty(), Ordering::Release);
+        peers
+    }
+
+    /// Called only after the active set becomes empty. Briefly include requests that registered
+    /// before tokenization; otherwise return control to the persistent worker's idle wait.
+    fn refill_batch(&self) -> Option<Vec<BatchWork>> {
+        let queue = self
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned");
+        let (mut queue, _) = self
+            .decode_ready
+            .wait_timeout_while(queue, DECODE_BATCH_WAIT, |queue| {
+                queue.waiting.is_empty() && queue.arriving > 0
+            })
+            .expect("decode batch queue poisoned");
+        if queue.waiting.is_empty() {
+            self.batch_interrupt.store(false, Ordering::Release);
+            None
+        } else {
+            let take = MAX_DECODE_BATCH.min(queue.waiting.len());
+            let work = queue.waiting.drain(..take).collect::<Vec<_>>();
+            self.batch_interrupt
+                .store(!queue.waiting.is_empty(), Ordering::Release);
+            Some(work)
+        }
+    }
+
+    fn qsa_sparse_at(&self, visible_tokens: usize) -> bool {
+        visible_tokens > self.qsa_threshold()
+    }
+
+    fn qsa_threshold(&self) -> usize {
+        let cfg = self.model.config();
+        let ratio = cfg
+            .compress_ratios
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(4)
+            .max(1);
+        cfg.indexer_top_k + ratio - 1
+    }
+
+    fn token_steps_before_qsa_boundary<'a>(
+        &self,
+        active: impl IntoIterator<Item = &'a BatchWork>,
+    ) -> usize {
+        let threshold = self.qsa_threshold();
+        active
+            .into_iter()
+            .filter(|work| !self.qsa_sparse_at(work.next_qsa_position()))
+            .map(|work| {
+                threshold
+                    .saturating_sub(work.next_qsa_position())
+                    .saturating_add(1)
+            })
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wait_for_decode_batch<F: FnMut(&str)>(
+        &self,
+        guard: &mut SlotGuard<'_>,
+        events: Receiver<BatchEvent>,
+        acknowledgements: SyncSender<bool>,
+        req: &RequestCtx,
+        acc: &mut Vec<u32>,
+        printed: &mut usize,
+        on_piece: &mut F,
+    ) -> Result<GenStats> {
+        loop {
+            let event = match events.recv() {
+                Ok(event) => event,
+                Err(_) => {
+                    guard.abandon_detached();
+                    return Err(anyhow!(
+                        "parallel decode worker stopped before returning its KV"
+                    ));
+                }
+            };
+            match event {
+                BatchEvent::Progress { progress } => req.report_progress(progress),
+                BatchEvent::Token { id, progress } => {
+                    req.report_progress(progress);
+                    let keep_going = if crate::sampling::abort_requested(Some(req)) {
+                        false
+                    } else {
+                        crate::stream_token(self.model.tokenizer(), acc, printed, id, on_piece);
+                        !crate::sampling::abort_requested(Some(req))
+                    };
+                    let _ = acknowledgements.send(keep_going);
+                }
+                BatchEvent::Complete { kv, stats } => {
+                    guard.reattach(kv);
+                    return Ok(stats);
+                }
+                BatchEvent::Failed { kv, error } => {
+                    guard.reattach(kv);
+                    return Err(anyhow!(error));
+                }
+            }
+        }
+    }
+
+    fn prepare_unified_work(&self, work: &mut BatchWork, req: &RequestCtx) -> Result<()> {
+        if work.phase != BatchPhase::Unprepared {
+            return Ok(());
+        }
+        let checkpoint = work.turn_checkpoint.take();
+        let prepared = {
+            let _gate = req.gate_pass();
+            crate::seam::prepare_dense_vulkan_parallel_prompt_session(
+                self.vk.as_ref(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                work.kv.as_mut().expect("unprepared work owns a KV slot"),
+                &work.prompt[..work.prompt_end],
+                checkpoint,
+            )?
+        };
+        work.prefill_start = prepared.start;
+        work.checkpoint_boundary = prepared.checkpoint_boundary;
+        work.stats.n_prompt = work
+            .stats
+            .n_prompt
+            .saturating_add(work.prompt_end.saturating_sub(prepared.start));
+        work.stats.n_cached = work.stats.n_cached.saturating_add(prepared.start);
+        work.phase = phase_for_remaining_prefill(work.remaining_prefill());
+        tracing::debug!(
+            slot = work.slot,
+            start = prepared.start,
+            prompt_tokens = work.prompt_end,
+            remaining = work.remaining_prefill(),
+            phase = ?work.phase,
+            "prepared work for the unified Qwen3.8 scheduler"
+        );
+        Ok(())
+    }
+
+    fn run_long_prefill_phase(&self, active: &mut Vec<BatchWork>, req: &RequestCtx) -> Result<()> {
+        let mut long = Vec::new();
+        let mut token_work = Vec::with_capacity(active.len());
+        for work in active.drain(..) {
+            if work.phase == BatchPhase::LongPrefill {
+                long.push(work);
+            } else {
+                token_work.push(work);
+            }
+        }
+        *active = token_work;
+        if long.is_empty() {
+            return Ok(());
+        }
+
+        let prompts = long
+            .iter()
+            .map(|work| work.prompt[..work.prompt_end].to_vec())
+            .collect::<Vec<_>>();
+        let prepared = long
+            .iter()
+            .map(|work| crate::seam::PreparedParallelPrompt {
+                start: work.prefill_start,
+                checkpoint_boundary: work.checkpoint_boundary,
+            })
+            .collect::<Vec<_>>();
+        let progress_senders = long
+            .iter()
+            .map(|work| {
+                work.channels
+                    .as_ref()
+                    .map(|channels| channels.events.clone())
+            })
+            .collect::<Vec<_>>();
+        let report_progress = |lane: usize, progress: infr_core::GenerationProgress| {
+            if let Some(Some(events)) = progress_senders.get(lane) {
+                let _ = events.send(BatchEvent::Progress { progress });
+            }
+        };
+        let mut primary = long[0].kv.take();
+        let mut peers = long
+            .iter_mut()
+            .skip(1)
+            .map(|work| work.kv.take().expect("long prefill work owns a KV slot"))
+            .collect::<Vec<_>>();
+        let result = {
+            // Long prefill owns the pager phase as one transaction. Passing no RequestCtx below
+            // avoids per-chunk baton release and prevents unrelated legacy work from rebuilding
+            // Decode LRU between ring chunks.
+            let _gate = req.gate_pass();
+            crate::seam::generate_dense_vulkan_parallel_prefill_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &prompts,
+                &mut primary,
+                &mut peers,
+                self.max_ctx,
+                &prepared,
+                Some(&report_progress),
+                None,
+            )
+        };
+        long[0].kv = primary;
+        for (work, kv) in long.iter_mut().skip(1).zip(peers) {
+            work.kv = Some(kv);
+        }
+
+        let stats = match result {
+            Ok(stats) if stats.len() == long.len() => stats,
+            Ok(stats) => {
+                active.extend(long);
+                return Err(anyhow!(
+                    "parallel prefill returned {} stats for {} lanes",
+                    stats.len(),
+                    prompts.len()
+                ));
+            }
+            Err(error) => {
+                active.extend(long);
+                return Err(error);
+            }
+        };
+        if long
+            .iter()
+            .any(|work| work.kv().cached_len() + 1 != work.prompt_end)
+        {
+            active.extend(long);
+            return Err(anyhow!(
+                "parallel long prefill stopped before every lane reached its decode frontier"
+            ));
+        }
+        for (work, stats) in long.iter_mut().zip(stats) {
+            work.stats.prompt_secs += stats.prompt_secs;
+            work.phase = BatchPhase::Decode;
+            work.checkpoint_boundary = None;
+            let progress = infr_core::GenerationProgress {
+                phase: infr_core::GenerationPhase::Prefill,
+                prompt_tokens: work.prompt_end as u64,
+                cached_prompt_tokens: work.prefill_start as u64,
+                prefill_tokens: work.prompt_end.saturating_sub(work.prefill_start) as u64,
+                completion_tokens: 0,
+                context_tokens: work.prompt_end.saturating_sub(1) as u64,
+                context_limit: self.max_ctx as u64,
+            };
+            if let Some(channels) = work.channels.as_ref() {
+                if channels
+                    .events
+                    .send(BatchEvent::Progress { progress })
+                    .is_err()
+                {
+                    work.finished = true;
+                }
+            }
+        }
+        tracing::debug!(
+            lanes = long.len(),
+            "completed one exclusive long-prefill phase"
+        );
+        active.extend(long);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_token_group(
+        &self,
+        active: &mut [BatchWork],
+        indices: &[usize],
+        quantum: usize,
+    ) -> Result<()> {
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let max_steps = indices
+            .iter()
+            .map(|&index| {
+                let work = &active[index];
+                work.remaining_prefill()
+                    .saturating_add(work.max_new.saturating_sub(work.generated))
+            })
+            .min()
+            .unwrap_or(0)
+            .min(self.token_steps_before_qsa_boundary(indices.iter().map(|&index| &active[index])))
+            .min(quantum);
+        if max_steps == 0 {
+            return Err(anyhow!("parallel token group contains exhausted work"));
+        }
+
+        let prompts = indices
+            .iter()
+            .map(|&index| active[index].prompt.clone())
+            .collect::<Vec<_>>();
+        let prompt_ends = indices
+            .iter()
+            .map(|&index| active[index].prompt_end)
+            .collect::<Vec<_>>();
+        let checkpoints = indices
+            .iter()
+            .map(|&index| active[index].checkpoint_boundary)
+            .collect::<Vec<_>>();
+        let mut primary = active[indices[0]].kv.take();
+        let mut peers = indices[1..]
+            .iter()
+            .map(|&index| {
+                active[index]
+                    .kv
+                    .take()
+                    .expect("parallel token work owns a KV slot")
+            })
+            .collect::<Vec<_>>();
+        let mut samplers = indices
+            .iter()
+            .map(|&index| {
+                active[index]
+                    .sampler
+                    .take()
+                    .expect("parallel token work owns a sampler")
+            })
+            .collect::<Vec<_>>();
+        let mut channels = indices
+            .iter()
+            .map(|&index| active[index].channels.take())
+            .collect::<Vec<_>>();
+        let progress_bases = indices
+            .iter()
+            .map(|&index| {
+                let work = &active[index];
+                (work.prompt_end, work.prefill_start, work.generated)
+            })
+            .collect::<Vec<_>>();
+        let mut streamed = vec![0usize; indices.len()];
+        let mut accepted = vec![true; indices.len()];
+        let mut stream = |lane: usize, id: u32| {
+            streamed[lane] += 1;
+            let (prompt_tokens, cached_prompt_tokens, generated) = progress_bases[lane];
+            let progress = self.batch_decode_progress(
+                prompt_tokens,
+                cached_prompt_tokens,
+                generated.saturating_add(streamed[lane]),
+            );
+            let keep_going =
+                channels
+                    .get_mut(lane)
+                    .and_then(Option::as_mut)
+                    .is_some_and(|channels| {
+                        channels
+                            .events
+                            .send(BatchEvent::Token { id, progress })
+                            .is_ok()
+                            && channels.acknowledgements.recv().unwrap_or(false)
+                    });
+            accepted[lane] = keep_going;
+            keep_going
+        };
+        let group_req = match &self.gate {
+            Some(gate) => {
+                RequestCtx::with_gate(active[indices[0]].sampling.clone(), Arc::clone(gate))
+            }
+            None => RequestCtx::new(active[indices[0]].sampling.clone()),
+        };
+        let result = crate::seam::generate_dense_vulkan_parallel_sampled_session(
+            self.vk.as_ref(),
+            self.model.gguf(),
+            self.model.config(),
+            self.model.engine_cfg(),
+            self.model.embd(),
+            self.model.per_layer_embd(),
+            &prompts,
+            &prompt_ends,
+            &checkpoints,
+            max_steps,
+            &mut primary,
+            &mut peers,
+            self.max_ctx,
+            &mut samplers,
+            &mut stream,
+            Some(&self.batch_interrupt),
+            Some(&group_req),
+        );
+
+        active[indices[0]].kv = primary;
+        for (&index, kv) in indices[1..].iter().zip(peers) {
+            active[index].kv = Some(kv);
+        }
+        for (&index, sampler) in indices.iter().zip(samplers) {
+            active[index].sampler = Some(sampler);
+        }
+        for (&index, channel) in indices.iter().zip(channels) {
+            active[index].channels = channel;
+        }
+
+        let (outputs, prompt_secs, decode_secs) = result?;
+        if outputs.len() != indices.len()
+            || prompt_secs.len() != indices.len()
+            || decode_secs.len() != indices.len()
+        {
+            return Err(anyhow!(
+                "parallel token runner returned inconsistent lane counts"
+            ));
+        }
+        let cfg = self.model.config();
+        for (lane, &index) in indices.iter().enumerate() {
+            let work = &mut active[index];
+            work.stats.prompt_secs += prompt_secs[lane];
+            work.stats.decode_secs += decode_secs[lane];
+            work.generated += outputs[lane].len();
+            work.stats.n_gen += outputs[lane].len();
+            work.prompt.extend_from_slice(&outputs[lane]);
+            if work
+                .checkpoint_boundary
+                .is_some_and(|boundary| work.kv().cached_len() >= boundary)
+            {
+                work.checkpoint_boundary = None;
+            }
+            work.phase = phase_for_remaining_prefill(work.remaining_prefill());
+            let eos = outputs[lane].last().is_some_and(|token| {
+                !self.model.engine_cfg().sampling.ignore_eos
+                    && (cfg.eos_ids.contains(token) || *token == cfg.eos)
+            });
+            work.finished = eos || !accepted[lane] || work.generated >= work.max_new;
+
+            if work.phase == BatchPhase::ShortPrefill {
+                let progress = infr_core::GenerationProgress {
+                    phase: infr_core::GenerationPhase::Prefill,
+                    prompt_tokens: work.prompt_end as u64,
+                    cached_prompt_tokens: work.prefill_start as u64,
+                    prefill_tokens: work.kv().cached_len().saturating_sub(work.prefill_start)
+                        as u64,
+                    completion_tokens: work.generated as u64,
+                    context_tokens: work.kv().cached_len() as u64,
+                    context_limit: self.max_ctx as u64,
+                };
+                if let Some(channels) = work.channels.as_ref() {
+                    if channels
+                        .events
+                        .send(BatchEvent::Progress { progress })
+                        .is_err()
+                    {
+                        work.finished = true;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_finished_work(&self, active: &mut Vec<BatchWork>) {
+        for index in (0..active.len()).rev() {
+            if !active[index].finished {
+                continue;
+            }
+            self.complete_batch_work(active.remove(index));
+        }
+    }
+
+    fn fail_unified_scheduler(&self, active: &mut Vec<BatchWork>, error: anyhow::Error) {
+        let message = error.to_string();
+        for work in active.drain(..) {
+            self.fail_batch_work(work, &message);
+        }
+        self.close_decode_batch(Some(&message));
+        self.vk.release_primary_runtime_after_cohort_shrink();
+        tracing::warn!(%error, "parallel scheduler batch failed");
+    }
+
+    fn run_unified_batch(&self, work: Vec<BatchWork>, req: &RequestCtx) {
+        let mut active = Vec::with_capacity(MAX_DECODE_BATCH);
+        active.extend(work);
+        let mut long_prefill_coalesced = false;
+
+        loop {
+            let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
+            active.extend(self.take_pending_batch_work(capacity, false));
+            if active.is_empty() {
+                match self.refill_batch() {
+                    Some(work) => active = work,
+                    None => return,
+                }
+            }
+
+            for work in &mut active {
+                if let Err(error) = self.prepare_unified_work(work, req) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+            }
+
+            let mode = scheduler_mode(active.iter().map(|work| work.phase))
+                .expect("the active scheduler cohort is non-empty");
+            if mode == SchedulerMode::LongPrefill {
+                if !long_prefill_coalesced {
+                    let capacity = MAX_DECODE_BATCH.saturating_sub(active.len());
+                    let peers = self.take_prefill_cohort_peers(capacity);
+                    long_prefill_coalesced = true;
+                    if !peers.is_empty() {
+                        tracing::debug!(
+                            lanes = peers.len(),
+                            "coalescing work before the exclusive long-prefill phase"
+                        );
+                        active.extend(peers);
+                        continue;
+                    }
+                }
+                if let Err(error) = self.run_long_prefill_phase(&mut active, req) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                let cohort_len = active.len();
+                self.retire_finished_work(&mut active);
+                if active.len() < cohort_len {
+                    self.vk.release_primary_runtime_after_cohort_shrink();
+                }
+                long_prefill_coalesced = false;
+                continue;
+            }
+            long_prefill_coalesced = false;
+
+            let mut groups = [Vec::new(), Vec::new()];
+            for (index, work) in active.iter().enumerate() {
+                groups[usize::from(self.qsa_sparse_at(work.next_qsa_position()))].push(index);
+            }
+            let qsa_groups = groups.iter().filter(|indices| !indices.is_empty()).count();
+            let quantum = if qsa_groups > 1 { 16 } else { usize::MAX };
+            for mut indices in groups {
+                indices.sort_by_key(|&index| std::cmp::Reverse(active[index].remaining_prefill()));
+                if let Err(error) = self.run_token_group(&mut active, &indices, quantum) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+            }
+            let cohort_len = active.len();
+            self.retire_finished_work(&mut active);
+            if active.len() < cohort_len {
+                // Paged Decode deliberately retains graph scratch across tokens. A wider cohort
+                // raises that high-water mark; without this request-boundary reset, its retired
+                // expert slots remain unavailable after lanes leave and the surviving request
+                // stays permanently in the wider batch's slow cache state.
+                self.vk.release_primary_runtime_after_cohort_shrink();
+            }
+        }
+    }
+
     pub fn render_chat_messages(&self, messages: &[(&str, &str)]) -> Result<String> {
         self.model.render_chat_messages(messages)
     }
 
-    /// Generate one sequence: check out a slot, run the ordinary seam decode on it (taking turns on
-    /// the GPU baton at every step), and return the slot. `&self` — N of these run concurrently.
+    /// Generate one sequence: check out a slot, enqueue its work, stream scheduler events, and
+    /// return the slot as soon as this request completes.
     pub fn generate(
         &self,
         prompt: &str,
@@ -450,8 +2144,9 @@ impl ParallelSeam {
         self.generate_turn(prompt, None, max_new, constraint, req, on_piece)
     }
 
-    /// [`generate`](Self::generate) with a stable rendered-history prefix for recurrent state
-    /// checkpointing. Attention-only models ignore the resulting boundary in the runner.
+    /// Generate one turn through the authoritative Qwen3.8 scheduler. Eligible requests register
+    /// before tokenization, then stay owned by the dedicated worker from KV reconciliation through
+    /// their final decode token; they never fall back to the legacy per-request StepGate path.
     pub fn generate_turn(
         &self,
         prompt: &str,
@@ -461,20 +2156,180 @@ impl ParallelSeam {
         req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
     ) -> Result<GenStats> {
+        let initially_eligible = self.model.config().qwen4exp
+            && constraint.is_none()
+            && self.gate.is_some()
+            && max_new > 0;
+        let mut registration = initially_eligible.then(|| BatchRegistration::new(self));
         let prompt_tokens = self.model.encode(prompt)?;
         let turn_checkpoint = self.model.turn_checkpoint(&prompt_tokens, stable_prefix)?;
-        let mut guard = self.checkout(&prompt_tokens, req)?;
-        // Cap the reply to the context actually left in THIS slot (a per-slot ctx is smaller than
-        // the model's trained window under `-np N`), mirroring the sequential session path: a
-        // generation ceiling is a default, not a demand. An over-long PROMPT still errors cleanly
-        // in the runner.
         let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
-        let mut acc: Vec<u32> = Vec::new();
+        let batch_candidate = initially_eligible && max_new > 0;
+        if !batch_candidate {
+            drop(registration.take());
+        }
+
+        let mut guard = self.checkout(&prompt_tokens, req)?;
+        let mut acc = Vec::new();
         let mut printed = 0usize;
-        // Resolve `ubatch_rows`/`kv_auto_q8` against THIS engine's pins for the decode (warm calls
-        // must agree with the buffers placement sized). Concurrent requests share the one cell.
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
-        let (_ids, stats) = crate::seam::generate_dense_vulkan_session(
+        if !batch_candidate {
+            let (_, stats) = crate::seam::generate_dense_vulkan_session(
+                self.vk.as_ref(),
+                self.model.gguf(),
+                self.model.config(),
+                self.model.engine_cfg(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &prompt_tokens,
+                max_new,
+                |id| {
+                    crate::stream_token(
+                        self.model.tokenizer(),
+                        &mut acc,
+                        &mut printed,
+                        id,
+                        &mut on_piece,
+                    )
+                },
+                &mut guard.kv,
+                self.max_ctx,
+                turn_checkpoint,
+                constraint,
+                Some(req),
+                None,
+            )?;
+            return Ok(stats);
+        }
+
+        let sampler = ParallelSampler::new(req, &self.model.engine_cfg().sampling);
+        let mut queue = self
+            .decode_batch
+            .lock()
+            .expect("decode batch queue poisoned");
+        registration
+            .as_mut()
+            .expect("eligible request registered before tokenization")
+            .arrive(&mut queue);
+        drop(registration.take());
+        let (event_tx, event_rx) = mpsc::sync_channel(0);
+        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+        queue.waiting.push_back(BatchWork {
+            slot: guard.idx,
+            kv: Some(guard.detach()),
+            prompt_end: prompt_tokens.len(),
+            prompt: prompt_tokens,
+            max_new,
+            generated: 0,
+            stats: GenStats::default(),
+            phase: BatchPhase::Unprepared,
+            prefill_start: 0,
+            checkpoint_boundary: None,
+            turn_checkpoint,
+            finished: false,
+            sampling: req.sampling().clone(),
+            sampler: Some(sampler),
+            channels: Some(BatchChannels {
+                events: event_tx,
+                acknowledgements: ack_rx,
+            }),
+        });
+        self.batch_interrupt.store(true, Ordering::Release);
+        self.decode_ready.notify_all();
+        drop(queue);
+        self.wait_for_decode_batch(
+            &mut guard,
+            event_rx,
+            ack_tx,
+            req,
+            &mut acc,
+            &mut printed,
+            &mut on_piece,
+        )
+    }
+
+    /// Generate one Qwen3.8 vision turn. Projector execution is completed by the caller before
+    /// entering here, so its request-scoped weights have already returned to the unified arena.
+    pub fn generate_multimodal_turn(
+        &self,
+        prompt: &str,
+        stable_prefix: Option<&str>,
+        images: Vec<MultimodalEmbedding>,
+        max_new: usize,
+        req: &RequestCtx,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<GenStats> {
+        if !self.model.config().qwen4exp {
+            return Err(anyhow!(
+                "vision text integration currently supports qwen4exp models only"
+            ));
+        }
+        if images.is_empty() {
+            return self.generate_turn(prompt, stable_prefix, max_new, None, req, on_piece);
+        }
+        let image_pad_id = self
+            .model
+            .tokenizer()
+            .token_to_id("<|image_pad|>")
+            .ok_or_else(|| anyhow!("model tokenizer has no <|image_pad|> token"))?;
+        let base_tokens = self.model.encode(prompt)?;
+        let image_count = images.len();
+        let key = multimodal_key(&images);
+        let checkpoint_images = stable_prefix.map(|_| images.clone());
+        let (prompt_tokens, plan) = expand_multimodal_prompt(
+            &base_tokens,
+            image_pad_id,
+            images,
+            self.model.config().n_embd,
+        )?;
+        if prompt_tokens.len().saturating_add(1) > self.max_ctx {
+            return Err(anyhow!(
+                "multimodal prompt expands to {} tokens, exceeding this slot's {}-token context",
+                prompt_tokens.len(),
+                self.max_ctx
+            ));
+        }
+        let turn_checkpoint = stable_prefix.map(|stable| {
+            let boundary = self
+                .model
+                .encode(stable)
+                .ok()
+                .and_then(|tokens| {
+                    expand_multimodal_prompt(
+                        &tokens,
+                        image_pad_id,
+                        checkpoint_images
+                            .clone()
+                            .expect("stable prefix retained checkpoint images"),
+                        self.model.config().n_embd,
+                    )
+                    .ok()
+                    .map(|(tokens, _)| tokens)
+                })
+                .filter(|tokens| {
+                    !tokens.is_empty()
+                        && tokens.len() < prompt_tokens.len()
+                        && prompt_tokens.starts_with(tokens)
+                })
+                .map(|tokens| tokens.len());
+            boundary.map_or(
+                crate::seam::TurnCheckpoint::Enable,
+                crate::seam::TurnCheckpoint::Boundary,
+            )
+        });
+        let mut guard = self.checkout_multimodal(&prompt_tokens, key, req);
+        let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let mut acc = Vec::new();
+        let mut printed = 0usize;
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
+        tracing::info!(
+            images = image_count,
+            base_tokens = base_tokens.len(),
+            expanded_tokens = prompt_tokens.len(),
+            decode_base = plan.decode_base,
+            "multimodal prompt prepared"
+        );
+        let result = crate::seam::generate_dense_vulkan_session(
             &self.vk,
             self.model.gguf(),
             self.model.config(),
@@ -495,16 +2350,61 @@ impl ParallelSeam {
             &mut guard.kv,
             self.max_ctx,
             turn_checkpoint,
-            constraint,
+            None,
             Some(req),
-        )?;
+            Some(&plan),
+        );
+        if result.is_err() {
+            if let Some(kv) = guard.kv.as_mut() {
+                kv.reset();
+            }
+        }
+        let (_, stats) = result?;
         Ok(stats)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pick_continuation;
+    use super::{
+        expand_multimodal_prompt, multimodal_key, phase_for_remaining_prefill, pick_continuation,
+        scheduler_mode, BatchPhase, MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn short_prefill_boundary_is_inclusive_at_96_tokens() {
+        assert_eq!(phase_for_remaining_prefill(0), BatchPhase::Decode);
+        assert_eq!(phase_for_remaining_prefill(1), BatchPhase::ShortPrefill);
+        assert_eq!(
+            phase_for_remaining_prefill(SHORT_PREFILL_TOKENS),
+            BatchPhase::ShortPrefill
+        );
+        assert_eq!(
+            phase_for_remaining_prefill(SHORT_PREFILL_TOKENS + 1),
+            BatchPhase::LongPrefill
+        );
+    }
+
+    #[test]
+    fn scheduler_routes_the_four_supported_work_mixes() {
+        assert_eq!(
+            scheduler_mode([BatchPhase::Decode, BatchPhase::Decode]),
+            Some(SchedulerMode::DecodeRows)
+        );
+        assert_eq!(
+            scheduler_mode([BatchPhase::ShortPrefill, BatchPhase::ShortPrefill]),
+            Some(SchedulerMode::ShortPrefillRows)
+        );
+        assert_eq!(
+            scheduler_mode([BatchPhase::Decode, BatchPhase::ShortPrefill]),
+            Some(SchedulerMode::DecodeAndShortPrefillRows)
+        );
+        assert_eq!(
+            scheduler_mode([BatchPhase::Decode, BatchPhase::LongPrefill]),
+            Some(SchedulerMode::LongPrefill)
+        );
+    }
 
     #[test]
     fn continuation_picks_longest_prefix_not_first() {
@@ -533,5 +2433,70 @@ mod tests {
         assert_eq!(pick_continuation(candidates, 100), None);
         // Empty candidate set.
         assert_eq!(pick_continuation(std::iter::empty(), 100), None);
+    }
+
+    #[test]
+    fn multimodal_expansion_preserves_order_and_grid_positions() {
+        let images = vec![
+            MultimodalEmbedding {
+                values: Arc::new(vec![1.0; 2 * 2 * 3]),
+                grid_nx: 2,
+                grid_ny: 2,
+                fingerprint: [1; 32],
+            },
+            MultimodalEmbedding {
+                values: Arc::new(vec![2.0; 3 * 3]),
+                grid_nx: 3,
+                grid_ny: 1,
+                fingerprint: [2; 32],
+            },
+        ];
+        let (tokens, plan) = expand_multimodal_prompt(&[10, 99, 11, 99, 12], 99, images, 3)
+            .expect("valid synthetic multimodal prompt");
+        assert_eq!(tokens, [10, 99, 99, 99, 99, 11, 99, 99, 99, 12]);
+        assert_eq!(plan.spans[0].start, 1);
+        assert_eq!(plan.spans[0].n_tokens, 4);
+        assert_eq!(plan.spans[1].start, 6);
+        assert_eq!(plan.spans[1].n_tokens, 3);
+        assert_eq!(
+            &plan.prompt_pos4[4..20],
+            &[1, 1, 1, 0, 1, 1, 2, 0, 1, 2, 1, 0, 1, 2, 2, 0]
+        );
+        assert_eq!(plan.decode_base, 8);
+    }
+
+    #[test]
+    fn multimodal_expansion_rejects_marker_count_mismatch() {
+        let image = MultimodalEmbedding {
+            values: Arc::new(vec![0.0; 4]),
+            grid_nx: 1,
+            grid_ny: 1,
+            fingerprint: [0; 32],
+        };
+        assert!(expand_multimodal_prompt(&[1, 2], 99, vec![image], 4).is_err());
+    }
+
+    #[test]
+    fn multimodal_key_covers_image_identity_order_and_grid() {
+        let image = |fingerprint, grid_nx, grid_ny| MultimodalEmbedding {
+            values: Arc::new(Vec::new()),
+            grid_nx,
+            grid_ny,
+            fingerprint,
+        };
+        let a = image([1; 32], 2, 3);
+        let b = image([2; 32], 4, 5);
+        assert_eq!(
+            multimodal_key(&[a.clone(), b.clone()]),
+            multimodal_key(&[a.clone(), b.clone()])
+        );
+        assert_ne!(
+            multimodal_key(&[a.clone(), b.clone()]),
+            multimodal_key(&[b, a.clone()])
+        );
+        assert_ne!(
+            multimodal_key(&[a.clone()]),
+            multimodal_key(&[image([1; 32], 3, 2)])
+        );
     }
 }

@@ -3,36 +3,146 @@
 
 use crate::Config;
 use anyhow::{anyhow, bail, Context, Result};
-use infr_core::tensor::DType;
-use infr_core::WeightSource;
+use infr_core::{pager_profile, tensor::DType, WeightSource};
 use infr_gguf::{Gguf, TensorBytes};
+use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 
 const TABLE_NAME: &str = "per_layer_token_embd.weight";
+const SOURCE_PAGE_BYTES: usize = 4096;
+const MAX_GATHER_THREADS: usize = 4;
+const PARALLEL_MIN_UNIQUE_ROWS: usize = 256;
+const OUTPUT_POOL_DEPTH: usize = 2;
 
-struct Job {
+struct JobSpan {
     tokens: Vec<u32>,
     start: usize,
     rows: usize,
-    reply: SyncSender<Result<Vec<f32>>>,
 }
 
-/// One persistent model-level worker. `SyncSender` keeps submission lock-free at the model layer
-/// and bounds queued random I/O; each job owns its reply channel, so several conversation slots
-/// can share the immutable table safely.
+struct Job {
+    spans: Vec<JobSpan>,
+    reply: SyncSender<Result<PleRows>>,
+}
+
+/// One persistent model-level worker. The bounded channel prevents an unbounded random-I/O queue;
+/// each job owns its reply channel, so several conversation slots can share the immutable table.
 pub(super) struct PleWorker {
     tx: SyncSender<Job>,
 }
 
-pub(super) struct PleTicket(Receiver<Result<Vec<f32>>>);
+pub(super) struct PleTicket(Receiver<Result<PleRows>>);
 
 impl PleTicket {
-    pub(super) fn wait(self) -> Result<Vec<f32>> {
-        self.0
+    pub(super) fn wait(self) -> Result<PleRows> {
+        let t0 = pager_profile::start();
+        let rows = self
+            .0
             .recv()
-            .map_err(|_| anyhow!("qwen4exp PLE worker stopped before returning a row batch"))?
+            .map_err(|_| anyhow!("qwen4exp PLE worker stopped before returning a row batch"))?;
+        if let Some(elapsed) = pager_profile::elapsed(t0) {
+            pager_profile::record_ple_wait(elapsed);
+        }
+        rows
     }
 }
+
+/// A gathered batch backed by one of two reusable host buffers. More buffers may be allocated
+/// temporarily when several API slots reach PLE at once, so buffer reuse can never deadlock the
+/// shared model worker.
+pub(super) struct PleRows {
+    values: Option<Vec<f32>>,
+    pool: Arc<PleOutputPool>,
+}
+
+impl PleRows {
+    fn new(pool: Arc<PleOutputPool>, len: usize) -> Self {
+        let mut values = pool.take();
+        values.resize(len, 0.0);
+        Self {
+            values: Some(values),
+            pool,
+        }
+    }
+
+    pub(super) fn as_slice(&self) -> &[f32] {
+        self.values
+            .as_deref()
+            .expect("PLE rows retain their buffer until drop")
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [f32] {
+        self.values
+            .as_deref_mut()
+            .expect("PLE rows retain their buffer until drop")
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+impl Drop for PleRows {
+    fn drop(&mut self) {
+        let Some(values) = self.values.take() else {
+            return;
+        };
+        self.pool.put(values);
+    }
+}
+
+struct PleOutputPool {
+    buffers: Mutex<Vec<Vec<f32>>>,
+}
+
+impl PleOutputPool {
+    fn new() -> Self {
+        Self {
+            buffers: Mutex::new((0..OUTPUT_POOL_DEPTH).map(|_| Vec::new()).collect()),
+        }
+    }
+
+    fn take(&self) -> Vec<f32> {
+        self.buffers.lock().unwrap().pop().unwrap_or_default()
+    }
+
+    fn put(&self, values: Vec<f32>) {
+        let mut buffers = self.buffers.lock().unwrap();
+        if buffers.len() < OUTPUT_POOL_DEPTH {
+            buffers.push(values);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RowRequest {
+    row: usize,
+    src_offset: usize,
+    dst_row: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RowGroup {
+    request_start: usize,
+    request_end: usize,
+    row: usize,
+    src_offset: usize,
+}
+
+/// The planner assigns every request a unique output row before source sorting. Parallel groups
+/// therefore write disjoint ranges even though they are no longer in output order.
+#[derive(Clone, Copy)]
+struct SharedOutput {
+    ptr: *mut f32,
+    len: usize,
+}
+
+// SAFETY: `process_row_group` is the only user. The planner gives each RowRequest a unique
+// `dst_row`; exact source-row duplicates are folded into one group and copied to distinct rows.
+unsafe impl Send for SharedOutput {}
+unsafe impl Sync for SharedOutput {}
 
 struct WorkerState {
     table: TensorBytes,
@@ -46,6 +156,13 @@ struct WorkerState {
     multipliers: Vec<u64>,
     offsets: Vec<u64>,
     vocab_sizes: Vec<u64>,
+    gather_threads: usize,
+    gather_pool: ThreadPool,
+    output_pool: Arc<PleOutputPool>,
+    context_scratch: Vec<u64>,
+    indices_scratch: Vec<u64>,
+    requests: Vec<RowRequest>,
+    groups: Vec<RowGroup>,
 }
 
 impl PleWorker {
@@ -89,6 +206,15 @@ impl PleWorker {
                  {rows} rows"
             );
         }
+        let gather_threads = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(MAX_GATHER_THREADS);
+        let gather_pool = ThreadPoolBuilder::new()
+            .num_threads(gather_threads)
+            .thread_name(|i| format!("infr-qwen4-ple-{i}"))
+            .build()
+            .context("build qwen4exp PLE gather pool")?;
         let state = WorkerState {
             table: g.tensor_bytes_arc(TABLE_NAME).map_err(|e| anyhow!("{e}"))?,
             dtype: info.dtype,
@@ -101,15 +227,21 @@ impl PleWorker {
             multipliers: cfg.ple_layer_multipliers.clone(),
             offsets: cfg.ple_head_offsets.clone(),
             vocab_sizes: cfg.ple_head_vocab_sizes.clone(),
+            gather_threads,
+            gather_pool,
+            output_pool: Arc::new(PleOutputPool::new()),
+            context_scratch: Vec::with_capacity(cfg.ple_ngram_size),
+            indices_scratch: Vec::with_capacity((cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram),
+            requests: Vec::new(),
+            groups: Vec::new(),
         };
         let (tx, rx) = mpsc::sync_channel::<Job>(1);
         std::thread::Builder::new()
             .name("infr-qwen4-ple".into())
             .spawn(move || {
+                let mut state = state;
                 while let Ok(job) = rx.recv() {
-                    let _ = job
-                        .reply
-                        .send(state.gather_range(&job.tokens, job.start, job.rows));
+                    let _ = job.reply.send(state.gather_spans(&job.spans));
                 }
             })
             .context("spawn qwen4exp PLE worker")?;
@@ -131,18 +263,43 @@ impl PleWorker {
         rows: usize,
         ngram: usize,
     ) -> Result<PleTicket> {
-        let (tokens, local_start) = ple_job_tokens(tokens, start, rows, ngram)?;
+        self.submit_spans(vec![ple_job_span(tokens, start, rows, ngram)?])
+    }
+
+    /// Gather independent conversation rows in one source-sorted job. This lets concurrent decode
+    /// share deduplication and issue mmap faults in parallel instead of serializing one worker job
+    /// per conversation.
+    pub(super) fn submit_batch<'a>(
+        &self,
+        requests: impl IntoIterator<Item = (&'a [u32], usize)>,
+        ngram: usize,
+    ) -> Result<PleTicket> {
+        let spans = requests
+            .into_iter()
+            .map(|(tokens, pos)| ple_job_span(tokens, pos, 1, ngram))
+            .collect::<Result<Vec<_>>>()?;
+        if spans.is_empty() {
+            bail!("qwen4exp PLE batch cannot be empty");
+        }
+        self.submit_spans(spans)
+    }
+
+    fn submit_spans(&self, spans: Vec<JobSpan>) -> Result<PleTicket> {
         let (reply, rx) = mpsc::sync_channel(1);
         self.tx
-            .send(Job {
-                tokens,
-                start: local_start,
-                rows,
-                reply,
-            })
+            .send(Job { spans, reply })
             .map_err(|_| anyhow!("qwen4exp PLE worker is not running"))?;
         Ok(PleTicket(rx))
     }
+}
+
+fn ple_job_span(tokens: &[u32], start: usize, rows: usize, ngram: usize) -> Result<JobSpan> {
+    let (tokens, start) = ple_job_tokens(tokens, start, rows, ngram)?;
+    Ok(JobSpan {
+        tokens,
+        start,
+        rows,
+    })
 }
 
 fn ple_job_tokens(
@@ -168,55 +325,281 @@ fn ple_job_tokens(
 }
 
 impl WorkerState {
-    fn gather_range(&self, tokens: &[u32], start: usize, rows: usize) -> Result<Vec<f32>> {
+    fn gather_spans(&mut self, spans: &[JobSpan]) -> Result<PleRows> {
+        let profile = pager_profile::active();
+        let plan_t0 = profile.then(std::time::Instant::now);
         let heads = (self.ngram - 1) * self.heads_per_ngram;
-        let mut out = Vec::with_capacity(rows * heads * self.row_dim);
-        for pos in start..start + rows {
-            let recent = tokens
-                .get(..=pos)
-                .context("PLE local token range is inconsistent")?;
-            let ctx = ple_context(recent, self.ngram, self.eos)?;
-            let indices = ple_row_indices(
-                &ctx,
-                self.ngram,
-                self.heads_per_ngram,
-                &self.multipliers,
-                &self.offsets,
-                &self.vocab_sizes,
-            );
-            for row in indices {
-                let row = usize::try_from(row).context("PLE row index overflow")?;
-                if row >= self.rows {
-                    bail!(
-                        "qwen4exp PLE row {row} is outside table with {} rows",
-                        self.rows
-                    );
+        let rows = spans.iter().try_fold(0usize, |total, span| {
+            total
+                .checked_add(span.rows)
+                .context("PLE batch row count overflow")
+        })?;
+        let request_count = rows
+            .checked_mul(heads)
+            .context("PLE row request count overflow")?;
+        let output_len = request_count
+            .checked_mul(self.row_dim)
+            .context("PLE output size overflow")?;
+        let output_bytes = output_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("PLE output byte size overflow")?;
+        self.requests.clear();
+        self.requests.reserve(request_count);
+        for span in spans {
+            let token_end = span
+                .start
+                .checked_add(span.rows)
+                .context("PLE local token range overflow")?;
+            for pos in span.start..token_end {
+                let recent = span
+                    .tokens
+                    .get(..=pos)
+                    .context("PLE local token range is inconsistent")?;
+                ple_context_into(recent, self.ngram, self.eos, &mut self.context_scratch)?;
+                ple_row_indices_into(
+                    &self.context_scratch,
+                    self.ngram,
+                    self.heads_per_ngram,
+                    &self.multipliers,
+                    &self.offsets,
+                    &self.vocab_sizes,
+                    &mut self.indices_scratch,
+                );
+                for &row in &self.indices_scratch {
+                    let row = usize::try_from(row).context("PLE row index overflow")?;
+                    if row >= self.rows {
+                        bail!(
+                            "qwen4exp PLE row {row} is outside table with {} rows",
+                            self.rows
+                        );
+                    }
+                    let off = row
+                        .checked_mul(self.row_bytes)
+                        .context("PLE byte offset overflow")?;
+                    let end = off
+                        .checked_add(self.row_bytes)
+                        .context("PLE byte range overflow")?;
+                    if end > self.table.len() {
+                        bail!(
+                            "qwen4exp PLE row {row} byte range {off}..{end} exceeds table size {}",
+                            self.table.len()
+                        );
+                    }
+                    self.requests.push(RowRequest {
+                        row,
+                        src_offset: off,
+                        dst_row: self.requests.len(),
+                    });
                 }
-                let off = row
-                    .checked_mul(self.row_bytes)
-                    .context("PLE byte offset overflow")?;
-                let end = off
-                    .checked_add(self.row_bytes)
-                    .context("PLE byte range overflow")?;
-                let values = infr_gguf::dequant::dequant_block(self.dtype, &self.table[off..end])
-                    .with_context(|| format!("dequant qwen4exp PLE row {row}"))?;
-                if values.len() != self.row_dim {
-                    bail!(
-                        "qwen4exp PLE row {row} dequantized to {} values, expected {}",
-                        values.len(),
-                        self.row_dim
-                    );
-                }
-                out.extend_from_slice(&values);
             }
+        }
+        debug_assert_eq!(self.requests.len(), request_count);
+        self.requests
+            .sort_unstable_by_key(|request| request.src_offset);
+        let logical_pages = rebuild_row_groups(&self.requests, self.row_bytes, &mut self.groups);
+        let plan_elapsed = pager_profile::elapsed(plan_t0).unwrap_or_default();
+
+        let mut out = PleRows::new(Arc::clone(&self.output_pool), output_len);
+        let shared_out = SharedOutput {
+            ptr: out.as_mut_slice().as_mut_ptr(),
+            len: output_len,
+        };
+        let independent_batch = spans.len() > 1;
+        let parallel = self.gather_threads > 1
+            && (self.groups.len() >= PARALLEL_MIN_UNIQUE_ROWS
+                || (independent_batch && self.groups.len() > 1));
+        let work_t0 = profile.then(std::time::Instant::now);
+        let table: &[u8] = &self.table;
+        let requests = &self.requests;
+        let groups = &self.groups;
+        let dtype = self.dtype;
+        let row_bytes = self.row_bytes;
+        let row_dim = self.row_dim;
+        if parallel {
+            let task_count = if independent_batch {
+                self.gather_threads.min(spans.len()).min(groups.len())
+            } else {
+                self.gather_threads.min(groups.len())
+            };
+            let groups_per_task = groups.len().div_ceil(task_count);
+            self.gather_pool.install(|| {
+                groups
+                    .par_chunks(groups_per_task)
+                    .try_for_each(|group_chunk| -> Result<()> {
+                        for group in group_chunk {
+                            process_row_group(
+                                table, dtype, row_bytes, row_dim, requests, *group, shared_out,
+                            )?;
+                        }
+                        Ok(())
+                    })
+            })?;
+        } else {
+            for &group in groups {
+                process_row_group(
+                    table, dtype, row_bytes, row_dim, requests, group, shared_out,
+                )?;
+            }
+        }
+        let work_elapsed = pager_profile::elapsed(work_t0).unwrap_or_default();
+        if profile {
+            pager_profile::record_ple_gather(
+                rows,
+                request_count,
+                groups.len(),
+                logical_pages,
+                output_bytes,
+                parallel,
+                plan_elapsed,
+                work_elapsed,
+            );
         }
         Ok(out)
     }
 }
 
-fn ple_context(recent: &[u32], ngram: usize, eos: u32) -> Result<Vec<u64>> {
+fn process_row_group(
+    table: &[u8],
+    dtype: DType,
+    row_bytes: usize,
+    row_dim: usize,
+    requests: &[RowRequest],
+    group: RowGroup,
+    output: SharedOutput,
+) -> Result<()> {
+    let end = group
+        .src_offset
+        .checked_add(row_bytes)
+        .context("PLE byte range overflow")?;
+    let source = table
+        .get(group.src_offset..end)
+        .with_context(|| format!("qwen4exp PLE row {} is outside its table", group.row))?;
+    let first = requests[group.request_start];
+    let first_offset = first
+        .dst_row
+        .checked_mul(row_dim)
+        .context("PLE destination offset overflow")?;
+    let first_end = first_offset
+        .checked_add(row_dim)
+        .context("PLE destination range overflow")?;
+    if first_end > output.len {
+        bail!("qwen4exp PLE destination row is outside its output buffer");
+    }
+
+    // SAFETY: every planned dst_row is unique, and groups partition the request array by source
+    // row. Parallel groups therefore write disjoint output slices. `out` remains alive until all
+    // pool work has joined.
+    let first_ptr = unsafe { output.ptr.add(first_offset) };
+    let first_out = unsafe { std::slice::from_raw_parts_mut(first_ptr, row_dim) };
+    dequant_ple_row_into(dtype, source, first_out)
+        .with_context(|| format!("dequant qwen4exp PLE row {}", group.row))?;
+
+    // Exact duplicate source rows share one dequantization, but retain their original output
+    // positions. Overlap is impossible because each request owns one complete output row.
+    for request in &requests[group.request_start + 1..group.request_end] {
+        let dst_offset = request
+            .dst_row
+            .checked_mul(row_dim)
+            .context("PLE duplicate destination offset overflow")?;
+        let dst_end = dst_offset
+            .checked_add(row_dim)
+            .context("PLE duplicate destination range overflow")?;
+        if dst_end > output.len {
+            bail!("qwen4exp PLE duplicate destination is outside its output buffer");
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(first_ptr, output.ptr.add(dst_offset), row_dim);
+        }
+    }
+    Ok(())
+}
+
+fn rebuild_row_groups(
+    requests: &[RowRequest],
+    row_bytes: usize,
+    groups: &mut Vec<RowGroup>,
+) -> usize {
+    groups.clear();
+    for (i, request) in requests.iter().enumerate() {
+        match groups.last_mut() {
+            Some(group) if group.src_offset == request.src_offset => group.request_end = i + 1,
+            _ => groups.push(RowGroup {
+                request_start: i,
+                request_end: i + 1,
+                row: request.row,
+                src_offset: request.src_offset,
+            }),
+        }
+    }
+
+    let mut pages = 0usize;
+    let mut last_page: Option<usize> = None;
+    for group in groups.iter() {
+        let first_page = group.src_offset / SOURCE_PAGE_BYTES;
+        let last = group.src_offset.saturating_add(row_bytes.saturating_sub(1)) / SOURCE_PAGE_BYTES;
+        let first_unseen = last_page.map_or(first_page, |page| first_page.max(page + 1));
+        if first_unseen <= last {
+            pages = pages.saturating_add(last - first_unseen + 1);
+        }
+        last_page = Some(last_page.map_or(last, |page| page.max(last)));
+    }
+    pages
+}
+
+fn dequant_ple_row_into(dtype: DType, bytes: &[u8], out: &mut [f32]) -> Result<()> {
+    match dtype {
+        DType::Q5_1 => dequant_q5_1_into(bytes, out),
+        _ => {
+            let values = infr_gguf::dequant::dequant_block(dtype, bytes)?;
+            if values.len() != out.len() {
+                bail!(
+                    "PLE row dequantized to {} values, expected {}",
+                    values.len(),
+                    out.len()
+                );
+            }
+            out.copy_from_slice(&values);
+            Ok(())
+        }
+    }
+}
+
+fn dequant_q5_1_into(bytes: &[u8], out: &mut [f32]) -> Result<()> {
+    const BLOCK_BYTES: usize = 24;
+    const BLOCK_ELEMS: usize = 32;
+    if !out.len().is_multiple_of(BLOCK_ELEMS)
+        || bytes.len() != out.len() / BLOCK_ELEMS * BLOCK_BYTES
+    {
+        bail!(
+            "invalid Q5_1 PLE row geometry: {} bytes for {} values",
+            bytes.len(),
+            out.len()
+        );
+    }
+    for (block, values) in bytes
+        .chunks_exact(BLOCK_BYTES)
+        .zip(out.chunks_exact_mut(BLOCK_ELEMS))
+    {
+        let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let m = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
+        let qh = u32::from_le_bytes(block[4..8].try_into().unwrap());
+        let qs = &block[8..24];
+        for j in 0..16 {
+            let high0 = ((qh >> j) << 4) & 0x10;
+            let high1 = (qh >> (j + 12)) & 0x10;
+            let q0 = (qs[j] as u32 & 0x0f) | high0;
+            let q1 = (qs[j] as u32 >> 4) | high1;
+            values[j] = d * q0 as f32 + m;
+            values[j + 16] = d * q1 as f32 + m;
+        }
+    }
+    Ok(())
+}
+
+fn ple_context_into(recent: &[u32], ngram: usize, eos: u32, ctx: &mut Vec<u64>) -> Result<()> {
     let current = *recent.last().context("empty PLE token context")?;
-    let mut ctx = vec![eos as u64; ngram];
+    ctx.clear();
+    ctx.resize(ngram, eos as u64);
     ctx[0] = current as u64;
     let mut cut = false;
     for s in 1..ngram {
@@ -230,18 +613,20 @@ fn ple_context(recent: &[u32], ngram: usize, eos: u32) -> Result<Vec<u64>> {
             cut = true;
         }
     }
-    Ok(ctx)
+    Ok(())
 }
 
-fn ple_row_indices(
+fn ple_row_indices_into(
     ctx: &[u64],
     ngram: usize,
     heads_per_ngram: usize,
     multipliers: &[u64],
     offsets: &[u64],
     vocab_sizes: &[u64],
-) -> Vec<u64> {
-    let mut rows = Vec::with_capacity((ngram - 1) * heads_per_ngram);
+    rows: &mut Vec<u64>,
+) {
+    rows.clear();
+    rows.reserve((ngram - 1) * heads_per_ngram);
     for n in 2..=ngram {
         let mut mixed = ctx[0].wrapping_mul(multipliers[0]);
         for j in 1..n {
@@ -252,6 +637,34 @@ fn ple_row_indices(
             rows.push(mixed % vocab_sizes[h] + offsets[h]);
         }
     }
+}
+
+#[cfg(test)]
+fn ple_context(recent: &[u32], ngram: usize, eos: u32) -> Result<Vec<u64>> {
+    let mut ctx = Vec::new();
+    ple_context_into(recent, ngram, eos, &mut ctx)?;
+    Ok(ctx)
+}
+
+#[cfg(test)]
+fn ple_row_indices(
+    ctx: &[u64],
+    ngram: usize,
+    heads_per_ngram: usize,
+    multipliers: &[u64],
+    offsets: &[u64],
+    vocab_sizes: &[u64],
+) -> Vec<u64> {
+    let mut rows = Vec::new();
+    ple_row_indices_into(
+        ctx,
+        ngram,
+        heads_per_ngram,
+        multipliers,
+        offsets,
+        vocab_sizes,
+        &mut rows,
+    );
     rows
 }
 
@@ -290,6 +703,136 @@ mod tests {
             let batched = ple_context(&local[..=start + row], 4, 2).unwrap();
             let scalar = ple_context(&tokens[..=3 + row], 4, 2).unwrap();
             assert_eq!(batched, scalar);
+        }
+    }
+
+    #[test]
+    fn independent_spans_preserve_lane_order_and_context() {
+        let lane0 = [3, 5, 7, 11, 13];
+        let lane1 = [17, 19, 23, 29, 31, 37];
+        let spans = [(&lane0[..], 4usize), (&lane1[..], 5usize)]
+            .into_iter()
+            .map(|(tokens, pos)| ple_job_span(tokens, pos, 1, 4).unwrap())
+            .collect::<Vec<_>>();
+
+        let contexts = spans
+            .iter()
+            .map(|span| ple_context(&span.tokens[..=span.start], 4, 2).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(contexts[0], ple_context(&lane0, 4, 2).unwrap());
+        assert_eq!(contexts[1], ple_context(&lane1, 4, 2).unwrap());
+    }
+
+    #[test]
+    fn q5_1_into_matches_the_general_dequantizer() {
+        let mut bytes = vec![0u8; 5 * 24];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = i.wrapping_mul(37).wrapping_add(11) as u8;
+        }
+        // Keep both f16 scale fields finite for every block.
+        for block in bytes.chunks_exact_mut(24) {
+            block[0..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes());
+            block[2..4].copy_from_slice(&half::f16::from_f32(-0.75).to_le_bytes());
+        }
+        let expected = infr_gguf::dequant::dequant_block(DType::Q5_1, &bytes).unwrap();
+        let mut actual = vec![0.0; expected.len()];
+        dequant_q5_1_into(&bytes, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn source_sorting_groups_duplicate_rows_and_counts_pages() {
+        let mut requests = vec![
+            RowRequest {
+                row: 40,
+                src_offset: 4800,
+                dst_row: 0,
+            },
+            RowRequest {
+                row: 1,
+                src_offset: 120,
+                dst_row: 1,
+            },
+            RowRequest {
+                row: 40,
+                src_offset: 4800,
+                dst_row: 2,
+            },
+        ];
+        requests.sort_unstable_by_key(|request| request.src_offset);
+        let mut groups = Vec::new();
+        let pages = rebuild_row_groups(&requests, 120, &mut groups);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1].request_end - groups[1].request_start, 2);
+        assert_eq!(pages, 2);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.dst_row)
+                .sum::<usize>(),
+            3
+        );
+    }
+
+    #[test]
+    fn source_sorted_parallel_gather_restores_output_order() {
+        const ROW_DIM: usize = 160;
+        const ROW_BYTES: usize = 120;
+        let mut table = vec![0u8; 4 * ROW_BYTES];
+        for (row, row_bytes) in table.chunks_exact_mut(ROW_BYTES).enumerate() {
+            for (block_index, block) in row_bytes.chunks_exact_mut(24).enumerate() {
+                block[0..2].copy_from_slice(&half::f16::from_f32(0.125 + row as f32).to_le_bytes());
+                block[2..4].copy_from_slice(&half::f16::from_f32(block_index as f32).to_le_bytes());
+                for (i, byte) in block[4..].iter_mut().enumerate() {
+                    *byte = (row * 53 + block_index * 17 + i) as u8;
+                }
+            }
+        }
+
+        let source_rows = [3usize, 0, 3, 1, 2, 0, 1, 3];
+        let mut requests = source_rows
+            .iter()
+            .enumerate()
+            .map(|(dst_row, &row)| RowRequest {
+                row,
+                src_offset: row * ROW_BYTES,
+                dst_row,
+            })
+            .collect::<Vec<_>>();
+        requests.sort_unstable_by_key(|request| request.src_offset);
+        let mut groups = Vec::new();
+        rebuild_row_groups(&requests, ROW_BYTES, &mut groups);
+
+        let mut actual = vec![0.0; source_rows.len() * ROW_DIM];
+        let output = SharedOutput {
+            ptr: actual.as_mut_ptr(),
+            len: actual.len(),
+        };
+        groups
+            .par_iter()
+            .try_for_each(|&group| {
+                process_row_group(
+                    &table,
+                    DType::Q5_1,
+                    ROW_BYTES,
+                    ROW_DIM,
+                    &requests,
+                    group,
+                    output,
+                )
+            })
+            .unwrap();
+
+        for (dst_row, &source_row) in source_rows.iter().enumerate() {
+            let expected = infr_gguf::dequant::dequant_block(
+                DType::Q5_1,
+                &table[source_row * ROW_BYTES..(source_row + 1) * ROW_BYTES],
+            )
+            .unwrap();
+            assert_eq!(
+                &actual[dst_row * ROW_DIM..(dst_row + 1) * ROW_DIM],
+                expected.as_slice()
+            );
         }
     }
 }

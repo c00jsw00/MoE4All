@@ -192,6 +192,11 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.type_v_specified = presence(get, "INFR_KV_TYPE_V");
     p.kv.force_q8 = presence(get, "INFR_KV_Q8");
     p.kv.slots = num_pos(get, "INFR_KV_SLOTS");
+    p.kv.session_cache_dir = opt_path(get, "INFR_KV_SESSION_CACHE_DIR");
+    p.kv.session_idle_secs = num(get, "INFR_KV_SESSION_IDLE_SECS");
+    p.kv.session_cache_max =
+        get("INFR_KV_SESSION_CACHE_MAX").and_then(|value| crate::parse_size(&value));
+    p.kv.session_cache_ttl_hours = num(get, "INFR_KV_SESSION_CACHE_TTL_HOURS");
     p.kv.ring = presence_inv(get, "INFR_NO_KV_RING");
     p.kv.dynamic = presence_inv(get, "INFR_NO_DYNAMIC_KV");
     p.kv.inline_decode = presence(get, "INFR_KV_INLINE");
@@ -206,6 +211,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.paging.ring_slots = num(get, "INFR_PAGER_RING_SLOTS");
     p.paging.moe_layer_stream = presence_inv(get, "INFR_NO_MOE_LAYER_STREAM");
     p.paging.prefill_upload_async = presence_inv(get, "INFR_SYNC_PREFILL_UPLOAD");
+    p.paging.expert_prefetch = presence(get, "INFR_EXPERT_PREFETCH");
     p.paging.moe_size_cache_bias = opt_num(get, "INFR_MOE_SIZE_CACHE_BIAS");
     p.paging.dram = opt_size(get, "INFR_DRAM_CACHE");
     p.paging.dram_bypass = presence(get, "INFR_DRAM_BYPASS");

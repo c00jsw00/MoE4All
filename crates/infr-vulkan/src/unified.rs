@@ -471,6 +471,10 @@ impl ExpertArenaLayout {
         // runtime workspace behind small shard-tail fragments. Restore caller order before commit
         // so returned handles still align exactly with the request slice.
         ordered.sort_unstable_by_key(|&(index, _, len)| (std::cmp::Reverse(len), index));
+        let batch_bytes = ordered
+            .iter()
+            .fold(0usize, |sum, (_, _, len)| sum.saturating_add(*len));
+        let initial_blockers = blockers.len();
         let mut ranges = vec![None; requested.len()];
         for (index, requested_len, len) in ordered {
             let candidate = match direction {
@@ -478,8 +482,35 @@ impl ExpertArenaLayout {
                 ClaimDirection::High => find_high_gap(&pieces, &blockers, len),
             }
             .ok_or_else(|| {
+                let corridor_bytes = pieces
+                    .iter()
+                    .fold(0usize, |sum, piece| sum.saturating_add(piece.end - piece.start));
+                let (free_bytes, largest_gap, gaps) = gap_stats(&pieces, &blockers);
+                let live_classes = live
+                    .iter()
+                    .filter(|range| {
+                        range.class != UnifiedVramClass::Expert
+                            && pieces.iter().any(|piece| {
+                                piece.shard == range.shard
+                                    && range.offset < piece.end
+                                    && range.offset.saturating_add(range.len) > piece.start
+                            })
+                    })
+                    .fold(HashMap::<UnifiedVramClass, usize>::new(), |mut bytes, range| {
+                        *bytes.entry(range.class).or_default() += range.len;
+                        bytes
+                    });
                 be(format!(
-                    "{class:?} cannot fit {len} contiguous bytes in its frozen arena corridor"
+                    "{class:?} cannot fit {len} contiguous bytes in its frozen arena corridor: \
+                     corridor={corridor_bytes} bytes across {} shard piece(s), available={free_bytes} \
+                     bytes in {gaps} gap(s), largest_gap={largest_gap} bytes, batch={batch_bytes} \
+                     bytes / {} range(s), placed={} range(s), live={live_classes:?}, reservations={}, \
+                     protected_experts={}",
+                    pieces.len(),
+                    requested.len(),
+                    blockers.len().saturating_sub(initial_blockers),
+                    reservations.len(),
+                    protected_experts.len(),
                 ))
             })?;
             let range = PlannedRange {
@@ -804,6 +835,43 @@ fn find_high_gap(
     None
 }
 
+fn gap_stats(pieces: &[ArenaPiece], blockers: &[PlannedRange]) -> (usize, usize, usize) {
+    let mut total = 0usize;
+    let mut largest = 0usize;
+    let mut count = 0usize;
+    for piece in pieces {
+        let mut occupied: Vec<_> = blockers
+            .iter()
+            .filter(|range| range.shard == piece.shard)
+            .map(|range| {
+                (
+                    range.offset.max(piece.start),
+                    range.offset.saturating_add(range.len).min(piece.end),
+                )
+            })
+            .filter(|&(start, end)| start < end)
+            .collect();
+        occupied.sort_unstable();
+        let mut cursor = piece.start;
+        for (start, end) in occupied {
+            if cursor < start {
+                let bytes = start - cursor;
+                total = total.saturating_add(bytes);
+                largest = largest.max(bytes);
+                count += 1;
+            }
+            cursor = cursor.max(end);
+        }
+        if cursor < piece.end {
+            let bytes = piece.end - cursor;
+            total = total.saturating_add(bytes);
+            largest = largest.max(bytes);
+            count += 1;
+        }
+    }
+    (total, largest, count)
+}
+
 fn ranges_overlap(a_offset: usize, a_len: usize, b_offset: usize, b_len: usize) -> bool {
     a_offset < b_offset.saturating_add(b_len) && b_offset < a_offset.saturating_add(a_len)
 }
@@ -838,6 +906,26 @@ impl UnifiedVramClass {
             Self::VisionRuntime => 7,
             Self::DraftWeights => 8,
             Self::DraftRuntime => 9,
+        }
+    }
+
+    fn placement(self, layout: &ExpertArenaLayout) -> Result<(Range<usize>, ClaimDirection)> {
+        match self {
+            Self::Expert => Err(be(
+                "Expert filler must be claimed from the frozen slot directory",
+            )),
+            Self::KvCache => Ok((layout.kv_corridor(), ClaimDirection::Low)),
+            Self::Prefill => Ok((layout.prefill_corridor(), ClaimDirection::Low)),
+            Self::LlmRuntime
+            | Self::EmbeddingWeights
+            | Self::EmbeddingRuntime
+            | Self::VisionWeights
+            | Self::VisionRuntime
+            | Self::DraftWeights
+            | Self::DraftRuntime => Ok((
+                layout.floor_corridor().end..layout.total_bytes(),
+                ClaimDirection::High,
+            )),
         }
     }
 }
@@ -1194,14 +1282,22 @@ impl UnifiedRangePool {
 /// A Vulkan-backed range lease. Keeping the physical shard and logical lease in the same handle
 /// lets a `VkBuffer` view outlive the backend handle without forming a cycle through
 /// `VulkanShared`.
+struct UnifiedOwnerLease {
+    _allocations: Vec<Arc<UnifiedAllocation>>,
+}
+
 pub(crate) struct UnifiedAllocationHandle {
-    lease: Arc<UnifiedAllocation>,
+    range: UnifiedRange,
+    /// Every range committed by one owner transaction shares this lease. No subset can return to
+    /// Expert filler while sibling buffers from the same KV-growth, Prefill or runtime batch are
+    /// still live.
+    _owner: Arc<UnifiedOwnerLease>,
     shard: Arc<DeviceArenaShard>,
 }
 
 impl UnifiedAllocationHandle {
     pub(crate) fn range(&self) -> UnifiedRange {
-        self.lease.range()
+        self.range
     }
 
     pub(crate) fn buffer(&self) -> &dyn Buffer {
@@ -1313,24 +1409,38 @@ impl UnifiedVramPool {
             UnifiedVramClass::Expert,
         )?;
         let shard = self.arena.shard(placement.shard)?;
-        Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
+        let range = lease.range();
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: vec![lease],
+        });
+        Some(Arc::new(UnifiedAllocationHandle {
+            range,
+            _owner: owner,
+            shard,
+        }))
     }
 
-    pub(crate) fn plan_kv_claim(
+    /// Plan one logical owner without exposing corridor or growth-direction policy to callers.
+    /// The class fixes those choices at session construction: KV grows from low addresses,
+    /// Prefill uses its phase-exclusive middle corridor, and variable phase owners grow down from
+    /// high addresses. Expert filler remains a separate fixed-slot operation.
+    pub(crate) fn plan_owner_claim(
         &self,
         requested: &[usize],
+        class: UnifiedVramClass,
         protected_experts: &[ExpertSlotId],
     ) -> Result<UnifiedClaimPlan> {
         let layout = self
             .expert_layout
             .as_ref()
-            .ok_or_else(|| be("KV corridor requires an expert-aware unified VRAM layout"))?;
+            .ok_or_else(|| be("owner claims require an expert-aware unified VRAM layout"))?;
+        let (corridor, direction) = class.placement(layout)?;
         layout.plan_claim(
             &self.ranges.allocations(),
             requested,
-            UnifiedVramClass::KvCache,
-            layout.kv_corridor(),
-            ClaimDirection::Low,
+            class,
+            corridor,
+            direction,
             protected_experts,
         )
     }
@@ -1370,69 +1480,25 @@ impl UnifiedVramPool {
         }))
     }
 
-    pub(crate) fn plan_exact_kv_claim(
+    /// Exact-coordinate twin of [`Self::plan_owner_claim`], used by owners that reserve a stable
+    /// future layout and commit it incrementally. The owner class still selects and validates the
+    /// corridor; callers cannot smuggle an exact range into another owner's address space.
+    pub(crate) fn plan_exact_owner_claim(
         &self,
         ranges: &[PlannedRange],
-        protected_experts: &[ExpertSlotId],
-    ) -> Result<UnifiedClaimPlan> {
-        let layout = self
-            .expert_layout
-            .as_ref()
-            .ok_or_else(|| be("exact KV claims require an expert-aware unified VRAM layout"))?;
-        layout.plan_exact_claim(
-            &self.ranges.allocations(),
-            ranges,
-            UnifiedVramClass::KvCache,
-            layout.kv_corridor(),
-            protected_experts,
-        )
-    }
-
-    pub(crate) fn plan_prefill_claim(
-        &self,
-        requested: &[usize],
-        protected_experts: &[ExpertSlotId],
-    ) -> Result<UnifiedClaimPlan> {
-        let layout = self
-            .expert_layout
-            .as_ref()
-            .ok_or_else(|| be("Prefill corridor requires an expert-aware unified VRAM layout"))?;
-        layout.plan_claim(
-            &self.ranges.allocations(),
-            requested,
-            UnifiedVramClass::Prefill,
-            layout.prefill_corridor(),
-            ClaimDirection::Low,
-            protected_experts,
-        )
-    }
-
-    /// Plan a non-KV, non-Prefill owner from high addresses. The physical expert-floor corridor
-    /// remains a hard lower boundary even before lazy KV segments are committed.
-    pub(crate) fn plan_high_claim(
-        &self,
-        requested: &[usize],
         class: UnifiedVramClass,
         protected_experts: &[ExpertSlotId],
     ) -> Result<UnifiedClaimPlan> {
-        if matches!(
-            class,
-            UnifiedVramClass::Expert | UnifiedVramClass::KvCache | UnifiedVramClass::Prefill
-        ) {
-            return Err(be(format!(
-                "{class:?} cannot use the high-address elastic claim path"
-            )));
-        }
         let layout = self
             .expert_layout
             .as_ref()
-            .ok_or_else(|| be("high-address claim requires an expert-aware unified VRAM layout"))?;
-        layout.plan_claim(
+            .ok_or_else(|| be("exact owner claims require an expert-aware unified VRAM layout"))?;
+        let (corridor, _) = class.placement(layout)?;
+        layout.plan_exact_claim(
             &self.ranges.allocations(),
-            requested,
+            ranges,
             class,
-            layout.floor_corridor().end..layout.total_bytes(),
-            ClaimDirection::High,
+            corridor,
             protected_experts,
         )
     }
@@ -1448,15 +1514,22 @@ impl UnifiedVramPool {
             .ranges
             .try_claim_planned(class, &plan.ranges)
             .ok_or_else(|| be(format!("stale {class:?} unified VRAM claim plan")))?;
-        leases
+        let ranges = leases.iter().map(|lease| lease.range()).collect::<Vec<_>>();
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: leases,
+        });
+        ranges
             .into_iter()
-            .map(|lease| {
-                let range = lease.range();
+            .map(|range| {
                 let shard = self
                     .arena
                     .shard(range.shard)
                     .ok_or_else(|| be("planned unified VRAM range has no physical shard"))?;
-                Ok(Arc::new(UnifiedAllocationHandle { lease, shard }))
+                Ok(Arc::new(UnifiedAllocationHandle {
+                    range,
+                    _owner: Arc::clone(&owner),
+                    shard,
+                }))
             })
             .collect()
     }
@@ -1471,8 +1544,16 @@ impl UnifiedVramPool {
         } else {
             self.ranges.allocate_high(bytes, 256, class)?
         };
-        let shard = self.arena.shard(lease.range().shard)?;
-        Some(Arc::new(UnifiedAllocationHandle { lease, shard }))
+        let range = lease.range();
+        let shard = self.arena.shard(range.shard)?;
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: vec![lease],
+        });
+        Some(Arc::new(UnifiedAllocationHandle {
+            range,
+            _owner: owner,
+            shard,
+        }))
     }
 
     pub(crate) fn try_claim_exact(
@@ -1484,8 +1565,13 @@ impl UnifiedVramPool {
     ) -> Option<Arc<UnifiedAllocationHandle>> {
         let lease = self.ranges.try_claim_exact(shard, offset, bytes, class)?;
         let physical = self.arena.shard(shard)?;
+        let range = lease.range();
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: vec![lease],
+        });
         Some(Arc::new(UnifiedAllocationHandle {
-            lease,
+            range,
+            _owner: owner,
             shard: physical,
         }))
     }
@@ -1641,6 +1727,34 @@ mod tests {
         assert_eq!(layout.kv_corridor(), 0..512);
         assert_eq!(layout.runtime_corridor(), 4352..5120);
         assert_eq!(layout.prefill_corridor(), 512..4352);
+    }
+
+    #[test]
+    fn owner_classes_select_their_frozen_corridors() {
+        let layout = ExpertArenaLayout::build(&[(256, 20, 0)], 4096, 512, 0, 0, 512).unwrap();
+
+        let (kv, kv_direction) = UnifiedVramClass::KvCache.placement(&layout).unwrap();
+        assert_eq!(kv, layout.kv_corridor());
+        assert!(matches!(kv_direction, ClaimDirection::Low));
+
+        let (prefill, prefill_direction) = UnifiedVramClass::Prefill.placement(&layout).unwrap();
+        assert_eq!(prefill, layout.prefill_corridor());
+        assert!(matches!(prefill_direction, ClaimDirection::Low));
+
+        for class in [
+            UnifiedVramClass::LlmRuntime,
+            UnifiedVramClass::EmbeddingWeights,
+            UnifiedVramClass::EmbeddingRuntime,
+            UnifiedVramClass::VisionWeights,
+            UnifiedVramClass::VisionRuntime,
+            UnifiedVramClass::DraftWeights,
+            UnifiedVramClass::DraftRuntime,
+        ] {
+            let (corridor, direction) = class.placement(&layout).unwrap();
+            assert_eq!(corridor, layout.floor_corridor().end..layout.total_bytes());
+            assert!(matches!(direction, ClaimDirection::High));
+        }
+        assert!(UnifiedVramClass::Expert.placement(&layout).is_err());
     }
 
     #[test]
@@ -1907,6 +2021,27 @@ mod tests {
             .try_claim_planned(UnifiedVramClass::LlmRuntime, &plan)
             .unwrap();
         assert_eq!(claimed.len(), 2);
+    }
+
+    #[test]
+    fn owner_batch_keeps_every_range_until_the_final_reference_drops() {
+        let pool = UnifiedRangePool::new([1024]).unwrap();
+        let leases = vec![
+            pool.try_claim_exact(0, 0, 256, UnifiedVramClass::KvCache)
+                .unwrap(),
+            pool.try_claim_exact(0, 256, 256, UnifiedVramClass::KvCache)
+                .unwrap(),
+        ];
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: leases,
+        });
+        let sibling = Arc::clone(&owner);
+
+        drop(owner);
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::KvCache), 512);
+        drop(sibling);
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::KvCache), 0);
+        assert_eq!(pool.stats().free_bytes, 1024);
     }
 
     #[test]

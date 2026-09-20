@@ -42,17 +42,19 @@ use ash::vk;
 use indicatif::ProgressBar;
 
 use infr_core::backend::{Buffer, BufferUsage};
-use infr_core::blockio::BlockDesc;
+use infr_core::blockio::{BlockDesc, BlockIo};
 use infr_core::error::Result;
-use infr_core::hostpager::{AlignedHostBuffer, HostPager, InclusiveHostCache};
+use infr_core::hostpager::{
+    AlignedHostBuffer, HostPager, InclusiveBlockState, InclusiveHostCache, InclusiveHostTier,
+};
 use infr_core::pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
 use infr_core::pager_profile;
 use infr_core::Backend;
 
 use super::{as_vk_buf, be, VulkanBackend};
 use crate::transfer::{
-    parallel_copy_to_mapped as par_copy_to_mapped, DeviceTransferTarget, PreparedTransfer,
-    SessionTransferPlan, TransferExecutor,
+    parallel_copy_to_mapped as par_copy_to_mapped, BackgroundTransferExecutor,
+    DeviceTransferTarget, PreparedTransfer, SessionTransferPlan, TransferExecutor,
 };
 use crate::unified::{
     ExpertSlotId, UnifiedAllocationHandle, UnifiedClaimPlan, UnifiedRange, UnifiedVramClass,
@@ -146,6 +148,89 @@ struct CpuPushPlan {
 struct InclusiveCpuPushPlan {
     target: DeviceTransferTarget,
     evicted: Option<BlockId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotRelocation {
+    block: BlockId,
+    from: u32,
+    to: u32,
+    evicted: Option<BlockId>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SlotRetirementPlan {
+    /// Exactly the globally coldest resident blocks that disappear when the target slots are
+    /// loaned. Entries stay in LRU order so host-tier accounting sees deterministic victims.
+    evicted: Vec<BlockId>,
+    /// Hot residents physically blocking the target range, paired with cold same-size slots
+    /// outside it. The pager has one instance per size class, so every pair is byte-compatible.
+    relocations: Vec<SlotRelocation>,
+}
+
+struct PreparedSlotLoan {
+    slots: Vec<usize>,
+    retirement: SlotRetirementPlan,
+    copies: Vec<(DeviceTransferTarget, DeviceTransferTarget)>,
+}
+
+/// Select the same victims an ideal LRU cache resize would choose, independently of which physical
+/// slots a higher-priority owner happens to cover. A selected victim already inside `targets` is
+/// retired in place. Every other target resident is moved into an existing free cell or one
+/// selected cold slot outside the target, preserving that resident's exact LRU node while making
+/// its old cell reclaimable.
+fn plan_slot_retirement(
+    resident_lru: &[(BlockId, u32)],
+    free_outside: &[u32],
+    targets: &HashSet<usize>,
+) -> SlotRetirementPlan {
+    let target_residents = resident_lru
+        .iter()
+        .filter(|(_, slot)| targets.contains(&(*slot as usize)))
+        .count();
+    let retire_count = target_residents.saturating_sub(free_outside.len());
+    if target_residents == 0 {
+        return SlotRetirementPlan::default();
+    }
+
+    let selected = &resident_lru[..retire_count];
+    let evicted: Vec<_> = selected.iter().map(|&(id, _)| id).collect();
+    let selected_ids: HashSet<_> = evicted.iter().copied().collect();
+    let free_destinations = target_residents - retire_count;
+    let destinations: Vec<_> = free_outside
+        .iter()
+        .copied()
+        .take(free_destinations)
+        .map(|slot| (None, slot))
+        .chain(
+            selected
+                .iter()
+                .copied()
+                .filter(|(_, slot)| !targets.contains(&(*slot as usize)))
+                .map(|(id, slot)| (Some(id), slot)),
+        )
+        .collect();
+    let movers: Vec<_> = resident_lru
+        .iter()
+        .copied()
+        .filter(|(id, slot)| targets.contains(&(*slot as usize)) && !selected_ids.contains(id))
+        .collect();
+    debug_assert_eq!(movers.len(), destinations.len());
+
+    let relocations = movers
+        .into_iter()
+        .zip(destinations)
+        .map(|((block, from), (evicted, to))| SlotRelocation {
+            block,
+            from,
+            to,
+            evicted,
+        })
+        .collect();
+    SlotRetirementPlan {
+        evicted,
+        relocations,
+    }
 }
 
 impl GpuPager {
@@ -386,10 +471,17 @@ impl GpuPager {
         Ok(true)
     }
 
-    fn loan_slots(&mut self, slots: &[usize], min_enabled_slots: usize) -> Result<Vec<BlockId>> {
+    /// Build one pool's physical compaction without changing residency. The session combines the
+    /// copy lists from every size class and executes them as one device transaction before any
+    /// pool commits its LRU/LUT changes.
+    fn plan_slot_loan(
+        &self,
+        slots: &[usize],
+        min_enabled_slots: usize,
+    ) -> Result<PreparedSlotLoan> {
         let unified = self
             .unified
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| be("cannot loan a slot from a legacy pager arena"))?;
         let loan_count = slots
             .iter()
@@ -406,14 +498,87 @@ impl GpuPager {
                 self.pager.enabled_slots(),
             )));
         }
-        let mut victims = Vec::new();
-        for &slot in slots {
+        if self.pager.pinned_blocks() != 0 {
+            return Err(be(
+                "unified VRAM cannot relocate expert slots while a pager read is pinned",
+            ));
+        }
+
+        let targets: HashSet<_> = slots
+            .iter()
+            .copied()
+            .filter(|&slot| {
+                unified
+                    .slots
+                    .get(slot)
+                    .is_some_and(|backing| backing.allocation.is_some())
+            })
+            .collect();
+        let resident_lru = self.pager.resident_slots_lru();
+        let occupied: HashSet<_> = resident_lru.iter().map(|&(_, slot)| slot).collect();
+        let free_outside: Vec<_> = (0..self.pager.n_slots() as u32)
+            .filter(|slot| {
+                self.pager.slot_enabled(*slot)
+                    && !occupied.contains(slot)
+                    && !targets.contains(&(*slot as usize))
+            })
+            .collect();
+        let retirement = plan_slot_retirement(&resident_lru, &free_outside, &targets);
+        let copies: Vec<_> = retirement
+            .relocations
+            .iter()
+            .map(|relocation| {
+                Ok((
+                    self.slot_copy_target(relocation.from)?,
+                    self.slot_copy_target(relocation.to)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(PreparedSlotLoan {
+            slots: slots.to_vec(),
+            retirement,
+            copies,
+        })
+    }
+
+    /// Publish a previously prepared loan after every device copy in the cross-pool transaction
+    /// has completed. The session mutex and unified execution gate keep this plan current, so the
+    /// remaining operations are infallible bookkeeping over the state it just validated.
+    fn commit_slot_loan(&mut self, plan: PreparedSlotLoan) -> Vec<BlockId> {
+        let PreparedSlotLoan {
+            slots,
+            retirement,
+            copies: _,
+        } = plan;
+        for relocation in &retirement.relocations {
+            let evicted = self.pager.disable_slot(relocation.to);
+            debug_assert_eq!(evicted, relocation.evicted);
+            let old = self
+                .pager
+                .rotate_resident_to_spare(relocation.block, relocation.to);
+            debug_assert_eq!(old, relocation.from);
+            apply_placement(
+                &mut self.lut_host,
+                relocation.block,
+                relocation.to,
+                relocation.evicted,
+            );
+            self.lut_dirty = true;
+        }
+
+        let mut retired_in_place = Vec::new();
+        let unified = self
+            .unified
+            .as_mut()
+            .expect("unified backing was validated before relocation");
+        for slot in slots {
             if unified.slots[slot].allocation.is_none() {
                 continue;
             }
             if self.pager.slot_enabled(slot as u32) {
                 if let Some(evicted) = self.pager.disable_slot(slot as u32) {
-                    victims.push(evicted);
+                    retired_in_place.push(evicted);
                     if let Some(entry) = self.lut_host.get_mut(evicted as usize) {
                         *entry = NOT_RESIDENT;
                     }
@@ -422,7 +587,19 @@ impl GpuPager {
             }
             unified.slots[slot].allocation.take();
         }
-        Ok(victims)
+        debug_assert_eq!(
+            retired_in_place.len()
+                + retirement
+                    .relocations
+                    .iter()
+                    .filter(|relocation| relocation.evicted.is_some())
+                    .count(),
+            retirement.evicted.len()
+        );
+        debug_assert!(retired_in_place
+            .iter()
+            .all(|id| retirement.evicted.contains(id)));
+        retirement.evicted
     }
 
     fn try_restore_loaned_slots(&mut self) -> usize {
@@ -576,6 +753,22 @@ impl GpuPager {
         }
     }
 
+    /// Speculative counterpart of [`Self::plan_cpu_push`]. It does not count as a demand lookup,
+    /// keeps resident predictions in place, and refuses admission when the current compute batch
+    /// protects every possible victim.
+    fn plan_prefetch_cpu_push(&mut self, id: BlockId) -> Result<Option<CpuPushPlan>> {
+        match self.pager.prefetch_cold(id) {
+            None | Some(Resolution::Hit { .. }) => Ok(None),
+            Some(Resolution::Miss { slot, evicted }) => {
+                self.record_placement(id, slot, evicted);
+                Ok(Some(CpuPushPlan {
+                    target: self.slot_copy_target(slot)?,
+                    evicted,
+                }))
+            }
+        }
+    }
+
     /// Permanently reserve one physical slot as this size class's exchange destination. The slot
     /// stays allocated in the unified arena but is disabled in the ordinary VRAM LRU until a
     /// promotion rotates into it; the evicted slot then becomes the next disabled spare.
@@ -706,6 +899,42 @@ impl GpuPager {
                 slot,
                 evicted: Some(victim),
             } => {
+                let promoted_slot = *exchange_slot;
+                let old_slot = self.pager.rotate_resident_to_spare(id, promoted_slot);
+                debug_assert_eq!(old_slot, slot);
+                *exchange_slot = old_slot;
+                self.record_placement(id, promoted_slot, Some(victim));
+                Ok(Some(InclusiveCpuPushPlan {
+                    target: self.slot_copy_target(promoted_slot)?,
+                    evicted: Some(victim),
+                }))
+            }
+        }
+    }
+
+    /// Inclusive-RAM form of [`Self::plan_prefetch_cpu_push`]. The rotating spare keeps GPU
+    /// eviction metadata-only exactly as on the demand path; only LRU insertion/statistics differ.
+    fn plan_inclusive_prefetch_cpu_push(
+        &mut self,
+        id: BlockId,
+        exchange_slot: &mut u32,
+    ) -> Result<Option<InclusiveCpuPushPlan>> {
+        match self.pager.prefetch_cold(id) {
+            None | Some(Resolution::Hit { .. }) => Ok(None),
+            Some(Resolution::Miss {
+                slot,
+                evicted: None,
+            }) => {
+                self.record_placement(id, slot, None);
+                Ok(Some(InclusiveCpuPushPlan {
+                    target: self.slot_copy_target(slot)?,
+                    evicted: None,
+                }))
+            }
+            Some(Resolution::Miss {
+                slot,
+                evicted: Some(victim),
+            }) => {
                 let promoted_slot = *exchange_slot;
                 let old_slot = self.pager.rotate_resident_to_spare(id, promoted_slot);
                 debug_assert_eq!(old_slot, slot);
@@ -1229,8 +1458,9 @@ fn stats_suffix(s: &PagerStats) -> String {
 }
 
 /// Load-time description of one paged layer's per-role expert bank. In full-RAM mode `register`
-/// copies it once into the session's CPU-only layer-major store. In bounded-RAM mode the
-/// individual block descriptors have already been registered with the inclusive host cache.
+/// reads its file descriptor directly into the session's CPU-only layer-major store. In
+/// bounded-RAM mode the seam registers the individual block descriptors after fixed GPU uploads
+/// and before calling `register` here.
 pub struct ExpertSource {
     pub bank: Arc<dyn AsRef<[u8]> + Send + Sync>,
     pub stride_bytes: usize,
@@ -1241,8 +1471,9 @@ pub struct ExpertSource {
     pub layer_base: u32,
     /// Byte offset assigned by the seam's layer-major permanent host-store plan.
     pub host_offset: usize,
-    /// Exact file descriptor of this whole role bank. Present in bounded-RAM mode and validated
-    /// against the per-expert descriptors used to assemble Prefill banks from RAM plus SSD misses.
+    /// Exact file descriptor of this whole role bank. The full store reads it directly rather than
+    /// faulting GGUF mmap pages; bounded mode validates it against the per-expert descriptors used
+    /// to assemble Prefill banks from RAM plus SSD misses.
     pub file: Option<BlockDesc>,
 }
 
@@ -1276,15 +1507,18 @@ impl HostStoreChunk {
             .then(|| unsafe { self.bytes.slice(offset, len) })
     }
 
-    fn copy_from_slice(&self, offset: usize, src: &[u8]) -> Result<()> {
-        let dst = offset
-            .checked_add(src.len())
+    fn read_block(&self, offset: usize, desc: &BlockDesc, io: &dyn BlockIo) -> Result<()> {
+        let len = desc.nbytes();
+        let dst_end = offset
+            .checked_add(len)
             .filter(|&end| end <= self.bytes.len())
-            .ok_or_else(|| be("host-store copy range out of bounds"))?;
-        let len = dst - offset;
-        debug_assert_eq!(len, src.len());
-        unsafe { self.bytes.copy_from_slice(offset, src) };
-        Ok(())
+            .ok_or_else(|| be("host-store file-read range out of bounds"))?;
+        debug_assert_eq!(dst_end - offset, len);
+        // Registration is single-threaded before graph construction, and the seam assigns every
+        // expert bank a disjoint destination range. Reading directly into that final range avoids
+        // faulting the same bank through GGUF mmap while a second anonymous copy is being built.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.bytes.as_ptr().add(offset), len) };
+        io.read_block(desc, dst)
     }
 }
 
@@ -1294,6 +1528,7 @@ impl HostStoreChunk {
 #[must_use = "pager promotions must be recorded or explicitly completed"]
 pub struct PreparedHostPush {
     requested: usize,
+    bytes: usize,
     transfer: PreparedTransfer,
 }
 
@@ -1309,6 +1544,49 @@ impl PreparedHostPush {
     ) -> Result<usize> {
         self.transfer.complete_now(executor)?;
         Ok(self.requested)
+    }
+
+    pub(crate) fn submit_background(
+        self,
+        executor: &BackgroundTransferExecutor,
+    ) -> Result<Option<u64>> {
+        self.transfer.submit_background(executor)
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// Source tier for one complete predicted logical expert after filtering role blocks already in
+/// VRAM. Classification is read-only; only the `Ram` arm may proceed to GPU admission.
+pub(crate) enum ExpertPrefetchSource {
+    Resident,
+    Ram { bytes: usize },
+    Loading,
+    Ssd(PreparedHostPrefetch),
+}
+
+/// One best-effort SSD-to-RAM job. A job may contain Gate/Up/Down blocks from different size
+/// classes, but represents only one predicted logical expert.
+pub(crate) struct PreparedHostPrefetch {
+    blocks: Vec<(Arc<InclusiveHostCache>, BlockId)>,
+}
+
+impl PreparedHostPrefetch {
+    pub(crate) fn execute(self) -> Result<usize> {
+        use rayon::prelude::*;
+
+        let outcomes: Vec<Result<bool>> = self
+            .blocks
+            .into_par_iter()
+            .map(|(cache, id)| cache.prefetch_cold(id))
+            .collect();
+        let mut loaded = 0usize;
+        for outcome in outcomes {
+            loaded += usize::from(outcome?);
+        }
+        Ok(loaded)
     }
 }
 
@@ -1534,6 +1812,13 @@ pub struct MoePagerSession {
     /// The only owned host copy of all paged MoE weights. Plain CPU memory, deliberately not a
     /// Vulkan buffer: the full payload cannot be counted or accessed as shared/virtual VRAM.
     host_store: Vec<HostStoreChunk>,
+    /// Bounded RAM/SSD owner. Size classes retain independent LRUs, while this object freezes their
+    /// shared budget and lifetime for the model session. `None` selects the full host store above.
+    _host_tier: Option<Arc<InclusiveHostTier>>,
+    /// File reader used only to populate the permanent full-RAM store. Keeping this separate from
+    /// the GGUF mapping prevents Windows from making both the mapped source pages and the final
+    /// anonymous Host Store resident during load.
+    host_store_io: Option<Arc<dyn BlockIo>>,
     /// Frozen host-to-device routes for this session. The pager submits opaque source/target
     /// requests through it and never branches on mapped memory, host import or staging details.
     transfer_plan: Arc<SessionTransferPlan>,
@@ -1599,9 +1884,6 @@ pub struct MoePoolSpec {
     pub n_slots: usize,
     /// Runtime loans may consume surplus slots, but must preserve this planner-derived batch floor.
     pub min_enabled_slots: usize,
-    /// Bounded inclusive RAM cache below this VRAM size class. `None` selects the permanent
-    /// full-Host-Store fast path.
-    pub host: Option<Arc<InclusiveHostCache>>,
 }
 
 /// One chunk of the unique permanent CPU store. Chunks are split only at complete layer boundaries
@@ -1611,12 +1893,10 @@ pub struct MoeHostChunkSpec {
     pub bytes: usize,
 }
 
-/// Fixed layout for [`MoePagerSession::new`] — sizes every arena/LUT UP FRONT, before any tensor
-/// is registered. This split (layout now, registration per tensor later) matters for sequencing:
-/// the session must exist and answer `is_paged`/`Backend::moe_paged` truthy BEFORE the seam's
-/// weight-load closure runs (so a paged tensor's placeholder buffer is recognized the very first
-/// time the adapter executes a graph, not just after the whole model is loaded) — see
-/// `infr-llama`'s `generate_dense_vulkan_session` for the call order this enables.
+/// Fixed layout for [`MoePagerSession::new`]. The seam creates it after resident/fixed allocations,
+/// then registers every weight placeholder before graph construction. Thus arena sizing uses the
+/// measured steady-state remainder while `Backend::moe_paged` and the source directory are still
+/// complete before the adapter can execute anything.
 pub struct MoePagerLayout {
     /// Runtime workspace to hold physically until cold session initialization has completed. The
     /// separate weight-packing margin must remain free for the real BDA block tails to consume.
@@ -1626,6 +1906,12 @@ pub struct MoePagerLayout {
     /// it; other layers' entries stay `NOT_RESIDENT`).
     pub n_blocks: usize,
     pub pools: Vec<MoePoolSpec>,
+    /// One bounded RAM/SSD tier shared by all size classes. `None` selects the permanent full-RAM
+    /// host store described by `host_chunks`.
+    pub host_tier: Option<Arc<InclusiveHostTier>>,
+    /// Positioned file reader for populating a permanent full-RAM store without touching GGUF mmap
+    /// pages. Required when a full-store expert bank is registered; unused by the bounded tier.
+    pub host_store_io: Option<Arc<dyn BlockIo>>,
     /// Maximum lazily committed KV/QSA bytes. The unified arena reserves this low-address
     /// corridor logically while allowing Expert filler to occupy uncommitted cells.
     pub dynamic_state_reserve_bytes: u64,
@@ -1681,14 +1967,19 @@ impl MoePagerSession {
                 layout.load_reserve_bytes as f64 / (1u64 << 30) as f64,
             );
         }
-        let tiered = layout.pools.iter().any(|pool| pool.host.is_some());
+        let tiered = layout.host_tier.is_some();
         if !tiered && layout.host_chunks.is_empty() {
             return Err(be("moe pager: permanent host-store plan has no chunks"));
         }
-        if tiered && layout.pools.iter().any(|pool| pool.host.is_none()) {
-            return Err(be(
-                "moe pager: bounded-RAM mode requires a host tier for every size class",
-            ));
+        if let Some(host_tier) = &layout.host_tier {
+            for pool in &layout.pools {
+                if host_tier.cache(pool.slot_bytes).is_none() {
+                    return Err(be(format!(
+                        "moe pager: bounded RAM tier has no {}-byte size class",
+                        pool.slot_bytes
+                    )));
+                }
+            }
         }
         let mut host_store = Vec::with_capacity(layout.host_chunks.len());
         let mut previous_end = 0usize;
@@ -1711,21 +2002,15 @@ impl MoePagerSession {
         for chunk in &host_store {
             transfer_sources.push((Arc::clone(&chunk.bytes), 1));
         }
-        for pool in &layout.pools {
-            if let Some(host) = &pool.host {
-                transfer_sources.push((host.arena_allocation(), pool.slot_bytes));
-            }
+        if let Some(host_tier) = &layout.host_tier {
+            transfer_sources.extend(host_tier.arena_allocations());
         }
-        if tiered {
-            let cache_bytes: usize = layout
-                .pools
-                .iter()
-                .filter_map(|pool| pool.host.as_ref())
-                .map(|host| host.arena_bytes())
-                .sum();
+        if let Some(host_tier) = &layout.host_tier {
             tracing::info!(
-                "[infr] paged-MoE host tier: inclusive bounded cache={} bytes; permanent full Host Store=0 bytes",
-                cache_bytes,
+                "[infr] paged-MoE host tier: inclusive bounded cache={} bytes of a {}-byte budget across {} size class(es); permanent full Host Store=0 bytes",
+                host_tier.arena_bytes(),
+                host_tier.budget_bytes(),
+                host_tier.classes().len(),
             );
         } else {
             tracing::info!(
@@ -1774,7 +2059,11 @@ impl MoePagerSession {
                 spec.n_slots,
                 spec.slot_bytes,
             )?;
-            let exchange_slot = if spec.host.is_some() {
+            let host = layout
+                .host_tier
+                .as_ref()
+                .and_then(|tier| tier.cache(spec.slot_bytes));
+            let exchange_slot = if host.is_some() {
                 Some(pager.reserve_exchange_slot()?)
             } else {
                 None
@@ -1791,7 +2080,7 @@ impl MoePagerSession {
                 slot_bytes: spec.slot_bytes,
                 pager,
                 min_enabled_slots: spec.min_enabled_slots,
-                host: spec.host.clone(),
+                host,
                 exchange_slot,
             });
         }
@@ -1813,6 +2102,8 @@ impl MoePagerSession {
             unified_pool,
             role_stride: layout.n_blocks,
             host_store,
+            _host_tier: layout.host_tier,
+            host_store_io: layout.host_store_io,
             transfer_plan: Arc::new(transfer_plan),
             prefill_host_worker_ready,
             pending_transfer_sources: transfer_sources,
@@ -1938,8 +2229,8 @@ impl MoePagerSession {
         Ok((total_blocks, total_bytes))
     }
 
-    /// Register one paged layer's `role` tensor — called from the seam's weight-load closure
-    /// (once per paged `_exps` tensor) instead of uploading it. `buf_id` is the placeholder
+    /// Register one paged layer's `role` tensor — called from the seam's post-fixed-allocation
+    /// finalizer (once per skipped `_exps` tensor). `buf_id` is the placeholder
     /// buffer's identity (see [`buffer_identity`]); `source` is where its bytes actually live.
     /// The pool is picked by `source.stride_bytes` — errors if the layout has no matching pool (a
     /// seam sizing bug: layout enumeration and registration must derive the same expert size).
@@ -1964,31 +2255,30 @@ impl MoePagerSession {
                     source.stride_bytes, role,
                 ))
             })?;
-        let bank = expert_bytes(&source.bank);
         let expected = source
             .stride_bytes
             .checked_mul(n_expert)
             .ok_or_else(|| be("moe pager: expert bank byte size overflow"))?;
-        if bank.len() != expected {
+        let bank_bytes = expert_bytes(&source.bank).len();
+        if bank_bytes != expected {
             return Err(be(format!(
-                "moe pager: bank is {} bytes, expected {n_expert} x {} = {expected}",
-                bank.len(),
+                "moe pager: bank is {bank_bytes} bytes, expected {n_expert} x {} = {expected}",
+                source.stride_bytes,
+            )));
+        }
+        let file = source
+            .file
+            .as_ref()
+            .ok_or_else(|| be("moe pager: expert bank has no file descriptor"))?;
+        if file.nbytes() != expected {
+            return Err(be(format!(
+                "moe pager: bank file descriptor is {} bytes, expected {n_expert} x {} = {expected}",
+                file.nbytes(),
                 source.stride_bytes,
             )));
         }
         let block_base = (role.index() * self.role_stride) as u32 + source.layer_base;
         let (host_chunk, chunk_offset) = if let Some(host) = &self.pools[pool].host {
-            let file = source
-                .file
-                .clone()
-                .ok_or_else(|| be("moe pager: bounded-RAM expert bank has no file descriptor"))?;
-            if file.nbytes() != bank.len() {
-                return Err(be(format!(
-                    "moe pager: bank file descriptor is {} bytes, expected {}",
-                    file.nbytes(),
-                    bank.len(),
-                )));
-            }
             for expert in 0..n_expert as u32 {
                 let id = block_base + expert;
                 if host.block_bytes(id) != Some(source.stride_bytes) {
@@ -2000,9 +2290,13 @@ impl MoePagerSession {
             }
             (None, 0)
         } else {
+            let io =
+                Arc::clone(self.host_store_io.as_ref().ok_or_else(|| {
+                    be("moe pager: permanent host store has no direct file reader")
+                })?);
             let end = source
                 .host_offset
-                .checked_add(bank.len())
+                .checked_add(expected)
                 .ok_or_else(|| be("moe pager: host-store offset overflow"))?;
             let (host_chunk, chunk) = self
                 .host_store
@@ -2019,11 +2313,7 @@ impl MoePagerSession {
                     ))
                 })?;
             let chunk_offset = source.host_offset - chunk.base_offset;
-            let copy_t0 = pager_profile::active().then(std::time::Instant::now);
-            chunk.copy_from_slice(chunk_offset, bank)?;
-            if let Some(t0) = copy_t0 {
-                pager_profile::record_memcpy(bank.len(), t0.elapsed());
-            }
+            chunk.read_block(chunk_offset, file, io.as_ref())?;
             (Some(host_chunk), chunk_offset)
         };
         self.sources.insert(
@@ -2037,7 +2327,7 @@ impl MoePagerSession {
                     block_base,
                     host_chunk,
                     host_offset: chunk_offset,
-                    bank_bytes: bank.len(),
+                    bank_bytes: expected,
                 },
             ),
         );
@@ -2089,8 +2379,9 @@ impl MoePagerSession {
     /// Retire exactly the Expert filler cells selected by the arena manager, then commit every
     /// higher-priority range as one allocator transaction. The manager owns geometry; the pager
     /// remains the sole owner of LRU/LUT and bounded-RAM shadow semantics.
-    pub(crate) fn commit_unified_claim(
+    pub(crate) fn commit_unified_claim<E: TransferExecutor>(
         &mut self,
+        executor: &E,
         plan: UnifiedClaimPlan,
     ) -> Result<Vec<Arc<UnifiedAllocationHandle>>> {
         let floor_suspended =
@@ -2138,9 +2429,11 @@ impl MoePagerSession {
         }
 
         let loaned: usize = by_pool.iter().map(Vec::len).sum();
-        for (pool_index, (pool, slots)) in self.pools.iter_mut().zip(by_pool).enumerate() {
+        // Park rotating bounded-host exchange spares before planning physical moves. Parking is a
+        // complete valid cache state by itself: a later planning/copy error may lose one cold
+        // resident, but cannot lose capacity or leave a half-relocated address.
+        for (pool_index, (pool, slots)) in self.pools.iter_mut().zip(&by_pool).enumerate() {
             let claimed: HashSet<_> = slots.iter().copied().collect();
-            let mut evicted = Vec::new();
             if !floor_suspended {
                 if let Some(mut exchange) = pool.exchange_slot {
                     if let Some(id) = pool.pager.park_exchange_for_claim(
@@ -2148,17 +2441,38 @@ impl MoePagerSession {
                         &floor_slots[pool_index],
                         &claimed,
                     )? {
-                        evicted.push(id);
+                        if let Some(host) = &pool.host {
+                            host.release_gpu_blocks(&[id]);
+                        }
                     }
                     pool.exchange_slot = Some(exchange);
                 }
             }
-            let retained_floor = if floor_suspended {
-                0
-            } else {
-                pool.min_enabled_slots
-            };
-            evicted.extend(pool.pager.loan_slots(&slots, retained_floor)?);
+        }
+
+        let loans = self
+            .pools
+            .iter()
+            .zip(&by_pool)
+            .map(|(pool, slots)| {
+                let retained_floor = if floor_suspended {
+                    0
+                } else {
+                    pool.min_enabled_slots
+                };
+                pool.pager.plan_slot_loan(slots, retained_floor)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let copies = loans
+            .iter()
+            .flat_map(|loan| loan.copies.iter().cloned())
+            .collect::<Vec<_>>();
+
+        // All physical movement succeeds before any size class changes its LRU, LUT or owner
+        // metadata. A transfer error therefore leaves every prepared pool untouched.
+        executor.relocate_device_ranges_now(&copies)?;
+        for (pool, loan) in self.pools.iter_mut().zip(loans) {
+            let evicted = pool.pager.commit_slot_loan(loan);
             if let Some(host) = &pool.host {
                 host.release_gpu_blocks(&evicted);
             }
@@ -2215,6 +2529,13 @@ impl MoePagerSession {
             );
         }
         restored
+    }
+
+    /// Reclaim ranges released by an auxiliary client at the service-level execution boundary,
+    /// without changing Decode/Prefill interpretation. This is intentionally absent from the
+    /// per-token pager path.
+    pub(crate) fn restore_released_unified_slots(&mut self) -> usize {
+        self.restore_unified_slots_if_changed()
     }
 
     fn restore_exchange_spares(&mut self) {
@@ -2280,7 +2601,7 @@ impl MoePagerSession {
         true
     }
 
-    fn build_prefill_layout(&mut self) -> Result<()> {
+    fn build_prefill_layout<E: TransferExecutor>(&mut self, executor: &E) -> Result<()> {
         if !self.prefill_placement.is_empty() {
             return Ok(());
         }
@@ -2381,10 +2702,11 @@ impl MoePagerSession {
                     coordinates.push((lane, bank));
                 }
             }
-            let plan = match self
-                .unified_pool
-                .plan_prefill_claim(&requested, &protected_experts)
-            {
+            let plan = match self.unified_pool.plan_owner_claim(
+                &requested,
+                UnifiedVramClass::Prefill,
+                &protected_experts,
+            ) {
                 Ok(plan) => plan,
                 Err(error) => {
                     last_error = Some(error.to_string());
@@ -2392,7 +2714,7 @@ impl MoePagerSession {
                 }
             };
             let retired = plan.victims().len();
-            let allocations = match self.commit_unified_claim(plan) {
+            let allocations = match self.commit_unified_claim(executor, plan) {
                 Ok(allocations) => allocations,
                 Err(error) => {
                     last_error = Some(error.to_string());
@@ -2476,11 +2798,11 @@ impl MoePagerSession {
 
     /// Select whole-layer interpretation for Prefill. The ring claims its frozen middle corridor;
     /// every Expert cell outside those exact physical ranges retains both residency and heat.
-    pub fn enter_prefill_layer(&mut self) -> Result<()> {
+    pub(crate) fn enter_prefill_layer<E: TransferExecutor>(&mut self, executor: &E) -> Result<()> {
         if self.mode != MoeArenaMode::PrefillLayer {
             // Decode/runtime allocations may have released ranges since the previous phase.
             self.restore_unified_slots_if_changed();
-            self.build_prefill_layout()?;
+            self.build_prefill_layout(executor)?;
             self.prefill_lane_layer.fill(None);
             self.prefill_loaded.clear();
         }
@@ -2510,11 +2832,12 @@ impl MoePagerSession {
 
     /// Reserve a layer's ring lane and resolve stable host/device ranges. `None` means the layer
     /// is already loaded or already queued.
-    pub(crate) fn prepare_prefill_layer_cpu(
+    pub(crate) fn prepare_prefill_layer_cpu<E: TransferExecutor>(
         &mut self,
+        executor: &E,
         buf_id: usize,
     ) -> Result<Option<PrefillCopyJob>> {
-        self.enter_prefill_layer()?;
+        self.enter_prefill_layer(executor)?;
         if self.layer_bank_current(buf_id)? || self.layer_bank_pending(buf_id)? {
             return Ok(None);
         }
@@ -2680,6 +3003,18 @@ impl MoePagerSession {
         self.tape.as_ref()
     }
 
+    /// Model-layer index encoded by a registered expert bank's global block range.
+    pub(crate) fn registered_layer(&self, buf_id: usize, n_expert: usize) -> Result<u32> {
+        if n_expert == 0 {
+            return Err(be("moe pager: cannot derive a layer with zero experts"));
+        }
+        let (_, _, source) = self
+            .sources
+            .get(&buf_id)
+            .ok_or_else(|| be("moe pager: layer queried an unregistered buffer"))?;
+        Ok(source.layer_base / n_expert as u32)
+    }
+
     /// Whether ALL `n_expert` experts of `buf_id`'s layer are resident in its pool — the
     /// no-readback inline gate for a small-m (decode) layer: when true, any routing the GPU
     /// picks is covered, so the host needs no routing knowledge at all.
@@ -2694,24 +3029,18 @@ impl MoePagerSession {
 
     /// Return one bit per routed slot whose expert is resident in every supplied role. This is a
     /// read-only Decode scheduling query used to launch complete hit triplets while the remaining
-    /// experts are promoted. All roles must share one physical size pool so a single pager epoch
-    /// can protect the in-flight hit slots from the later miss insertions.
+    /// experts are promoted. Each role's size pool opens its own pager epoch before those hits are
+    /// touched, protecting every in-flight role from later miss insertions.
     pub fn routed_roles_resident_mask(&self, buf_ids: &[usize], ids: &[u32]) -> Result<u32> {
         if ids.len() > u32::BITS as usize {
             return Err(be("moe pager: routed residency mask exceeds 32 slots"));
         }
         let mut resolved = Vec::with_capacity(buf_ids.len());
-        let mut common_pool = None;
         for &buf_id in buf_ids {
             let (_, pool, src) = self
                 .sources
                 .get(&buf_id)
                 .ok_or_else(|| be("moe pager: residency mask queried an unregistered buffer"))?;
-            match common_pool {
-                Some(existing) if existing != *pool => return Ok(0),
-                None => common_pool = Some(*pool),
-                _ => {}
-            }
             resolved.push((*pool, src.block_base));
         }
         let mut mask = 0u32;
@@ -2724,6 +3053,64 @@ impl MoePagerSession {
             }
         }
         Ok(mask)
+    }
+
+    /// Classify one predicted logical expert without changing either cache's replacement order.
+    /// Role blocks already present in VRAM are filtered out. A bounded host tier reports `Ram`
+    /// only when every remaining role is immediately readable; SSD work is returned as an owned
+    /// plan so the caller can perform it after releasing the GPU pager lock.
+    pub(crate) fn expert_prefetch_source(
+        &self,
+        role_buf_ids: &[usize],
+        local_id: u32,
+    ) -> Result<ExpertPrefetchSource> {
+        let mut seen = HashSet::with_capacity(role_buf_ids.len());
+        let mut bytes = 0usize;
+        let mut loading = false;
+        let mut ssd = Vec::new();
+        for &buf_id in role_buf_ids {
+            if !seen.insert(buf_id) {
+                continue;
+            }
+            let (_, pool_idx, src) = self
+                .sources
+                .get(&buf_id)
+                .ok_or_else(|| be("moe pager: prefetch named an unregistered expert bank"))?;
+            if src.stride_bytes == 0 || !src.bank_bytes.is_multiple_of(src.stride_bytes) {
+                return Err(be("moe pager: invalid prefetched expert bank geometry"));
+            }
+            let n_expert = src.bank_bytes / src.stride_bytes;
+            if local_id as usize >= n_expert {
+                return Err(be(format!(
+                    "moe pager: prefetched expert {local_id} exceeds a {n_expert}-expert bank"
+                )));
+            }
+            let pool = &self.pools[*pool_idx];
+            let id = src.block_base + local_id;
+            if pool.pager.is_resident(id) {
+                continue;
+            }
+            bytes = bytes.saturating_add(src.stride_bytes);
+            let Some(host) = pool.host.as_ref() else {
+                continue;
+            };
+            match host.block_state(id)? {
+                InclusiveBlockState::Ready => {}
+                InclusiveBlockState::Loading => loading = true,
+                InclusiveBlockState::Absent => ssd.push((Arc::clone(host), id)),
+            }
+        }
+        if bytes == 0 {
+            Ok(ExpertPrefetchSource::Resident)
+        } else if !ssd.is_empty() {
+            Ok(ExpertPrefetchSource::Ssd(PreparedHostPrefetch {
+                blocks: ssd,
+            }))
+        } else if loading {
+            Ok(ExpertPrefetchSource::Loading)
+        } else {
+            Ok(ExpertPrefetchSource::Ram { bytes })
+        }
     }
 
     /// LRU maintenance for an inline-recorded (no-readback) layer: mark all `n_expert` blocks
@@ -2773,9 +3160,34 @@ impl MoePagerSession {
         Ok(())
     }
 
-    /// Open one epoch for several roles that share the same logical size pool. Gate, Up and Down
-    /// then remain eviction-protected until the complete routed set has been resolved, even though
-    /// their bytes may live in unrelated physical arenas.
+    /// Open one epoch in every logical size pool used by the supplied roles. Gate, Up and Down then
+    /// remain eviction-protected until the complete routed set has been resolved, including models
+    /// whose Down blocks use a different size class from Gate/Up.
+    pub fn begin_role_batches(&mut self, buf_ids: &[usize]) -> Result<bool> {
+        for &buf_id in buf_ids {
+            self.sources
+                .get(&buf_id)
+                .ok_or_else(|| be("moe pager: role begin_batch on an unregistered buffer"))?;
+        }
+        if buf_ids.is_empty() {
+            return Ok(false);
+        }
+        for (role_idx, &buf_id) in buf_ids.iter().enumerate() {
+            let pool_idx = self.sources[&buf_id].1;
+            let already_open = buf_ids[..role_idx]
+                .iter()
+                .any(|previous| self.sources[previous].1 == pool_idx);
+            if already_open {
+                continue;
+            }
+            self.pools[pool_idx].pager.begin_batch();
+        }
+        Ok(true)
+    }
+
+    /// Open one epoch for several roles only when they share a logical size pool. This is the
+    /// original combined-role path used by ordinary paging; cross-pool batching is reserved for
+    /// the Decode hit-first schedule that explicitly protects every involved pool.
     pub fn begin_shared_batch(&mut self, buf_ids: &[usize]) -> Result<bool> {
         let mut pool_idx = None;
         for &buf_id in buf_ids {
@@ -2809,11 +3221,10 @@ impl MoePagerSession {
         self.push_roles_cpu(executor, &[(buf_id, local_ids)], scan)
     }
 
-    /// Resolve several roles from one shared size pool in caller order, then move all resulting
-    /// misses as one transfer batch. This preserves the exact LRU/LUT decisions of repeated
-    /// [`Self::push_role_cpu`] calls while allowing split Gate/Up/Down banks to share one deeper
-    /// full-RAM, bounded-RAM or SSD-to-device batch. The caller must have opened one shared pager
-    /// epoch first.
+    /// Resolve several roles in caller order within each independent size pool, then move all
+    /// resulting misses as one transfer batch. This preserves each pool's exact LRU/LUT decisions
+    /// while allowing differently-sized Gate/Up/Down banks to share one full-RAM, bounded-RAM or
+    /// SSD-to-device batch. The caller must have opened one epoch for every involved pool first.
     pub(crate) fn push_roles_cpu<E: TransferExecutor>(
         &mut self,
         executor: &E,
@@ -2823,6 +3234,7 @@ impl MoePagerSession {
         if roles.is_empty() {
             return Ok(PreparedHostPush {
                 requested: 0,
+                bytes: 0,
                 transfer: PreparedTransfer::default(),
             });
         }
@@ -2851,12 +3263,6 @@ impl MoePagerSession {
                 local_ids,
             ));
         }
-        let pool_idx = resolved[0].1;
-        if resolved.iter().any(|entry| entry.1 != pool_idx) {
-            return Err(be(
-                "moe pager: cross-role CPU push spans multiple size pools",
-            ));
-        }
         let requested = resolved.iter().map(|entry| entry.7.len()).sum();
         let trace_call = self.trace.as_mut().map(PagerTrace::begin_call);
         let Self {
@@ -2867,99 +3273,241 @@ impl MoePagerSession {
             ..
         } = self;
         let transfer_plan = Arc::clone(transfer_plan);
-        let pool = &mut pools[pool_idx];
         let mut transfer = PreparedTransfer::default();
-        if let Some(host) = pool.host.as_ref().cloned() {
-            // Resolve in the original order first: this preserves exact GPU-LRU victim selection
-            // and LUT contents. Only the resulting independent byte moves run in parallel.
-            let mut promotions = Vec::with_capacity(requested);
-            let mut targets = Vec::with_capacity(requested);
-            for &(role, _, stride, block_base, layer, _, _, local_ids) in &resolved {
-                for &lid in local_ids {
-                    let id = block_base + lid;
-                    let plan = pool.pager.plan_inclusive_cpu_push(
+        let mut transfer_bytes = 0usize;
+        let mut resident_uploads: Vec<(&[u8], DeviceTransferTarget)> = Vec::new();
+        for first_role_idx in 0..resolved.len() {
+            let pool_idx = resolved[first_role_idx].1;
+            if resolved[..first_role_idx]
+                .iter()
+                .any(|entry| entry.1 == pool_idx)
+            {
+                continue;
+            }
+            let pool = &mut pools[pool_idx];
+            let pool_requested = resolved
+                .iter()
+                .filter(|entry| entry.1 == pool_idx)
+                .map(|entry| entry.7.len())
+                .sum();
+            if let Some(host) = pool.host.as_ref().cloned() {
+                // Resolve in caller order within this pool first: pools have independent LRUs, so
+                // grouping them cannot change victim selection or LUT contents.
+                let mut promotions = Vec::with_capacity(pool_requested);
+                let mut targets = Vec::with_capacity(pool_requested);
+                for &(role, role_pool, stride, block_base, layer, _, _, local_ids) in &resolved {
+                    if role_pool != pool_idx {
+                        continue;
+                    }
+                    for &lid in local_ids {
+                        let id = block_base + lid;
+                        let plan = pool.pager.plan_inclusive_cpu_push(
+                            id,
+                            pool.exchange_slot
+                                .as_mut()
+                                .expect("tiered pool has an exchange slot"),
+                            scan,
+                        )?;
+                        if let (Some(trace), Some(call)) = (trace.as_mut(), trace_call) {
+                            trace.records.push(PagerTraceRecord {
+                                call,
+                                pool: pool_idx as u32,
+                                layer,
+                                expert: lid,
+                                block_id: id,
+                                bytes: stride.min(u32::MAX as usize) as u32,
+                                evicted: plan
+                                    .as_ref()
+                                    .and_then(|plan| plan.evicted)
+                                    .unwrap_or(TRACE_NO_EVICTION),
+                                role,
+                                gpu_hit: plan.is_none(),
+                            });
+                        }
+                        let Some(plan) = plan else {
+                            continue;
+                        };
+                        transfer_bytes = transfer_bytes.saturating_add(stride);
+                        let target = targets.len();
+                        targets.push(plan.target);
+                        promotions.push((id, plan.evicted, target));
+                    }
+                }
+                let collected = std::sync::Mutex::new(PreparedTransfer::default());
+                host.promote_batch(&promotions, |bytes, target| {
+                    let mut local = PreparedTransfer::default();
+                    transfer_plan.prepare_upload(executor, bytes, &targets[target], &mut local)?;
+                    collected.lock().unwrap().append(local);
+                    Ok(())
+                })?;
+                transfer.append(collected.into_inner().unwrap());
+            } else {
+                for &(
+                    role,
+                    role_pool,
+                    stride,
+                    block_base,
+                    layer,
+                    host_chunk,
+                    host_base,
+                    local_ids,
+                ) in &resolved
+                {
+                    if role_pool != pool_idx {
+                        continue;
+                    }
+                    for &lid in local_ids {
+                        let local = lid as usize;
+                        let id = block_base + lid;
+                        let host_chunk = host_chunk.ok_or_else(|| {
+                            be("moe pager: resident Host Store source has no chunk")
+                        })?;
+                        let src = host_base
+                            .checked_add(local.saturating_mul(stride))
+                            .ok_or_else(|| be("moe pager: expert host offset overflow"))?;
+                        let plan = pool.pager.plan_cpu_push(id, scan)?;
+                        if let (Some(trace), Some(call)) = (trace.as_mut(), trace_call) {
+                            trace.records.push(PagerTraceRecord {
+                                call,
+                                pool: pool_idx as u32,
+                                layer,
+                                expert: lid,
+                                block_id: id,
+                                bytes: stride.min(u32::MAX as usize) as u32,
+                                evicted: plan
+                                    .as_ref()
+                                    .and_then(|plan| plan.evicted)
+                                    .unwrap_or(TRACE_NO_EVICTION),
+                                role,
+                                gpu_hit: plan.is_none(),
+                            });
+                        }
+                        if let Some(plan) = plan {
+                            transfer_bytes = transfer_bytes.saturating_add(stride);
+                            let bytes =
+                                host_store[host_chunk].range(src, stride).ok_or_else(|| {
+                                    be("moe pager: expert CPU-store range out of bounds")
+                                })?;
+                            resident_uploads.push((bytes, plan.target));
+                        }
+                    }
+                }
+            }
+        }
+        transfer_plan.prepare_upload_batch(
+            executor,
+            resident_uploads
+                .iter()
+                .map(|(bytes, target)| (*bytes, target)),
+            &mut transfer,
+        )?;
+        Ok(PreparedHostPush {
+            requested,
+            bytes: transfer_bytes,
+            transfer,
+        })
+    }
+
+    /// Admit one predicted expert across its registered role banks without opening a new epoch.
+    /// The current layer's real demand batch therefore stays protected while prediction fills
+    /// only cold capacity. Roles are grouped by size class because each class has an independent
+    /// VRAM/RAM LRU; the returned transfer still submits all resulting regions together.
+    pub(crate) fn prefetch_roles_cpu<E: TransferExecutor>(
+        &mut self,
+        executor: &E,
+        role_buf_ids: &[usize],
+        local_id: u32,
+    ) -> Result<PreparedHostPush> {
+        let mut by_pool: BTreeMap<usize, Vec<(usize, u32, Option<usize>, usize)>> = BTreeMap::new();
+        let mut seen = HashSet::with_capacity(role_buf_ids.len());
+        for &buf_id in role_buf_ids {
+            if !seen.insert(buf_id) {
+                continue;
+            }
+            let (_, pool, src) = self
+                .sources
+                .get(&buf_id)
+                .ok_or_else(|| be("moe pager: prefetch named an unregistered expert bank"))?;
+            if src.stride_bytes == 0 || !src.bank_bytes.is_multiple_of(src.stride_bytes) {
+                return Err(be("moe pager: invalid prefetched expert bank geometry"));
+            }
+            let n_expert = src.bank_bytes / src.stride_bytes;
+            if local_id as usize >= n_expert {
+                return Err(be(format!(
+                    "moe pager: prefetched expert {local_id} exceeds a {n_expert}-expert bank"
+                )));
+            }
+            let host_offset = src
+                .host_offset
+                .checked_add(local_id as usize * src.stride_bytes)
+                .ok_or_else(|| be("moe pager: prefetched host offset overflow"))?;
+            by_pool.entry(*pool).or_default().push((
+                src.stride_bytes,
+                src.block_base + local_id,
+                src.host_chunk,
+                host_offset,
+            ));
+        }
+
+        let requested = by_pool.values().map(Vec::len).sum();
+        let Self {
+            pools,
+            host_store,
+            transfer_plan,
+            ..
+        } = self;
+        let transfer_plan = Arc::clone(transfer_plan);
+        let mut transfer = PreparedTransfer::default();
+        let mut transfer_bytes = 0usize;
+        for (pool_idx, entries) in by_pool {
+            let pool = &mut pools[pool_idx];
+            if let Some(host) = pool.host.as_ref().cloned() {
+                let mut promotions = Vec::with_capacity(entries.len());
+                let mut targets = Vec::with_capacity(entries.len());
+                for &(_, id, _, _) in &entries {
+                    let Some(plan) = pool.pager.plan_inclusive_prefetch_cpu_push(
                         id,
                         pool.exchange_slot
                             .as_mut()
                             .expect("tiered pool has an exchange slot"),
-                        scan,
-                    )?;
-                    if let (Some(trace), Some(call)) = (trace.as_mut(), trace_call) {
-                        trace.records.push(PagerTraceRecord {
-                            call,
-                            pool: pool_idx as u32,
-                            layer,
-                            expert: lid,
-                            block_id: id,
-                            bytes: stride.min(u32::MAX as usize) as u32,
-                            evicted: plan
-                                .as_ref()
-                                .and_then(|plan| plan.evicted)
-                                .unwrap_or(TRACE_NO_EVICTION),
-                            role,
-                            gpu_hit: plan.is_none(),
-                        });
-                    }
-                    let Some(plan) = plan else {
+                    )?
+                    else {
                         continue;
                     };
+                    transfer_bytes = transfer_bytes.saturating_add(plan.target.len());
                     let target = targets.len();
                     targets.push(plan.target);
                     promotions.push((id, plan.evicted, target));
                 }
-            }
-            let collected = std::sync::Mutex::new(PreparedTransfer::default());
-            host.promote_batch(&promotions, |bytes, target| {
-                let mut local = PreparedTransfer::default();
-                transfer_plan.prepare_upload(executor, bytes, &targets[target], &mut local)?;
-                collected.lock().unwrap().append(local);
-                Ok(())
-            })?;
-            transfer.append(collected.into_inner().unwrap());
-        } else {
-            for &(role, _, stride, block_base, layer, host_chunk, host_base, local_ids) in &resolved
-            {
-                for &lid in local_ids {
-                    let local = lid as usize;
-                    let id = block_base + lid;
-                    let host_chunk = host_chunk
-                        .ok_or_else(|| be("moe pager: resident Host Store source has no chunk"))?;
-                    let src = host_base
-                        .checked_add(local.saturating_mul(stride))
-                        .ok_or_else(|| be("moe pager: expert host offset overflow"))?;
-                    let plan = pool.pager.plan_cpu_push(id, scan)?;
-                    if let (Some(trace), Some(call)) = (trace.as_mut(), trace_call) {
-                        trace.records.push(PagerTraceRecord {
-                            call,
-                            pool: pool_idx as u32,
-                            layer,
-                            expert: lid,
-                            block_id: id,
-                            bytes: stride.min(u32::MAX as usize) as u32,
-                            evicted: plan
-                                .as_ref()
-                                .and_then(|plan| plan.evicted)
-                                .unwrap_or(TRACE_NO_EVICTION),
-                            role,
-                            gpu_hit: plan.is_none(),
-                        });
-                    }
-                    if let Some(plan) = plan {
-                        let bytes = host_store[host_chunk]
-                            .range(src, stride)
-                            .ok_or_else(|| be("moe pager: expert CPU-store range out of bounds"))?;
-                        transfer_plan.prepare_upload(
-                            executor,
-                            bytes,
-                            &plan.target,
-                            &mut transfer,
-                        )?;
-                    }
+                let collected = std::sync::Mutex::new(PreparedTransfer::default());
+                host.promote_batch(&promotions, |bytes, target| {
+                    let mut local = PreparedTransfer::default();
+                    transfer_plan.prepare_upload(executor, bytes, &targets[target], &mut local)?;
+                    collected.lock().unwrap().append(local);
+                    Ok(())
+                })?;
+                transfer.append(collected.into_inner().unwrap());
+            } else {
+                for &(stride, id, host_chunk, host_offset) in &entries {
+                    let Some(plan) = pool.pager.plan_prefetch_cpu_push(id)? else {
+                        continue;
+                    };
+                    transfer_bytes = transfer_bytes.saturating_add(stride);
+                    let chunk = host_chunk.ok_or_else(|| {
+                        be("moe pager: prefetched Host Store source has no chunk")
+                    })?;
+                    let bytes = host_store[chunk]
+                        .range(host_offset, stride)
+                        .ok_or_else(|| {
+                            be("moe pager: prefetched Host Store range out of bounds")
+                        })?;
+                    transfer_plan.prepare_upload(executor, bytes, &plan.target, &mut transfer)?;
                 }
             }
         }
         Ok(PreparedHostPush {
             requested,
+            bytes: transfer_bytes,
             transfer,
         })
     }
@@ -2972,7 +3520,7 @@ impl MoePagerSession {
         executor: &E,
         buf_id: usize,
     ) -> Result<bool> {
-        self.enter_prefill_layer()?;
+        self.enter_prefill_layer(executor)?;
         if self.layer_bank_current(buf_id)? {
             return Ok(false);
         }
@@ -2982,7 +3530,7 @@ impl MoePagerSession {
             ));
         }
         let job = self
-            .prepare_prefill_layer_cpu(buf_id)?
+            .prepare_prefill_layer_cpu(executor, buf_id)?
             .ok_or_else(|| be("moe pager: failed to prepare synchronous Prefill layer"))?;
         job.execute(executor)?;
         self.complete_prefill_layer_cpu(buf_id)?;
@@ -3520,6 +4068,48 @@ pub type DensePagerCell = Mutex<Option<DensePagerSession>>;
 mod tests {
     use super::*;
 
+    struct PatternBlockIo;
+
+    impl BlockIo for PatternBlockIo {
+        fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+            let len = desc.nbytes();
+            if dst.len() < len {
+                return Err(be("test destination is too short"));
+            }
+            for (index, byte) in dst[..len].iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(17).wrapping_add(3);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn full_host_store_reads_directly_into_the_final_range() {
+        let chunk = HostStoreChunk {
+            base_offset: 1024,
+            bytes: AlignedHostBuffer::new(32).expect("host store"),
+        };
+        let desc = BlockDesc {
+            id: 7,
+            extents: vec![
+                infr_core::blockio::BlockExtent { offset: 40, len: 3 },
+                infr_core::blockio::BlockExtent { offset: 90, len: 5 },
+            ],
+        };
+
+        chunk
+            .read_block(7, &desc, &PatternBlockIo)
+            .expect("direct host-store read");
+
+        assert_eq!(chunk.range(0, 7).unwrap(), &[0; 7]);
+        assert_eq!(
+            chunk.range(7, 8).unwrap(),
+            &[3, 20, 37, 54, 71, 88, 105, 122]
+        );
+        assert_eq!(chunk.range(15, 17).unwrap(), &[0; 17]);
+        assert!(chunk.read_block(25, &desc, &PatternBlockIo).is_err());
+    }
+
     // ── #4: GpuPager::new dimension validation returns Err (not panic) on bad input ──────────────
     #[test]
     fn validate_pager_dims_rejects_zero_slots() {
@@ -3588,6 +4178,78 @@ mod tests {
         assert!(!loan_preserves_pool_floor(624, 113, 512));
         assert!(!loan_preserves_pool_floor(8, 1, 8));
         assert!(!loan_preserves_pool_floor(8, 9, 1));
+    }
+
+    #[test]
+    fn slot_retirement_evicts_global_lru_instead_of_physical_blockers() {
+        // Slots 4 and 5 are claimed. Both physical blockers are hotter than the globally-cold
+        // blocks in slots 0 and 1, so both move and the actual LRU victims disappear.
+        let lru = vec![(10, 0), (11, 1), (14, 4), (12, 2), (13, 3), (15, 5)];
+        let targets = HashSet::from([4usize, 5]);
+        let plan = plan_slot_retirement(&lru, &[], &targets);
+
+        assert_eq!(plan.evicted, vec![10, 11]);
+        assert_eq!(
+            plan.relocations,
+            vec![
+                SlotRelocation {
+                    block: 14,
+                    from: 4,
+                    to: 0,
+                    evicted: Some(10),
+                },
+                SlotRelocation {
+                    block: 15,
+                    from: 5,
+                    to: 1,
+                    evicted: Some(11),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn slot_retirement_needs_no_copy_when_cold_blocks_are_already_in_target() {
+        let lru = vec![(10, 4), (11, 5), (12, 0), (13, 1)];
+        let plan = plan_slot_retirement(&lru, &[], &HashSet::from([4usize, 5]));
+
+        assert_eq!(plan.evicted, vec![10, 11]);
+        assert!(plan.relocations.is_empty());
+    }
+
+    #[test]
+    fn slot_retirement_counts_only_occupied_target_slots() {
+        // Target slot 5 is free/disabled and therefore does not force an unrelated eviction.
+        let lru = vec![(10, 0), (11, 4), (12, 1)];
+        let plan = plan_slot_retirement(&lru, &[], &HashSet::from([4usize, 5]));
+
+        assert_eq!(plan.evicted, vec![10]);
+        assert_eq!(
+            plan.relocations,
+            vec![SlotRelocation {
+                block: 11,
+                from: 4,
+                to: 0,
+                evicted: Some(10),
+            }]
+        );
+    }
+
+    #[test]
+    fn slot_retirement_moves_into_free_capacity_without_an_eviction() {
+        let lru = vec![(10, 0), (11, 4), (12, 1)];
+        let plan = plan_slot_retirement(&lru, &[2, 3], &HashSet::from([4usize, 5]));
+
+        assert!(plan.evicted.is_empty());
+        assert_eq!(
+            plan.relocations,
+            vec![SlotRelocation {
+                block: 11,
+                from: 4,
+                to: 2,
+                evicted: None,
+            }]
+        );
     }
 
     #[test]

@@ -19,7 +19,9 @@ use crate::seam::TokenEmbd;
 use crate::{Config, EngineConfig, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
-use infr_core::graph::{Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, Op};
+use infr_core::graph::{
+    Activation, AttnMask, Dsv4CacheFormat, Graph, HyperGates, MoePrefetchHint, Op, SequenceSpan,
+};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
@@ -112,6 +114,145 @@ fn resident_after_gen(cur: &[u32], last_written: Option<usize>) -> Vec<u32> {
     }
 }
 
+fn sampling_suffix_start(positions: &[usize], prompt_ends: &[usize]) -> AResult<usize> {
+    if positions.len() != prompt_ends.len() {
+        return Err(anyhow!(
+            "parallel token step has {} positions and {} prompt ends",
+            positions.len(),
+            prompt_ends.len()
+        ));
+    }
+    let start = positions
+        .iter()
+        .zip(prompt_ends)
+        .position(|(&position, &end)| position + 1 >= end)
+        .unwrap_or(positions.len());
+    if positions[start..]
+        .iter()
+        .zip(&prompt_ends[start..])
+        .any(|(&position, &end)| position + 1 < end)
+    {
+        return Err(anyhow!(
+            "parallel token sampling rows are not a contiguous suffix"
+        ));
+    }
+    Ok(start)
+}
+
+/// Whether a contiguous slice of Qwen IMROPE rows is exactly representable by ordinary 1D RoPE.
+/// The Vulkan 1D kernel receives the first position and advances it once per row, so both the
+/// selected IMROPE plane and the row-to-row position sequence must agree with that layout.
+fn mrope_rows_are_plain_rope(
+    positions4: &[i32],
+    start: usize,
+    rows: usize,
+    sections: [u32; 4],
+    rope_pairs: usize,
+) -> bool {
+    let Some(end) = start.checked_add(rows) else {
+        return false;
+    };
+    let Some(values_end) = end.checked_mul(4) else {
+        return false;
+    };
+    if rows == 0 || rope_pairs == 0 || values_end > positions4.len() {
+        return false;
+    }
+    let widths = sections.map(|value| value as usize);
+    let section_total = widths.iter().sum::<usize>();
+    if section_total == 0 {
+        return false;
+    }
+    let first_t = positions4[start * 4];
+    if first_t < 0 {
+        return false;
+    }
+    for row_index in 0..rows {
+        let base = (start + row_index) * 4;
+        let row = &positions4[base..base + 4];
+        let Ok(delta) = i32::try_from(row_index) else {
+            return false;
+        };
+        if first_t.checked_add(delta) != Some(row[0]) {
+            return false;
+        }
+        for pair in 0..rope_pairs {
+            let sector = pair % section_total;
+            let plane = if sector % 3 == 1 && sector < 3 * widths[1] {
+                1
+            } else if sector % 3 == 2 && sector < 3 * widths[2] {
+                2
+            } else if sector % 3 == 0 && sector < 3 * widths[0] {
+                0
+            } else {
+                3
+            };
+            if row[plane] != row[0] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn allocate_parallel_prefill_rows(available: &[usize], ubatch: usize) -> Vec<usize> {
+    let mut rows = vec![0; available.len()];
+    let mut budget = ubatch.min(available.iter().sum());
+    while budget > 0 {
+        let active = available
+            .iter()
+            .zip(&rows)
+            .filter(|&(available, used)| available > used)
+            .count();
+        if active == 0 {
+            break;
+        }
+        let share = budget.div_ceil(active);
+        let mut granted = 0;
+        for (used, &available) in rows.iter_mut().zip(available) {
+            if *used == available || granted == budget {
+                continue;
+            }
+            let take = (available - *used).min(share).min(budget - granted);
+            *used += take;
+            granted += take;
+        }
+        debug_assert!(granted > 0);
+        budget -= granted;
+    }
+    rows
+}
+
+fn parallel_prefill_progress(
+    prompt_tokens: usize,
+    cached_prompt_tokens: usize,
+    context_tokens: usize,
+    context_limit: usize,
+) -> infr_core::GenerationProgress {
+    infr_core::GenerationProgress {
+        phase: infr_core::GenerationPhase::Prefill,
+        prompt_tokens: prompt_tokens as u64,
+        cached_prompt_tokens: cached_prompt_tokens as u64,
+        prefill_tokens: context_tokens.saturating_sub(cached_prompt_tokens) as u64,
+        completion_tokens: 0,
+        context_tokens: context_tokens as u64,
+        context_limit: context_limit as u64,
+    }
+}
+
+fn dense_request_exceeds_capacity(
+    prompt_tokens: usize,
+    max_new_or_steps: usize,
+    context_limit: usize,
+    parallel_token_step: bool,
+) -> bool {
+    !parallel_token_step
+        && prompt_tokens
+            .saturating_add(max_new_or_steps)
+            .saturating_add(1)
+            > context_limit
+}
+
 /// Return the cached-prefix length only when a recurrent model can safely continue from its
 /// existing state. An empty token cache is deliberately NOT reusable: `SeamKv::reset()` clears
 /// the token bookkeeping but cannot synchronously clear device-side DeltaNet conv/S buffers, so
@@ -122,6 +263,119 @@ fn recurrent_extension_start(cached: &[u32], prompt: &[u32]) -> Option<usize> {
     }
     let pfx = common_prefix_len(cached, prompt);
     (pfx == cached.len() && pfx < prompt.len()).then_some(pfx)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedParallelPrompt {
+    pub(crate) start: usize,
+    pub(crate) checkpoint_boundary: Option<usize>,
+}
+
+/// Prepare one recurrent slot for a layer-synchronous prefill cohort. This mirrors the ordinary
+/// runner's continuation/checkpoint/reset and SWA rewind rules, but finishes the slot-local
+/// transaction before any shared activation batch is built.
+fn prepare_parallel_prompt_state(
+    be: &dyn Backend,
+    c: &Config,
+    ec: &EngineConfig,
+    kv: &mut SeamKv,
+    prompt: &[u32],
+    turn_checkpoint: Option<TurnCheckpoint>,
+    req: Option<&crate::sampling::RequestCtx>,
+) -> AResult<PreparedParallelPrompt> {
+    let recurrent_model = c.qwen35 || c.qwen4exp || c.bailingmoe3;
+    let live_turn_start = recurrent_model
+        .then(|| recurrent_extension_start(&kv.cached, prompt))
+        .flatten();
+    let restored_turn_start = if recurrent_model && live_turn_start.is_none() {
+        let _gp = req.and_then(|request| request.gate_pass());
+        kv.restore_turn_recurrent(be, prompt)?
+    } else {
+        None
+    };
+    let mut start = if recurrent_model {
+        if let Some(prefix) = live_turn_start.or(restored_turn_start) {
+            prefix
+        } else {
+            let conv_elems = (c.ssm_d_conv - 1) * c.recurrent_conv_channels();
+            let state_elems = c.recurrent_state_elems();
+            let conv_zero = vec![0f32; conv_elems];
+            let state_zero = vec![0f32; state_elems];
+            for layer in 0..c.n_layer {
+                if c.is_recurrent_layer(layer) {
+                    be.upload(kv.kbufs[layer].as_ref(), bytemuck::cast_slice(&conv_zero))
+                        .map_err(|error| anyhow!("{error}"))?;
+                    be.upload(kv.vbufs[layer].as_ref(), bytemuck::cast_slice(&state_zero))
+                        .map_err(|error| anyhow!("{error}"))?;
+                }
+            }
+            if let Some(state) = kv.ple_state_buf.as_ref() {
+                let zeros = vec![0u8; state.len_bytes()];
+                be.upload(state.as_ref(), &zeros)
+                    .map_err(|error| anyhow!("{error}"))?;
+            }
+            if let Some(checkpoint) = kv.turn_recurrent_ckpt.as_mut() {
+                checkpoint.invalidate();
+            }
+            kv.cached.clear();
+            0
+        }
+    } else {
+        common_prefix_len(&kv.cached, prompt).min(prompt.len().saturating_sub(1))
+    };
+
+    if kv.kv_ring && start > 0 && start < kv.cached.len() {
+        let safe = (0..c.n_layer)
+            .filter(|&layer| c.is_swa_layer(layer))
+            .map(|layer| crate::seam::kv_rows(c, layer, kv.max_ctx, true, ec))
+            .filter(|&rows| rows < kv.max_ctx)
+            .all(|rows| {
+                let live_from = kv.cached.len().saturating_sub(rows);
+                start.saturating_sub(c.swa_window) >= live_from
+            });
+        if !safe {
+            start = 0;
+        }
+    }
+
+    let checkpoint_boundary = turn_checkpoint
+        .and_then(|checkpoint| match checkpoint {
+            TurnCheckpoint::Enable => None,
+            TurnCheckpoint::Boundary(boundary) => Some(boundary),
+        })
+        .filter(|&boundary| {
+            recurrent_model && boundary > start && boundary < prompt.len() && boundary <= kv.max_ctx
+        });
+    if let Some(boundary) = checkpoint_boundary {
+        TurnRecurrentCkpt::begin(
+            &mut kv.turn_recurrent_ckpt,
+            be,
+            c,
+            &kv.kbufs,
+            &kv.vbufs,
+            kv.ple_state_buf.as_deref(),
+            &prompt[..boundary],
+        )?;
+    }
+    kv.cached.truncate(start);
+    Ok(PreparedParallelPrompt {
+        start,
+        checkpoint_boundary,
+    })
+}
+
+/// Reconcile one checked-out Qwen3.8 slot with a new prompt before the scheduler chooses between
+/// token-step prefill and the streaming prefill ring. Keeping this transaction outside either
+/// execution primitive makes the 96-token policy depend on the real post-restore KV frontier.
+pub(crate) fn prepare_parallel_prompt(
+    be: &dyn Backend,
+    c: &Config,
+    ec: &EngineConfig,
+    kv: &mut SeamKv,
+    prompt: &[u32],
+    turn_checkpoint: Option<TurnCheckpoint>,
+) -> AResult<PreparedParallelPrompt> {
+    prepare_parallel_prompt_state(be, c, ec, kv, prompt, turn_checkpoint, None)
 }
 
 /// Bind the per-layer IO + weights shared by EVERY decode/prefill/verify/denoise execution: the
@@ -141,6 +395,7 @@ fn bind_layer_io<'a>(
     vbufs: &'a [Box<dyn Buffer>],
     qsa_kbufs: &'a [Option<Box<dyn Buffer>>],
     qsa_cbufs: &'a [Option<Box<dyn Buffer>>],
+    mrope_history_buf: &'a Option<Box<dyn Buffer>>,
     wbufs: &'a [Box<dyn Buffer>],
     qwen_wide_buf: &'a Option<Box<dyn Buffer>>,
     ple_embd_buf: &'a Option<Box<dyn Buffer>>,
@@ -151,6 +406,9 @@ fn bind_layer_io<'a>(
     }
     if let (Some(yid), Some((yb, _))) = (h.yarn_ff, yff_buf) {
         b.bind(yid, yb.as_ref());
+    }
+    if let (Some(id), Some(buf)) = (h.mrope_history, mrope_history_buf) {
+        b.bind(id, buf.as_ref());
     }
     for l in 0..n_layer {
         b.bind(h.k_cache[l], kbufs[l].as_ref());
@@ -173,6 +431,145 @@ fn bind_layer_io<'a>(
     }
     if let (Some(id), Some(buf)) = (h.ple_state, ple_state_buf) {
         b.bind(id, buf.as_ref());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_parallel_layer_io<'a>(
+    b: &mut Bindings<'a>,
+    h: &DecodeHandles,
+    n_layer: usize,
+    rf_buf: &'a Option<(Box<dyn Buffer>, usize)>,
+    yff_buf: &'a Option<(Box<dyn Buffer>, usize)>,
+    kbufs: &'a [Box<dyn Buffer>],
+    vbufs: &'a [Box<dyn Buffer>],
+    qsa_kbufs: &'a [Option<Box<dyn Buffer>>],
+    qsa_cbufs: &'a [Option<Box<dyn Buffer>>],
+    mrope_history_buf: &'a Option<Box<dyn Buffer>>,
+    wbufs: &'a [Box<dyn Buffer>],
+    primary_wide: &'a Option<Box<dyn Buffer>>,
+    primary_ple_embd: &'a Option<Box<dyn Buffer>>,
+    primary_ple_state: &'a Option<Box<dyn Buffer>>,
+    wide: &'a dyn Buffer,
+    ple_embd: Option<&'a dyn Buffer>,
+    peers: &'a [SeamKv],
+    lane_indices: Option<&[usize]>,
+    independent_rows: bool,
+) {
+    bind_layer_io(
+        b,
+        h,
+        n_layer,
+        rf_buf,
+        yff_buf,
+        kbufs,
+        vbufs,
+        qsa_kbufs,
+        qsa_cbufs,
+        mrope_history_buf,
+        wbufs,
+        primary_wide,
+        primary_ple_embd,
+        primary_ple_state,
+    );
+    if let Some(id) = h.qwen_wide {
+        b.bind(id, wide);
+    }
+    if let (Some(id), Some(buf)) = (h.ple_embd, ple_embd) {
+        b.bind(id, buf);
+    }
+    let all_lanes;
+    let lanes = if let Some(indices) = lane_indices {
+        indices
+    } else {
+        all_lanes = (0..peers.len() + 1).collect::<Vec<_>>();
+        &all_lanes
+    };
+    if !independent_rows {
+        assert_eq!(
+            lanes.len(),
+            1,
+            "a shared-row binding requires exactly one sequence lane"
+        );
+    }
+    for layer in 0..n_layer {
+        let mut k_rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
+        let mut v_rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
+        for &lane in lanes {
+            if lane == 0 {
+                k_rows.push(kbufs[layer].as_ref());
+                v_rows.push(vbufs[layer].as_ref());
+            } else {
+                k_rows.push(peers[lane - 1].kbufs[layer].as_ref());
+                v_rows.push(peers[lane - 1].vbufs[layer].as_ref());
+            }
+        }
+        if independent_rows {
+            b.bind_rows(h.k_cache[layer], k_rows);
+            b.bind_rows(h.v_cache[layer], v_rows);
+        } else {
+            b.bind(h.k_cache[layer], k_rows[0]);
+            b.bind(h.v_cache[layer], v_rows[0]);
+        }
+
+        if let Some(id) = h.qsa_k_cache[layer] {
+            let mut rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
+            for &lane in lanes {
+                rows.push(if lane == 0 {
+                    qsa_kbufs[layer]
+                        .as_deref()
+                        .expect("QSA handle requires primary raw cache")
+                } else {
+                    peers[lane - 1].qsa_kbufs[layer]
+                        .as_deref()
+                        .expect("QSA handle requires peer raw cache")
+                });
+            }
+            if independent_rows {
+                b.bind_rows(id, rows);
+            } else {
+                b.bind(id, rows[0]);
+            }
+        }
+        if let Some(id) = h.qsa_block_cache[layer] {
+            let mut rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
+            for &lane in lanes {
+                rows.push(if lane == 0 {
+                    qsa_cbufs[layer]
+                        .as_deref()
+                        .expect("QSA handle requires primary block cache")
+                } else {
+                    peers[lane - 1].qsa_cbufs[layer]
+                        .as_deref()
+                        .expect("QSA handle requires peer block cache")
+                });
+            }
+            if independent_rows {
+                b.bind_rows(id, rows);
+            } else {
+                b.bind(id, rows[0]);
+            }
+        }
+    }
+    if let Some(id) = h.ple_state {
+        let mut rows: Vec<&dyn Buffer> = Vec::with_capacity(lanes.len());
+        for &lane in lanes {
+            rows.push(if lane == 0 {
+                primary_ple_state
+                    .as_deref()
+                    .expect("PLE handle requires primary state")
+            } else {
+                peers[lane - 1]
+                    .ple_state_buf
+                    .as_deref()
+                    .expect("PLE handle requires peer state")
+            });
+        }
+        if independent_rows {
+            b.bind_rows(id, rows);
+        } else {
+            b.bind(id, rows[0]);
+        }
     }
 }
 
@@ -357,6 +754,10 @@ fn session_stable(
 pub(super) struct DecodeHandles {
     hidden: TensorId,
     positions: TensorId,
+    /// Per-execute `(T,H,W,E)` positions on multimodal builds.
+    positions4: Option<TensorId>,
+    /// Full request position table shared by every QSA layer while materializing block keys.
+    mrope_history: Option<TensorId>,
     rope_freqs: Option<TensorId>, // gemma4 proportional-RoPE divisors (full-attention layers)
     // DeepSeek V2+ YaRN per-pair frequency divisors (qk_rope_dim/2 floats): the graph Input the
     // driver binds `yff_buf` to (a per-step f32 Input like `rope_freqs`). `None` for non-yarn.
@@ -409,9 +810,500 @@ pub(super) struct DecodeHandles {
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
+/// One serve slot with every pool-external, session-lifetime allocation already materialized.
+/// Segmented KV payload and LLM runtime buffers are attached only after the unified arena has been
+/// sized from the device's then-current free room.
+struct PendingSeamSlot {
+    kbufs: Vec<Option<Box<dyn Buffer>>>,
+    vbufs: Vec<Option<Box<dyn Buffer>>>,
+    qsa_kbufs: Vec<Option<Box<dyn Buffer>>>,
+    qsa_cbufs: Vec<Option<Box<dyn Buffer>>>,
+    hidden_buf: Box<dyn Buffer>,
+    pos_buf: Box<dyn Buffer>,
+    ipl_buf: Option<Box<dyn Buffer>>,
+    logits_buf: Box<dyn Buffer>,
+    ple_embd_buf: Option<Box<dyn Buffer>>,
+    ple_state_buf: Option<Box<dyn Buffer>>,
+    turn_recurrent_ckpt: Option<TurnRecurrentCkpt>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_pending_seam_slot(
+    be: &dyn Backend,
+    cfg: &Config,
+    ec: &EngineConfig,
+    want_ctx: usize,
+    kv_ring: bool,
+    k_fmt: DType,
+    v_fmt: DType,
+    segmented_layout: Option<&SegmentedKvLayout>,
+    e2b: bool,
+    gpu_ple: bool,
+    checkpoint: bool,
+) -> AResult<PendingSeamSlot> {
+    let mut kbufs = Vec::with_capacity(cfg.n_layer);
+    let mut vbufs = Vec::with_capacity(cfg.n_layer);
+    let mut qsa_kbufs = Vec::with_capacity(cfg.n_layer);
+    let mut qsa_cbufs = Vec::with_capacity(cfg.n_layer);
+    for layer in 0..cfg.n_layer {
+        let (k_bytes, v_bytes) = super::layer_state_bytes(
+            cfg,
+            layer,
+            want_ctx,
+            kv_ring,
+            super::ubatch_rows(ec),
+            k_fmt,
+            v_fmt,
+        );
+        let k_segmented =
+            segmented_layout.is_some_and(|layout| layout.plane(layer, PlaneKind::K).is_some());
+        kbufs.push(if k_segmented {
+            Some(alloc_segmented_plane(
+                be,
+                segmented_layout.expect("segmented K has a layout"),
+                layer,
+                PlaneKind::K,
+            )?)
+        } else {
+            Some(
+                be.alloc(k_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        });
+        let v_segmented =
+            segmented_layout.is_some_and(|layout| layout.plane(layer, PlaneKind::V).is_some());
+        vbufs.push(if v_segmented {
+            Some(alloc_segmented_plane(
+                be,
+                segmented_layout.expect("segmented V has a layout"),
+                layer,
+                PlaneKind::V,
+            )?)
+        } else {
+            Some(
+                be.alloc(v_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        });
+
+        let qsa_bytes = super::qsa_raw_cache_bytes(cfg, layer, want_ctx);
+        qsa_kbufs.push(if qsa_bytes > 0 {
+            Some(if let Some(layout) = segmented_layout {
+                alloc_segmented_plane(be, layout, layer, PlaneKind::QsaRaw)?
+            } else {
+                be.alloc(qsa_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?
+            })
+        } else {
+            None
+        });
+        let qsa_comp_bytes = super::qsa_block_cache_bytes(cfg, layer, want_ctx);
+        qsa_cbufs.push(if qsa_comp_bytes > 0 {
+            Some(if let Some(layout) = segmented_layout {
+                alloc_segmented_plane(be, layout, layer, PlaneKind::QsaBlock)?
+            } else {
+                be.alloc(qsa_comp_bytes, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?
+            })
+        } else {
+            None
+        });
+    }
+
+    let ple_state_buf = if cfg.qwen4exp {
+        let hist = (cfg.ple_conv_kernel - 1) * cfg.ple_ngram_size;
+        Some(
+            be.alloc(hist * cfg.hc_mult * cfg.n_embd * 4, BufferUsage::KvCache)
+                .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+    let mut turn_recurrent_ckpt = None;
+    if checkpoint && (cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3) {
+        TurnRecurrentCkpt::begin_before_dynamic_kv(
+            &mut turn_recurrent_ckpt,
+            be,
+            cfg,
+            &kbufs,
+            &vbufs,
+            ple_state_buf.as_deref(),
+            &[],
+        )?;
+    }
+
+    let npl = cfg.n_embd_per_layer.max(1);
+    let hidden_buf = be
+        .alloc(cfg.n_embd * 4, BufferUsage::Staging)
+        .map_err(|e| anyhow!("{e}"))?;
+    let pos_buf = be
+        .alloc(4, BufferUsage::Staging)
+        .map_err(|e| anyhow!("{e}"))?;
+    let ipl_buf = if e2b && !gpu_ple {
+        Some(
+            be.alloc(cfg.n_layer * npl * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+    let logits_buf = be
+        .alloc(cfg.vocab * 4, BufferUsage::Readback)
+        .map_err(|e| anyhow!("{e}"))?;
+    let ple_embd_buf = if cfg.qwen4exp {
+        let heads = (cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram;
+        Some(
+            be.alloc(heads * cfg.ple_head_dim * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(PendingSeamSlot {
+        kbufs,
+        vbufs,
+        qsa_kbufs,
+        qsa_cbufs,
+        hidden_buf,
+        pos_buf,
+        ipl_buf,
+        logits_buf,
+        ple_embd_buf,
+        ple_state_buf,
+        turn_recurrent_ckpt,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_pending_seam_slot(
+    mut pending: PendingSeamSlot,
+    be: &dyn Backend,
+    cfg: &Config,
+    weights: std::sync::Arc<SeamWeights>,
+    stable: std::sync::Arc<SessionStable>,
+    segmented_layout: Option<&SegmentedKvLayout>,
+    k_fmt: DType,
+    v_fmt: DType,
+    want_ctx: usize,
+    kv_ring: bool,
+) -> AResult<SeamKv> {
+    if let Some(layout) = segmented_layout {
+        for layer in 0..cfg.n_layer {
+            if pending.kbufs[layer].is_none() && layout.plane(layer, PlaneKind::K).is_some() {
+                pending.kbufs[layer] =
+                    Some(alloc_segmented_plane(be, layout, layer, PlaneKind::K)?);
+            }
+            if pending.vbufs[layer].is_none() && layout.plane(layer, PlaneKind::V).is_some() {
+                pending.vbufs[layer] =
+                    Some(alloc_segmented_plane(be, layout, layer, PlaneKind::V)?);
+            }
+            if pending.qsa_kbufs[layer].is_none()
+                && super::qsa_raw_cache_bytes(cfg, layer, want_ctx) > 0
+            {
+                pending.qsa_kbufs[layer] =
+                    Some(alloc_segmented_plane(be, layout, layer, PlaneKind::QsaRaw)?);
+            }
+            if pending.qsa_cbufs[layer].is_none()
+                && super::qsa_block_cache_bytes(cfg, layer, want_ctx) > 0
+            {
+                pending.qsa_cbufs[layer] = Some(alloc_segmented_plane(
+                    be,
+                    layout,
+                    layer,
+                    PlaneKind::QsaBlock,
+                )?);
+            }
+        }
+    }
+    let kbufs = pending
+        .kbufs
+        .into_iter()
+        .enumerate()
+        .map(|(layer, buffer)| {
+            buffer.ok_or_else(|| anyhow!("layer {layer} K/state buffer was not allocated"))
+        })
+        .collect::<AResult<Vec<_>>>()?;
+    let vbufs = pending
+        .vbufs
+        .into_iter()
+        .enumerate()
+        .map(|(layer, buffer)| {
+            buffer.ok_or_else(|| anyhow!("layer {layer} V/state buffer was not allocated"))
+        })
+        .collect::<AResult<Vec<_>>>()?;
+
+    Ok(SeamKv {
+        weights,
+        stable,
+        kbufs,
+        vbufs,
+        qsa_kbufs: pending.qsa_kbufs,
+        qsa_cbufs: pending.qsa_cbufs,
+        segmented_kv: if segmented_layout.is_some() {
+            SegmentedKvState::enabled()
+        } else {
+            SegmentedKvState::default()
+        },
+        k_fmt,
+        v_fmt,
+        hidden_buf: pending.hidden_buf,
+        pos_buf: pending.pos_buf,
+        ipl_buf: pending.ipl_buf,
+        logits_buf: pending.logits_buf,
+        qwen_wide_buf: if cfg.qwen4exp {
+            Some(
+                be.alloc(cfg.hc_mult * cfg.n_embd * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        },
+        ple_embd_buf: pending.ple_embd_buf,
+        ple_state_buf: pending.ple_state_buf,
+        max_ctx: want_ctx,
+        kv_ring,
+        cached: Vec::new(),
+        denoise_cache: None,
+        self_cond_w: None,
+        sc_embt: None,
+        sc_ping: None,
+        sc_ping_write: 0,
+        sc_temp_inv_buf: None,
+        mtp_delta_ckpt: None,
+        turn_recurrent_ckpt: pending.turn_recurrent_ckpt,
+        preallocated_siblings: Vec::new(),
+    })
+}
+
+struct ParallelDecodeRequest<'a> {
+    prompts: &'a [Vec<u32>],
+    prompt_ends: &'a [usize],
+    checkpoint_boundaries: &'a [Option<usize>],
+    peers: &'a mut [SeamKv],
+    peer_outputs: &'a mut Vec<Vec<u32>>,
+    prompt_secs: &'a mut Vec<f64>,
+    decode_secs: &'a mut Vec<f64>,
+    samplers: &'a mut [crate::sampling::ParallelSampler],
+    on_token: &'a mut dyn FnMut(usize, u32) -> bool,
+    yield_requested: Option<&'a std::sync::atomic::AtomicBool>,
+}
+
+struct ParallelPrefillRequest<'a> {
+    prompts: &'a [Vec<u32>],
+    peers: &'a mut [SeamKv],
+    prepared: &'a [PreparedParallelPrompt],
+    peer_stats: &'a mut Vec<GenStats>,
+    on_progress: Option<&'a dyn Fn(usize, infr_core::GenerationProgress)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    constraint: Option<&mut crate::grammar::Constraint>,
+    verify: Option<&mut Vec<f32>>,
+    verify_ids: Option<&mut Vec<u32>>,
+    logits_out: Option<&mut Vec<f32>>,
+    h_out: Option<&mut Vec<f32>>,
+    denoise_req: Option<DenoiseReq>,
+    turn_checkpoint: Option<TurnCheckpoint>,
+    req: Option<&crate::sampling::RequestCtx>,
+    finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
+    mm: Option<&crate::seam::MropePlan>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend_inner(
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        state,
+        want_ctx,
+        constraint,
+        verify,
+        verify_ids,
+        logits_out,
+        h_out,
+        denoise_req,
+        turn_checkpoint,
+        req,
+        finish_fixed_allocations,
+        mm,
+        None,
+        None,
+    )
+}
+
+/// Decode Qwen3.8 slots in one layer-synchronous graph while retaining independent positions,
+/// KV, QSA, PLE and sampler state for every row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend_parallel_sampled(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompts: &[Vec<u32>],
+    prompt_ends: &[usize],
+    checkpoint_boundaries: &[Option<usize>],
+    max_steps: usize,
+    primary: &mut Option<SeamKv>,
+    peers: &mut [SeamKv],
+    want_ctx: usize,
+    samplers: &mut [crate::sampling::ParallelSampler],
+    on_token: &mut dyn FnMut(usize, u32) -> bool,
+    yield_requested: Option<&std::sync::atomic::AtomicBool>,
+    req: Option<&crate::sampling::RequestCtx>,
+) -> AResult<(Vec<Vec<u32>>, Vec<f64>, Vec<f64>)> {
+    if prompts.len() != peers.len() + 1
+        || prompt_ends.len() != prompts.len()
+        || checkpoint_boundaries.len() != prompts.len()
+        || samplers.len() != prompts.len()
+    {
+        return Err(anyhow!(
+            "parallel token step has {} prompts, {} prompt ends, {} checkpoints, {} slots and {} samplers",
+            prompts.len(),
+            prompt_ends.len(),
+            checkpoint_boundaries.len(),
+            peers.len() + 1,
+            samplers.len()
+        ));
+    }
+    let mut peer_outputs = Vec::new();
+    let mut prompt_secs = Vec::new();
+    let mut decode_secs = Vec::new();
+    let mut parallel = ParallelDecodeRequest {
+        prompts,
+        prompt_ends,
+        checkpoint_boundaries,
+        peers,
+        peer_outputs: &mut peer_outputs,
+        prompt_secs: &mut prompt_secs,
+        decode_secs: &mut decode_secs,
+        samplers,
+        on_token,
+        yield_requested,
+    };
+    let (first, _) = generate_dense_backend_inner(
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        &prompts[0],
+        max_steps,
+        |_| {},
+        primary,
+        want_ctx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        req,
+        None,
+        None,
+        Some(&mut parallel),
+        None,
+    )?;
+    let mut outputs = Vec::with_capacity(prompts.len());
+    outputs.push(first);
+    outputs.append(&mut peer_outputs);
+    Ok((outputs, prompt_secs, decode_secs))
+}
+
+/// Prefill independent Qwen3.8 sessions in shared layer-synchronous activation batches. Each
+/// sequence retains its own absolute positions and persistent recurrent/KV state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend_parallel_prefill(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompts: &[Vec<u32>],
+    primary: &mut Option<SeamKv>,
+    peers: &mut [SeamKv],
+    want_ctx: usize,
+    prepared: &[PreparedParallelPrompt],
+    on_progress: Option<&dyn Fn(usize, infr_core::GenerationProgress)>,
+    req: Option<&crate::sampling::RequestCtx>,
+) -> AResult<Vec<GenStats>> {
+    if prompts.len() != peers.len() + 1 || prepared.len() != prompts.len() {
+        return Err(anyhow!(
+            "parallel prefill has {} prompts, {} slots and {} prepared states",
+            prompts.len(),
+            peers.len() + 1,
+            prepared.len()
+        ));
+    }
+    let mut peer_stats = Vec::with_capacity(peers.len());
+    let mut parallel = ParallelPrefillRequest {
+        prompts,
+        peers,
+        prepared,
+        peer_stats: &mut peer_stats,
+        on_progress,
+    };
+    let (_, primary_stats) = generate_dense_backend_inner(
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        &prompts[0],
+        0,
+        |_| {},
+        primary,
+        want_ctx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        req,
+        None,
+        None,
+        None,
+        Some(&mut parallel),
+    )?;
+    let mut stats = Vec::with_capacity(prompts.len());
+    stats.push(primary_stats);
+    stats.append(&mut peer_stats);
+    Ok(stats)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn generate_dense_backend(
+fn generate_dense_backend_inner(
     be: &dyn Backend,
     bind_weight: &BindWeight,
     g: &Gguf,
@@ -460,8 +1352,7 @@ pub(crate) fn generate_dense_backend(
     // The in-flight SEQUENCE's own state (`infr serve`): its sampling overrides, its stop-sequence
     // abort latch, and its turn on the GPU baton.
     //
-    // Explicitly per-SEQUENCE, and deliberately LAST so that adding it could not silently reshuffle
-    // the `Option`-heavy tail above (a misplaced bare `None` would still typecheck). This used to be
+    // Explicitly per-SEQUENCE. This used to be
     // a `thread_local!`, which was only sound while one generation owned one thread; N concurrent
     // sequences make that wrong by construction — see `crate::sampling::RequestCtx`.
     //
@@ -469,9 +1360,17 @@ pub(crate) fn generate_dense_backend(
     // resolves purely from the env, no abort latch is polled, and no gate is taken — byte-for-byte
     // the pre-existing behavior.
     req: Option<&crate::sampling::RequestCtx>,
+    // Vulkan paged-MoE cold loads defer their elastic arena until fixed allocations are resident.
+    // Every other backend/path passes None; the hook is invoked exactly once before dynamic state.
+    finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
+    // Vision request plan. `None` keeps every existing text-only graph and upload unchanged.
+    mm: Option<&crate::seam::MropePlan>,
+    mut parallel_decode: Option<&mut ParallelDecodeRequest<'_>>,
+    mut parallel_prefill: Option<&mut ParallelPrefillRequest<'_>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let state_trace = ec.debug.state_trace;
+    let expert_prefetch = c.qwen4exp && ec.paging.expert_prefetch;
     let state_was_cold = state.is_none();
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
@@ -1313,12 +2212,15 @@ pub(crate) fn generate_dense_backend(
         // escrow their predicted runtime workspace while those allocations land; release it before
         // the measured-room context clamp and exact KV/state allocations below. Other backends keep
         // the default no-op.
-        be.finish_weight_load().map_err(|e| anyhow!("{e}"))?;
+        let pager_deferred = finish_fixed_allocations.is_some();
+        if !pager_deferred {
+            be.finish_weight_load().map_err(|e| anyhow!("{e}"))?;
+        }
         // A paged Qwen session reserves its maximum per-token state inside the unified elastic
         // arena. Its buffers therefore keep the requested logical extent and commit physical 32K
         // segments on demand; applying the flat-buffer live-room clamp would price those bytes a
         // second time. Every other session retains the existing measured clamp unchanged.
-        let segmented_available = be.segmented_kv_available();
+        let segmented_available = be.segmented_kv_available() || pager_deferred;
         let segmented_kv =
             crate::seam::segmented_kv_wanted(c, ec, kv_ring, k_fmt, v_fmt) && segmented_available;
         if ec.kv.dynamic
@@ -1334,7 +2236,7 @@ pub(crate) fn generate_dense_backend(
                 "dynamic KV currently requires Q8_0/Q8_0; using flat KV"
             );
         }
-        let want_ctx = if segmented_kv {
+        let want_ctx = if segmented_kv || pager_deferred {
             want_ctx
         } else {
             crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)
@@ -1352,8 +2254,8 @@ pub(crate) fn generate_dense_backend(
         // regardless of the session's chosen KV dtype (see `MixerW::DeltaNet` / the `build` closure).
         // DeepSeek2 MLA layers have ONE k_cache (key_length = kv_lora_rank + qk_rope_dim wide) per
         // token; V is an aliased prefix view — no separate v_cache.
-        let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
-        let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut kbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+        let mut vbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         let mut qsa_kbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         let mut qsa_cbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         for l in 0..c.n_layer {
@@ -1383,28 +2285,38 @@ pub(crate) fn generate_dense_backend(
                 k_fmt,
                 v_fmt,
             );
-            kbufs.push(
-                if let Some(layout) = segmented_layout
-                    .as_ref()
-                    .filter(|layout| layout.plane(l, PlaneKind::K).is_some())
-                {
-                    alloc_segmented_plane(be, layout, l, PlaneKind::K)?
-                } else {
+            let k_segmented = segmented_layout
+                .as_ref()
+                .is_some_and(|layout| layout.plane(l, PlaneKind::K).is_some());
+            kbufs.push(if k_segmented {
+                Some(alloc_segmented_plane(
+                    be,
+                    segmented_layout.as_ref().expect("segmented K has a layout"),
+                    l,
+                    PlaneKind::K,
+                )?)
+            } else {
+                Some(
                     be.alloc(k_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?
-                },
-            );
-            vbufs.push(
-                if let Some(layout) = segmented_layout
-                    .as_ref()
-                    .filter(|layout| layout.plane(l, PlaneKind::V).is_some())
-                {
-                    alloc_segmented_plane(be, layout, l, PlaneKind::V)?
-                } else {
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            });
+            let v_segmented = segmented_layout
+                .as_ref()
+                .is_some_and(|layout| layout.plane(l, PlaneKind::V).is_some());
+            vbufs.push(if v_segmented {
+                Some(alloc_segmented_plane(
+                    be,
+                    segmented_layout.as_ref().expect("segmented V has a layout"),
+                    l,
+                    PlaneKind::V,
+                )?)
+            } else {
+                Some(
                     be.alloc(v_bytes, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?
-                },
-            );
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            });
             let qsa_bytes = crate::seam::qsa_raw_cache_bytes(c, l, want_ctx);
             qsa_kbufs.push(if qsa_bytes > 0 {
                 Some(if let Some(layout) = segmented_layout.as_ref() {
@@ -1428,11 +2340,60 @@ pub(crate) fn generate_dense_backend(
                 None
             });
         }
-        // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
-        // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
-        be.kv_overflow_report();
 
-        // ── per-step IO buffers ────────────────────────────────────────────────────────
+        // Fixed recurrent state is a real owner, unlike the Expert filler. Place Qwen3.8's PLE
+        // history and the rolling conversation checkpoint before the deferred Vulkan arena too.
+        let ple_state_buf = if c.qwen4exp {
+            let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
+            let b = be
+                .alloc(hist * c.hc_mult * ne * 4, BufferUsage::KvCache)
+                .map_err(|e| anyhow!("{e}"))?;
+            let zeros = vec![0u8; b.len_bytes()];
+            be.upload(b.as_ref(), &zeros).map_err(|e| anyhow!("{e}"))?;
+            Some(b)
+        } else {
+            None
+        };
+        let mut turn_recurrent_ckpt = None;
+        if turn_checkpoint.is_some() && (c.qwen35 || c.qwen4exp || c.bailingmoe3) {
+            TurnRecurrentCkpt::begin_before_dynamic_kv(
+                &mut turn_recurrent_ckpt,
+                be,
+                c,
+                &kbufs,
+                &vbufs,
+                ple_state_buf.as_deref(),
+                &[],
+            )?;
+        }
+
+        // A paged serve engine must make every sibling slot's pool-external lifetime allocation
+        // visible to the driver's live-budget query below. Their unified runtime storage is
+        // attached only after that query creates the arena.
+        let sibling_count = if pager_deferred {
+            super::placement_slots().saturating_sub(1) as usize
+        } else {
+            0
+        };
+        let mut pending_siblings = Vec::with_capacity(sibling_count);
+        for _ in 0..sibling_count {
+            pending_siblings.push(allocate_pending_seam_slot(
+                be,
+                c,
+                ec,
+                want_ctx,
+                kv_ring,
+                k_fmt,
+                v_fmt,
+                segmented_layout.as_ref(),
+                e2b,
+                gpu_ple,
+                turn_checkpoint.is_some(),
+            )?);
+        }
+
+        // These persistent control buffers used to land after the measured arena had consumed the
+        // remainder. Allocate the real objects now so the final live-room query sees them.
         let hidden_buf = be
             .alloc(ne * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
@@ -1461,8 +2422,6 @@ pub(crate) fn generate_dense_backend(
             }
             None => None,
         };
-        // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
-        // (Host path only — `gpu_ple` gathers it on-device from the resident table.)
         let ipl_buf = if e2b && !gpu_ple {
             Some(
                 be.alloc(c.n_layer * npl * 4, BufferUsage::Staging)
@@ -1474,14 +2433,6 @@ pub(crate) fn generate_dense_backend(
         let logits_buf = be
             .alloc(c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
-        let qwen_wide_buf = if c.qwen4exp {
-            Some(
-                be.alloc(c.hc_mult * ne * 4, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
-            )
-        } else {
-            None
-        };
         let ple_embd_buf = if c.qwen4exp {
             let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
             Some(
@@ -1491,29 +2442,87 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
-        let ple_state_buf = if c.qwen4exp {
-            let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
-            let b = be
-                .alloc(hist * c.hc_mult * ne * 4, BufferUsage::KvCache)
-                .map_err(|e| anyhow!("{e}"))?;
-            let zeros = vec![0u8; b.len_bytes()];
-            be.upload(b.as_ref(), &zeros).map_err(|e| anyhow!("{e}"))?;
-            Some(b)
+
+        if let Some(finish) = finish_fixed_allocations {
+            finish()?;
+            // The pager now exists and all deferred expert sources are registered, so the
+            // established host-tier preload can run unchanged.
+            be.finish_weight_load().map_err(|e| anyhow!("{e}"))?;
+        }
+
+        // Dynamic planes allocate only lightweight address-table handles here. Their 32K physical
+        // segments are claimed lazily from the newly measured unified arena at context growth.
+        if let Some(layout) = segmented_layout.as_ref() {
+            for l in 0..c.n_layer {
+                if kbufs[l].is_none() && layout.plane(l, PlaneKind::K).is_some() {
+                    kbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::K)?);
+                }
+                if vbufs[l].is_none() && layout.plane(l, PlaneKind::V).is_some() {
+                    vbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::V)?);
+                }
+                if qsa_kbufs[l].is_none() && crate::seam::qsa_raw_cache_bytes(c, l, want_ctx) > 0 {
+                    qsa_kbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::QsaRaw)?);
+                }
+                if qsa_cbufs[l].is_none() && crate::seam::qsa_block_cache_bytes(c, l, want_ctx) > 0
+                {
+                    qsa_cbufs[l] = Some(alloc_segmented_plane(be, layout, l, PlaneKind::QsaBlock)?);
+                }
+            }
+        }
+        let kbufs: Vec<Box<dyn Buffer>> = kbufs
+            .into_iter()
+            .enumerate()
+            .map(|(layer, buffer)| {
+                buffer.ok_or_else(|| anyhow!("layer {layer} K/state buffer was not allocated"))
+            })
+            .collect::<AResult<_>>()?;
+        let vbufs: Vec<Box<dyn Buffer>> = vbufs
+            .into_iter()
+            .enumerate()
+            .map(|(layer, buffer)| {
+                buffer.ok_or_else(|| anyhow!("layer {layer} V/state buffer was not allocated"))
+            })
+            .collect::<AResult<_>>()?;
+
+        // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
+        // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
+        be.kv_overflow_report();
+
+        // ── per-step IO buffers ────────────────────────────────────────────────────────
+        // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
+        // (Host path only — `gpu_ple` gathers it on-device from the resident table.)
+        let qwen_wide_buf = if c.qwen4exp {
+            Some(
+                be.alloc(c.hc_mult * ne * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
         } else {
             None
         };
         let ple_worker = super::ple::PleWorker::new(g, c)?.map(std::sync::Arc::new);
-        let mut turn_recurrent_ckpt = None;
-        if turn_checkpoint.is_some() && (c.qwen35 || c.qwen4exp || c.bailingmoe3) {
-            TurnRecurrentCkpt::begin(
-                &mut turn_recurrent_ckpt,
+        let weights = std::sync::Arc::new(SeamWeights {
+            wbufs,
+            wspecs,
+            rf_buf,
+            yff_buf,
+            layer_has_epb,
+            layer_fused_experts,
+            ple_worker,
+        });
+        let mut preallocated_siblings = Vec::with_capacity(pending_siblings.len());
+        for pending in pending_siblings {
+            preallocated_siblings.push(finish_pending_seam_slot(
+                pending,
                 be,
                 c,
-                &kbufs[..],
-                &vbufs[..],
-                ple_state_buf.as_deref(),
-                &[],
-            )?;
+                std::sync::Arc::clone(&weights),
+                std::sync::Arc::clone(&stable),
+                segmented_layout.as_ref(),
+                k_fmt,
+                v_fmt,
+                want_ctx,
+                kv_ring,
+            )?);
         }
         // Host DMA imports are optional aliases, but on WDDM they share finite driver allocation
         // capacity with real model buffers. Admit them only after the complete persistent session
@@ -1521,15 +2530,7 @@ pub(crate) fn generate_dense_backend(
         be.finish_session_allocations()
             .map_err(|e| anyhow!("{e}"))?;
         *state = Some(SeamKv {
-            weights: std::sync::Arc::new(SeamWeights {
-                wbufs,
-                wspecs,
-                rf_buf,
-                yff_buf,
-                layer_has_epb,
-                layer_fused_experts,
-                ple_worker,
-            }),
+            weights,
             stable: std::sync::Arc::clone(&stable),
             kbufs,
             vbufs,
@@ -1560,8 +2561,48 @@ pub(crate) fn generate_dense_backend(
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
             turn_recurrent_ckpt,
+            preallocated_siblings,
         });
     }
+    let parallel_prepared = if let Some(parallel) = parallel_prefill.as_deref_mut() {
+        if !c.qwen4exp {
+            return Err(anyhow!("parallel prefill currently supports qwen4exp only"));
+        }
+        if mm.is_some() {
+            return Err(anyhow!(
+                "parallel prefill does not yet support multimodal position rows"
+            ));
+        }
+        if parallel.prompts.len() != parallel.peers.len() + 1
+            || parallel.prepared.len() != parallel.prompts.len()
+            || parallel.prompts.first().map(Vec::as_slice) != Some(prompt)
+        {
+            return Err(anyhow!("invalid parallel prefill request layout"));
+        }
+        for (lane, (tokens, capacity)) in parallel
+            .prompts
+            .iter()
+            .zip(
+                std::iter::once(state.as_ref().expect("seam state just initialized").max_ctx)
+                    .chain(parallel.peers.iter().map(|slot| slot.max_ctx)),
+            )
+            .enumerate()
+        {
+            if tokens.is_empty() {
+                return Err(anyhow!("parallel prefill lane {lane} has an empty prompt"));
+            }
+            validate_token_ids(tokens, c.vocab)?;
+            if tokens.len() + 1 > capacity {
+                return Err(anyhow!(
+                    "parallel prefill lane {lane} prompt {} exceeds its KV capacity {capacity}",
+                    tokens.len()
+                ));
+            }
+        }
+        Some(parallel.prepared.to_vec())
+    } else {
+        None
+    };
     // A live append-only recurrent state wins when the new prompt extends it exactly. Otherwise
     // try the last stable conversation checkpoint before taking the unchanged zero-reset path.
     // Restoration is device-side work, so concurrent serve takes the same GPU baton as a forward.
@@ -1572,15 +2613,21 @@ pub(crate) fn generate_dense_backend(
             .as_ref()
             .map_or(0, |kv| common_prefix_len(&kv.cached, prompt))
     });
-    let live_turn_start = recurrent_model
-        .then(|| {
-            state
-                .as_ref()
-                .and_then(|kv| recurrent_extension_start(&kv.cached, prompt))
-        })
-        .flatten();
-    let checkpoint_attempted =
-        denoise_req.is_none() && recurrent_model && live_turn_start.is_none();
+    let live_turn_start = if parallel_prepared.is_some() {
+        None
+    } else {
+        recurrent_model
+            .then(|| {
+                state
+                    .as_ref()
+                    .and_then(|kv| recurrent_extension_start(&kv.cached, prompt))
+            })
+            .flatten()
+    };
+    let checkpoint_attempted = parallel_prepared.is_none()
+        && denoise_req.is_none()
+        && recurrent_model
+        && live_turn_start.is_none();
     let restored_turn_start = if checkpoint_attempted {
         let _gp = req.and_then(|r| r.gate_pass());
         state
@@ -1619,6 +2666,7 @@ pub(crate) fn generate_dense_backend(
         sc_temp_inv_buf,
         mtp_delta_ckpt: _,
         turn_recurrent_ckpt,
+        preallocated_siblings: _,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,
@@ -1634,7 +2682,10 @@ pub(crate) fn generate_dense_backend(
         ple_worker,
     } = weights.as_ref();
     let max_ctx = *max_ctx;
-    if prompt.len() + max_new + 1 > max_ctx {
+    // In a parallel token call `max_new` is a step budget containing both the uncached prompt tail
+    // and decode. Adding it to the full prompt would count that tail twice. The parallel branch
+    // below validates every lane against its current cached depth instead.
+    if dense_request_exceeds_capacity(prompt.len(), max_new, max_ctx, parallel_decode.is_some()) {
         return Err(anyhow!(
             "prompt {} + gen {} exceeds the session KV capacity {max_ctx}",
             prompt.len(),
@@ -1668,6 +2719,78 @@ pub(crate) fn generate_dense_backend(
         }
         validate_token_ids(prompt, c.vocab)?;
     }
+    // One request-scoped full-context position table lets every QSA layer materialize historical
+    // block keys with the first token's true multimodal position, including the first sparse call
+    // that compresses blocks from earlier prefill chunks. Future generated rows are deterministic
+    // linear text positions, so fill them once now instead of mutating another persistent cache on
+    // every decode step. Text-only calls allocate nothing.
+    let (mrope_history_buf, mrope_positions) = if let Some(plan) = mm {
+        if !c.qwen4exp {
+            return Err(anyhow!(
+                "multimodal RoPE is currently supported only by qwen4exp"
+            ));
+        }
+        if plan.prompt_pos4.len() != prompt.len() * 4 {
+            return Err(anyhow!(
+                "multimodal position table has {} values for {} prompt tokens (expected {})",
+                plan.prompt_pos4.len(),
+                prompt.len(),
+                prompt.len() * 4
+            ));
+        }
+        if c.rope_sections.iter().sum::<u32>() == 0 {
+            return Err(anyhow!("qwen4exp multimodal RoPE sections are empty"));
+        }
+        let mut previous_end = 0usize;
+        for (index, span) in plan.spans.iter().enumerate() {
+            let end = span
+                .start
+                .checked_add(span.n_tokens)
+                .ok_or_else(|| anyhow!("image span #{index} overflows token indices"))?;
+            if span.n_tokens == 0 || span.start < previous_end || end > prompt.len() {
+                return Err(anyhow!(
+                    "invalid image span #{index}: {}..{} for prompt length {}",
+                    span.start,
+                    end,
+                    prompt.len()
+                ));
+            }
+            if span.embeds.len() != span.n_tokens * ne {
+                return Err(anyhow!(
+                    "image span #{index} has {} embedding values, expected {}",
+                    span.embeds.len(),
+                    span.n_tokens * ne
+                ));
+            }
+            previous_end = end;
+        }
+        if plan.decode_base < 0 {
+            return Err(anyhow!(
+                "multimodal decode base must be non-negative, got {}",
+                plan.decode_base
+            ));
+        }
+        let mut all_positions = Vec::with_capacity(max_ctx * 4);
+        all_positions.extend_from_slice(&plan.prompt_pos4);
+        for token in prompt.len()..max_ctx {
+            let delta = i32::try_from(token - prompt.len())
+                .map_err(|_| anyhow!("multimodal context exceeds i32 position range"))?;
+            let pos = plan
+                .decode_base
+                .checked_add(delta)
+                .ok_or_else(|| anyhow!("multimodal decode position overflow"))?;
+            all_positions.extend_from_slice(&[pos, pos, pos, 0]);
+        }
+        let _gp = req.and_then(|r| r.gate_pass());
+        let buffer = be
+            .alloc_uninit(all_positions.len() * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("allocate multimodal QSA position table: {e}"))?;
+        be.upload(buffer.as_ref(), bytemuck::cast_slice(&all_positions))
+            .map_err(|e| anyhow!("upload multimodal QSA position table: {e}"))?;
+        (Some(buffer), Some(all_positions))
+    } else {
+        (None, None)
+    };
     // Phase-2 DiffusionGemma denoise: capture the prompt length BEFORE the ordinary prefix-diff
     // logic below runs (a denoise call's `prompt`/`max_new` are empty/0 — see `DenoiseReq`'s
     // caller — so `start`/`cached` are left untouched: the `if denoise_req.is_some()` guard just
@@ -1683,7 +2806,9 @@ pub(crate) fn generate_dense_backend(
     // else (divergent prompt, identical resend, first-ever call) zero-resets every DeltaNet layer's
     // conv/S state and re-prefills from scratch. Dense/attention models keep the generic
     // longest-common-prefix diff.
-    let (start, state_path) = if denoise_req.is_some() {
+    let (start, state_path) = if let Some(prepared) = &parallel_prepared {
+        (prepared[0].start, "parallel")
+    } else if denoise_req.is_some() {
         // No-op: a denoise call never touches `cached` (it isn't part of the prompt/generation
         // token stream) — `cached.truncate(start)` below is then a truncate-to-current-length.
         (cached.len(), "denoise")
@@ -1742,27 +2867,34 @@ pub(crate) fn generate_dense_backend(
     // Only a strict, newly processed prefix can become a checkpoint. If the hint is malformed,
     // tokenization did not preserve the rendered string prefix, or the state already lies past it,
     // leave the previous checkpoint intact and use the ordinary generation path.
-    let turn_checkpoint_boundary = turn_checkpoint
-        .and_then(|checkpoint| match checkpoint {
-            TurnCheckpoint::Enable => None,
-            TurnCheckpoint::Boundary(boundary) => Some(boundary),
-        })
-        .filter(|&boundary| {
-            (c.qwen35 || c.qwen4exp || c.bailingmoe3)
-                && boundary > start
-                && boundary < prompt.len()
-                && boundary <= max_ctx
-        });
-    if let Some(boundary) = turn_checkpoint_boundary {
-        TurnRecurrentCkpt::begin(
-            turn_recurrent_ckpt,
-            be,
-            c,
-            &kbufs[..],
-            &vbufs[..],
-            ple_state_buf.as_deref(),
-            &prompt[..boundary],
-        )?;
+    let turn_checkpoint_boundary = parallel_prepared.as_ref().map_or_else(
+        || {
+            turn_checkpoint
+                .and_then(|checkpoint| match checkpoint {
+                    TurnCheckpoint::Enable => None,
+                    TurnCheckpoint::Boundary(boundary) => Some(boundary),
+                })
+                .filter(|&boundary| {
+                    (c.qwen35 || c.qwen4exp || c.bailingmoe3)
+                        && boundary > start
+                        && boundary < prompt.len()
+                        && boundary <= max_ctx
+                })
+        },
+        |prepared| prepared[0].checkpoint_boundary,
+    );
+    if parallel_prepared.is_none() {
+        if let Some(boundary) = turn_checkpoint_boundary {
+            TurnRecurrentCkpt::begin(
+                turn_recurrent_ckpt,
+                be,
+                c,
+                &kbufs[..],
+                &vbufs[..],
+                ple_state_buf.as_deref(),
+                &prompt[..boundary],
+            )?;
+        }
     }
     // SWA ring rewind guard: a ring layer RETAINS only its last `rows_l` positions — rows for
     // positions older than `cached.len() - rows_l` were recycled by newer writes. Re-prefilling
@@ -1771,7 +2903,9 @@ pub(crate) fn generate_dense_backend(
     // re-prefill (start = 0 — correctness over reuse; the full cache never hits this). Extending
     // turns (start == cached.len()) and the ≤1-token `.min(prompt.len()-1)` rewind stay safe:
     // rows_l - window >= ubatch >= 1.
-    let start = if kv_ring && start > 0 && start < cached.len() {
+    let start = if parallel_prepared.is_some() {
+        start
+    } else if kv_ring && start > 0 && start < cached.len() {
         let safe = (0..c.n_layer)
             .filter(|&l| c.is_swa_layer(l))
             .map(|l| crate::seam::kv_rows(c, l, max_ctx, true, ec))
@@ -1979,6 +3113,12 @@ pub(crate) fn generate_dense_backend(
                  // speculative-VERIFY call site below (this fn's `verify` param is `Some`);
                  // `false` from every other caller (decode loop, batched prefill, DG denoise).
                  mtp_verify: bool,
+                 // Decode batch whose rows are independent sequences. Stateful handles are bound
+                 // per row; stateless activations and MoE routing remain aggregated.
+                 independent_rows: bool,
+                 // Optional multi-row boundaries for independent sequences. `None` retains the
+                 // one-row-per-sequence decode layout.
+                 independent_spans: Option<&[SequenceSpan]>,
                  // LAYER SPAN: emit the ops for `span` only, and carry the residual stream in a
                  // caller-owned buffer instead of graph scratch — `hidden` becomes an `Input` the
                  // caller binds and the ops mutate in place, so a span that is not the whole model
@@ -2020,6 +3160,47 @@ pub(crate) fn generate_dense_backend(
         );
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
+        g.independent_rows = independent_rows;
+        if independent_rows {
+            g.sequence_spans = independent_spans.map_or_else(
+                || {
+                    (0..batch)
+                        .map(|row| SequenceSpan {
+                            row_start: row as u32,
+                            rows: 1,
+                            start_pos: start_pos as u32,
+                        })
+                        .collect()
+                },
+                <[SequenceSpan]>::to_vec,
+            );
+            assert_eq!(
+                g.sequence_spans
+                    .iter()
+                    .map(|span| span.rows as usize)
+                    .sum::<usize>(),
+                batch,
+                "independent sequence spans must cover the activation batch"
+            );
+        }
+        let max_visible = if independent_rows {
+            g.sequence_spans
+                .iter()
+                .map(|span| span.start_pos as usize + span.rows as usize)
+                .max()
+                .unwrap_or(start_pos + batch)
+        } else {
+            start_pos + batch
+        };
+        let min_start = if independent_rows {
+            g.sequence_spans
+                .iter()
+                .map(|span| span.start_pos as usize)
+                .min()
+                .unwrap_or(start_pos)
+        } else {
+            start_pos
+        };
         // DiffusionGemma: force the per-execute STATIC path for every graph of this model (see
         // `Graph::no_decode_replay`). The record-once replay's `_dyn` kernels agree with the
         // static recording only to float-reassociation noise; the entropy-bound denoise loop
@@ -2064,6 +3245,23 @@ pub(crate) fn generate_dense_backend(
             g.input(f32d(batch * ne))
         };
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
+        // Generated/text-only IMROPE rows select the same logical T position in every active
+        // frequency pair. Emit the ordinary RoPE op for those batches; image rows retain the 4D
+        // op. QSA history remains 4D independently because old image blocks still need H/W.
+        let max_rope_pairs = (l_first..l_end)
+            .map(|layer| c.layer_rope_dim(layer) / 2)
+            .max()
+            .unwrap_or(c.rope_dim / 2)
+            .max(c.rope_dim / 2);
+        let positions4 = mrope_positions
+            .as_deref()
+            .is_some_and(|table| {
+                !mrope_rows_are_plain_rope(table, start_pos, batch, c.rope_sections, max_rope_pairs)
+            })
+            .then(|| g.input(TensorDesc::new(vec![batch, 4], DType::I32)));
+        let mrope_history = mrope_positions
+            .as_ref()
+            .map(|_| g.input(TensorDesc::new(vec![max_ctx, 4], DType::I32)));
         let qwen_wide = c.qwen4exp.then(|| g.input(f32d(batch * c.hc_mult * ne)));
         let span_has_ple = c.qwen4exp && (l_first..l_end).any(|l| c.is_ple_layer(l));
         let ple_embd = span_has_ple.then(|| {
@@ -2529,6 +3727,28 @@ pub(crate) fn generate_dense_backend(
                 pl_post_norm,
             });
         }
+        // Qwen3.8 executes layer 0 and layers 1..end as separate graphs around the CPU PLE
+        // hand-off. Keep an explicit directory so layer 0 can still name layer 1's router and
+        // expert banks; it stays empty for prefill and every architecture without the validated
+        // one-layer-ahead predictor.
+        let prefetch_targets: Vec<Option<(TensorId, TensorId, TensorId, TensorId, bool)>> =
+            if expert_prefetch && batch == 1 {
+                lw.iter()
+                    .map(|layer| match &layer.ffn {
+                        FfnW::Moe {
+                            router,
+                            gate_exps,
+                            up_exps,
+                            down_exps,
+                            fused_gate_up,
+                            ..
+                        } => Some((*router, *gate_exps, *up_exps, *down_exps, *fused_gate_up)),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let qwen_hc_head = c.qwen4exp.then(|| QwenHcW {
             norm: wpush(&mut g, &mut weights),
             down: wpush(&mut g, &mut weights),
@@ -4668,20 +5888,37 @@ pub(crate) fn generate_dense_backend(
                     // K: fused QkNorm+RoPE (qwen3/gemma) → f16 `k16`, else RoPE alone (llama) in-place f32.
                     let k_write = match aw.k_norm {
                         Some(kn) => {
-                            g.push(Op::QkNormRope {
-                                x: k,
-                                weight: kn,
-                                positions,
-                                dst: k16,
-                                rows: batch as u32,
-                                n_head: nkv as u32,
-                                head_dim: hd as u32,
-                                rope_dim: rope_dim as u32,
-                                theta,
-                                eps,
-                                freq_factors: layer_ff,
-                                x_stride: 0,
-                            });
+                            if let Some(pos4) = positions4 {
+                                g.push(Op::QkNormMrope {
+                                    x: k,
+                                    weight: kn,
+                                    positions4: pos4,
+                                    dst: k16,
+                                    rows: batch as u32,
+                                    n_head: nkv as u32,
+                                    head_dim: hd as u32,
+                                    rope_dim: rope_dim as u32,
+                                    theta,
+                                    eps,
+                                    sections: c.rope_sections,
+                                    x_stride: 0,
+                                });
+                            } else {
+                                g.push(Op::QkNormRope {
+                                    x: k,
+                                    weight: kn,
+                                    positions,
+                                    dst: k16,
+                                    rows: batch as u32,
+                                    n_head: nkv as u32,
+                                    head_dim: hd as u32,
+                                    rope_dim: rope_dim as u32,
+                                    theta,
+                                    eps,
+                                    freq_factors: layer_ff,
+                                    x_stride: 0,
+                                });
+                            }
                             k16
                         }
                         None if nope => {
@@ -4760,20 +5997,37 @@ pub(crate) fn generate_dense_backend(
                         } else {
                             (q, 0)
                         };
-                        g.push(Op::QkNormRope {
-                            x: q_src,
-                            weight: qn,
-                            positions,
-                            dst: q16,
-                            rows: batch as u32,
-                            n_head: nh as u32,
-                            head_dim: hd as u32,
-                            rope_dim: rope_dim as u32,
-                            theta,
-                            eps,
-                            freq_factors: layer_ff,
-                            x_stride: q_stride,
-                        });
+                        if let Some(pos4) = positions4 {
+                            g.push(Op::QkNormMrope {
+                                x: q_src,
+                                weight: qn,
+                                positions4: pos4,
+                                dst: q16,
+                                rows: batch as u32,
+                                n_head: nh as u32,
+                                head_dim: hd as u32,
+                                rope_dim: rope_dim as u32,
+                                theta,
+                                eps,
+                                sections: c.rope_sections,
+                                x_stride: q_stride,
+                            });
+                        } else {
+                            g.push(Op::QkNormRope {
+                                x: q_src,
+                                weight: qn,
+                                positions,
+                                dst: q16,
+                                rows: batch as u32,
+                                n_head: nh as u32,
+                                head_dim: hd as u32,
+                                rope_dim: rope_dim as u32,
+                                theta,
+                                eps,
+                                freq_factors: layer_ff,
+                                x_stride: q_stride,
+                            });
+                        }
                         q16
                     }
                     None if nope => {
@@ -4854,30 +6108,50 @@ pub(crate) fn generate_dense_backend(
                         out_f: (c.indexer_n_head * c.indexer_head_size) as u32,
                         w_off: 0,
                     });
-                    g.push(Op::QkNormRope {
-                        x: qsa_q,
-                        weight: qw.q_norm,
-                        positions,
-                        dst: qsa_q16,
-                        rows: batch as u32,
-                        n_head: c.indexer_n_head as u32,
-                        head_dim: c.indexer_head_size as u32,
-                        rope_dim: c.rope_dim as u32,
-                        theta,
-                        eps,
-                        freq_factors: layer_ff,
-                        x_stride: 0,
-                    });
+                    if let Some(pos4) = positions4 {
+                        g.push(Op::QkNormMrope {
+                            x: qsa_q,
+                            weight: qw.q_norm,
+                            positions4: pos4,
+                            dst: qsa_q16,
+                            rows: batch as u32,
+                            n_head: c.indexer_n_head as u32,
+                            head_dim: c.indexer_head_size as u32,
+                            rope_dim: c.rope_dim as u32,
+                            theta,
+                            eps,
+                            sections: c.rope_sections,
+                            x_stride: 0,
+                        });
+                    } else {
+                        g.push(Op::QkNormRope {
+                            x: qsa_q,
+                            weight: qw.q_norm,
+                            positions,
+                            dst: qsa_q16,
+                            rows: batch as u32,
+                            n_head: c.indexer_n_head as u32,
+                            head_dim: c.indexer_head_size as u32,
+                            rope_dim: c.rope_dim as u32,
+                            theta,
+                            eps,
+                            freq_factors: layer_ff,
+                            x_stride: 0,
+                        });
+                    }
                     Some((qsa_q16, cache, block_cache, qw.k_norm))
                 } else {
                     None
                 };
-                let visible = start_pos + batch;
+                let visible = max_visible;
                 let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
-                let batched_qsa = batch > 1 && qsa_query.is_some() && visible > qsa_threshold;
+                let batched_qsa = batch > 1
+                    && qsa_query.is_some()
+                    && visible > qsa_threshold
+                    && min_start + 1 > qsa_threshold;
                 if batched_qsa {
                     assert!(
-                        start_pos + 1 > qsa_threshold,
+                        min_start + 1 > qsa_threshold,
                         "a batched QSA span must not cross the dense-to-sparse boundary"
                     );
                     let (ix_q, ix_k, ix_blocks, ix_norm) = qsa_query.expect("batched QSA query");
@@ -4887,13 +6161,14 @@ pub(crate) fn generate_dense_backend(
                         k_cache: ix_k,
                         block_cache: ix_blocks,
                         k_norm: ix_norm,
+                        positions4: mrope_history,
                         dst: qsa_indices,
                         rows: batch as u32,
                         kv_len: visible as u32,
-                        compress_from: if start_pos <= qsa_threshold {
+                        compress_from: if min_start <= qsa_threshold {
                             0
                         } else {
-                            (start_pos / qsa_ratio) as u32
+                            (min_start / qsa_ratio) as u32
                         },
                         n_head: c.indexer_n_head as u32,
                         head_dim: c.indexer_head_size as u32,
@@ -4903,6 +6178,7 @@ pub(crate) fn generate_dense_backend(
                         theta,
                         eps,
                         scale: 1.0 / (c.indexer_head_size as f32).sqrt(),
+                        sections: c.rope_sections,
                     });
                     g.push(Op::QsaBatchAttention {
                         q: q_attn,
@@ -4933,6 +6209,7 @@ pub(crate) fn generate_dense_backend(
                                 k_cache: ix_k,
                                 block_cache: ix_blocks,
                                 k_norm: ix_norm,
+                                positions4: mrope_history,
                                 dst: qsa_indices,
                                 rows: 1,
                                 kv_len: visible as u32,
@@ -4949,6 +6226,7 @@ pub(crate) fn generate_dense_backend(
                                 theta,
                                 eps,
                                 scale: 1.0 / (c.indexer_head_size as f32).sqrt(),
+                                sections: c.rope_sections,
                             });
                             g.push(Op::QsaGather {
                                 k_cache: k_cache[kv_src],
@@ -5221,6 +6499,7 @@ pub(crate) fn generate_dense_backend(
                         });
                         sel
                     });
+                    let source_op = g.ops.len();
                     g.push(Op::MoeFfn {
                         x: hn,
                         router_x: hn, // qwen3moe/qwen35moe: router reads the SAME normed input as the experts
@@ -5249,6 +6528,29 @@ pub(crate) fn generate_dense_backend(
                         // `None` everywhere else, which is the router's own top-k.
                         expert_ids,
                     });
+                    if let Some(Some((
+                        target_router,
+                        target_gate_exps,
+                        target_up_exps,
+                        target_down_exps,
+                        target_fused_gate_up,
+                    ))) = prefetch_targets.get(l + 1)
+                    {
+                        g.moe_prefetch_hints.push(MoePrefetchHint {
+                            source_op,
+                            source_layer: l as u32,
+                            target_layer: (l + 1) as u32,
+                            target_router: *target_router,
+                            target_gate_exps: *target_gate_exps,
+                            target_up_exps: *target_up_exps,
+                            target_down_exps: *target_down_exps,
+                            target_fused_gate_up: *target_fused_gate_up,
+                            target_n_expert: mc.n_expert as u32,
+                            target_qsa: c.is_qwen_hybrid_attn_layer(l + 1),
+                            context_tokens: start_pos.saturating_add(batch).min(u32::MAX as usize)
+                                as u32,
+                        });
+                    }
                     if let Some(MoeSharedW {
                         gate_inp,
                         wgate,
@@ -5745,14 +7047,15 @@ pub(crate) fn generate_dense_backend(
                     rows: logits_rows as u32,
                 });
                 (Some(tid), None)
-            } else if gpu_sample && logits_rows == 1 {
-                let uin = g.input(f32d(1));
-                let tid = g.output(f32d(1));
+            } else if gpu_sample && logits_rows > 0 {
+                let uin = g.input(f32d(logits_rows));
+                let tid = g.output(f32d(logits_rows));
                 g.push(Op::Sample {
                     x: logits,
                     u: uin,
                     dst: tid,
                     n: c.vocab as u32,
+                    rows: logits_rows as u32,
                     top_k: sampler.top_k as u32,
                     temp: sampler.temp,
                     top_p: sampler.top_p,
@@ -5770,6 +7073,8 @@ pub(crate) fn generate_dense_backend(
             DecodeHandles {
                 hidden,
                 positions,
+                positions4,
+                mrope_history,
                 rope_freqs,
                 yarn_ff,
                 pl_tok_in: if pl_gathered { None } else { pl_tok_in },
@@ -5792,6 +7097,332 @@ pub(crate) fn generate_dense_backend(
             },
         )
     };
+
+    // ── layer-synchronous multi-session prefill ─────────────────────────────────────────────
+    if let Some(prepared) = parallel_prepared.as_ref() {
+        let parallel = parallel_prefill
+            .as_deref_mut()
+            .expect("prepared parallel prefill retains its request");
+        if !gpu_embed {
+            return Err(anyhow!("parallel prefill requires Vulkan GPU embedding"));
+        }
+        let lanes = parallel.prompts.len();
+        let starts = prepared.iter().map(|lane| lane.start).collect::<Vec<_>>();
+        let targets = parallel
+            .prompts
+            .iter()
+            .map(|tokens| tokens.len().saturating_sub(1))
+            .collect::<Vec<_>>();
+        let mut cursors = starts.clone();
+        let ubatch = crate::seam::ubatch_rows(ec).max(lanes);
+        let ple_row = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram * c.ple_head_dim;
+        let qsa_ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
+        let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
+        for lane in 0..lanes {
+            let progress = parallel_prefill_progress(
+                parallel.prompts[lane].len(),
+                starts[lane],
+                cursors[lane],
+                max_ctx,
+            );
+            if lane == 0 {
+                if let Some(request) = req {
+                    request.report_progress(progress);
+                }
+            }
+            if let Some(on_progress) = parallel.on_progress {
+                on_progress(lane, progress);
+            }
+        }
+        let t0 = std::time::Instant::now();
+
+        while let Some(first_lane) = (0..lanes).find(|&lane| cursors[lane] < targets[lane]) {
+            if crate::sampling::abort_requested(req) {
+                break;
+            }
+            let sparse = cursors[first_lane] + 1 > qsa_threshold;
+            let prefill_lanes = (0..lanes)
+                .filter(|&lane| {
+                    cursors[lane] < targets[lane] && (cursors[lane] + 1 > qsa_threshold) == sparse
+                })
+                .collect::<Vec<_>>();
+            let final_ranges = prefill_lanes
+                .iter()
+                .map(|&lane| {
+                    let begin = cursors[lane];
+                    let mut end = targets[lane];
+                    if !sparse {
+                        end = end.min(qsa_threshold);
+                    }
+                    if let Some(boundary) = prepared[lane].checkpoint_boundary {
+                        if begin < boundary {
+                            end = end.min(boundary);
+                        }
+                    }
+                    begin..end
+                })
+                .collect::<Vec<_>>();
+            let row_counts = allocate_parallel_prefill_rows(
+                &final_ranges
+                    .iter()
+                    .map(|range| range.len())
+                    .collect::<Vec<_>>(),
+                ubatch,
+            );
+            let mut prefill_ranges = Vec::with_capacity(prefill_lanes.len());
+            for ((&lane, final_range), rows) in
+                prefill_lanes.iter().zip(final_ranges).zip(row_counts)
+            {
+                let end = final_range.start + rows;
+                if end <= final_range.start {
+                    return Err(anyhow!(
+                        "parallel prefill lane {lane} made no progress at position {}",
+                        final_range.start
+                    ));
+                }
+                prefill_ranges.push(final_range.start..end);
+            }
+            let batch_lanes = prefill_lanes.clone();
+            let ranges = prefill_ranges.clone();
+            let mut spans = Vec::with_capacity(batch_lanes.len());
+            let mut row_start = 0usize;
+            for range in &ranges {
+                let rows = range.len();
+                spans.push(SequenceSpan {
+                    row_start: row_start as u32,
+                    rows: rows as u32,
+                    start_pos: range.start as u32,
+                });
+                row_start += rows;
+            }
+            let batch = row_start;
+            // One active lane is an ordinary contiguous sequence, even though it arrived through
+            // the parallel scheduler. Keeping it on the single-sequence graph also preserves the
+            // sparse-QSA gather path used by a final one-row prefill tail.
+            let independent_rows = batch_lanes.len() > 1;
+            let _gp = req.and_then(|request| request.gate_pass());
+            for (&lane, range) in batch_lanes.iter().zip(&ranges) {
+                if lane == 0 {
+                    ensure_kv_depth!(range.end);
+                } else {
+                    parallel.peers[lane - 1].ensure_segmented_depth(be, c, range.end)?;
+                }
+            }
+
+            let mut ids = Vec::with_capacity(batch);
+            let mut positions = Vec::with_capacity(batch);
+            let worker = ple_worker
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
+            let mut tickets = Vec::with_capacity(batch_lanes.len());
+            for (&lane, range) in batch_lanes.iter().zip(&ranges) {
+                ids.extend(
+                    parallel.prompts[lane][range.clone()]
+                        .iter()
+                        .map(|&token| token as i32),
+                );
+                positions.extend((range.start..range.end).map(|position| position as i32));
+                tickets.push(worker.submit_range(
+                    &parallel.prompts[lane],
+                    range.start,
+                    range.len(),
+                    c.ple_ngram_size,
+                )?);
+            }
+
+            let ids_buf = be
+                .alloc(batch * 4, BufferUsage::Staging)
+                .map_err(|error| anyhow!("{error}"))?;
+            let pos_batch = be
+                .alloc(batch * 4, BufferUsage::Staging)
+                .map_err(|error| anyhow!("{error}"))?;
+            let hidden_batch = be
+                .alloc_uninit(batch * ne * 4, BufferUsage::Activations)
+                .map_err(|error| anyhow!("{error}"))?;
+            let wide_batch = be
+                .alloc_uninit(batch * c.hc_mult * ne * 4, BufferUsage::Activations)
+                .map_err(|error| anyhow!("{error}"))?;
+            let ple_batch = be
+                .alloc(batch * ple_row * 4, BufferUsage::Staging)
+                .map_err(|error| anyhow!("{error}"))?;
+            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+                .map_err(|error| anyhow!("{error}"))?;
+            be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&positions))
+                .map_err(|error| anyhow!("{error}"))?;
+
+            let (g0, h0) = build(
+                batch,
+                ranges[0].start,
+                0,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                independent_rows,
+                independent_rows.then_some(spans.as_slice()),
+                Some(0..1),
+            );
+            let plan0 = be.compile(&g0).map_err(|error| anyhow!("{error}"))?;
+            let mut bindings0 = Bindings::new();
+            bindings0.bind(
+                h0.tok_ids.expect("GPU embedding needs token ids"),
+                ids_buf.as_ref(),
+            );
+            bindings0.bind(h0.hidden, hidden_batch.as_ref());
+            bindings0.bind(h0.positions, pos_batch.as_ref());
+            bind_parallel_layer_io(
+                &mut bindings0,
+                &h0,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+                wide_batch.as_ref(),
+                None,
+                &*parallel.peers,
+                Some(&batch_lanes),
+                independent_rows,
+            );
+            be.execute(plan0.as_ref(), &bindings0)
+                .map_err(|error| anyhow!("{error}"))?;
+
+            let mut ple_rows = Vec::with_capacity(batch * ple_row);
+            for (ticket, range) in tickets.into_iter().zip(&ranges) {
+                let rows = ticket.wait()?;
+                let expected = range.len() * ple_row;
+                if rows.len() != expected {
+                    return Err(anyhow!(
+                        "parallel PLE produced {} values, expected {expected}",
+                        rows.len()
+                    ));
+                }
+                ple_rows.extend_from_slice(rows.as_slice());
+            }
+            be.upload(ple_batch.as_ref(), bytemuck::cast_slice(&ple_rows))
+                .map_err(|error| anyhow!("{error}"))?;
+
+            let (g1, h1) = build(
+                batch,
+                ranges[0].start,
+                0,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                independent_rows,
+                independent_rows.then_some(spans.as_slice()),
+                Some(1..c.n_layer),
+            );
+            let plan1 = be.compile(&g1).map_err(|error| anyhow!("{error}"))?;
+            let mut bindings1 = Bindings::new();
+            bindings1.bind(h1.hidden, hidden_batch.as_ref());
+            bindings1.bind(h1.positions, pos_batch.as_ref());
+            bind_parallel_layer_io(
+                &mut bindings1,
+                &h1,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+                wide_batch.as_ref(),
+                Some(ple_batch.as_ref()),
+                &*parallel.peers,
+                Some(&batch_lanes),
+                independent_rows,
+            );
+            be.execute(plan1.as_ref(), &bindings1)
+                .map_err(|error| anyhow!("{error}"))?;
+
+            for (&lane, range) in prefill_lanes.iter().zip(&prefill_ranges) {
+                cursors[lane] = range.end;
+                if Some(range.end) == prepared[lane].checkpoint_boundary {
+                    if lane == 0 {
+                        if let Some(checkpoint) = turn_recurrent_ckpt.as_mut() {
+                            checkpoint.snapshot_all(
+                                be,
+                                &kbufs[..],
+                                &vbufs[..],
+                                ple_state_buf.as_deref(),
+                            )?;
+                        }
+                    } else {
+                        let slot = &mut parallel.peers[lane - 1];
+                        if let Some(checkpoint) = slot.turn_recurrent_ckpt.as_mut() {
+                            checkpoint.snapshot_all(
+                                be,
+                                &slot.kbufs,
+                                &slot.vbufs,
+                                slot.ple_state_buf.as_deref(),
+                            )?;
+                        }
+                    }
+                }
+            }
+            for lane in 0..lanes {
+                if starts[lane] < targets[lane] {
+                    let progress = parallel_prefill_progress(
+                        parallel.prompts[lane].len(),
+                        starts[lane],
+                        cursors[lane],
+                        max_ctx,
+                    );
+                    if lane == 0 {
+                        if let Some(request) = req {
+                            request.report_progress(progress);
+                        }
+                    }
+                    if let Some(on_progress) = parallel.on_progress {
+                        on_progress(lane, progress);
+                    }
+                }
+            }
+        }
+
+        let elapsed = t0.elapsed().as_secs_f64();
+        if cursors[0] == targets[0] {
+            *cached = parallel.prompts[0][..targets[0]].to_vec();
+        }
+        for lane in 1..lanes {
+            if cursors[lane] == targets[lane] {
+                parallel.peers[lane - 1].cached = parallel.prompts[lane][..targets[lane]].to_vec();
+            }
+        }
+        let stats = (0..lanes)
+            .map(|lane| GenStats {
+                n_prompt: parallel.prompts[lane].len() - starts[lane],
+                n_cached: starts[lane],
+                prompt_secs: elapsed,
+                n_gen: 0,
+                decode_secs: 0.0,
+            })
+            .collect::<Vec<_>>();
+        parallel.peer_stats.extend(stats.iter().skip(1).cloned());
+        return Ok((Vec::new(), stats[0].clone()));
+    }
 
     // ── Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc) ───────────────────────
     // ONE forward over the C canvas rows, reusing the session's already-prefilled prompt KV
@@ -5993,6 +7624,8 @@ pub(crate) fn generate_dense_backend(
                 false, // gpu_sample: same
                 false, // use_ids: the canvas rows are soft-embeds, not token ids
                 false, // mtp_verify: DG denoise is never an MTP-verify batch
+                false, // independent_rows: one session with several sequence rows
+                None,  // independent spans
                 None,  // span: the whole model in one graph
             );
             let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
@@ -6069,6 +7702,7 @@ pub(crate) fn generate_dense_backend(
             &vbufs[..],
             &qsa_kbufs[..],
             &qsa_cbufs[..],
+            &mrope_history_buf,
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -6297,8 +7931,10 @@ pub(crate) fn generate_dense_backend(
             gpu_verify_ids,
             false,
             false,
-            true, // mtp_verify: this IS the speculative-VERIFY batched forward
-            None, // span: the whole model in one graph
+            true,  // mtp_verify: this IS the speculative-VERIFY batched forward
+            false, // independent_rows: one speculative sequence
+            None,  // independent spans
+            None,  // span: the whole model in one graph
         );
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
         let t_vcompile0 = std::time::Instant::now();
@@ -6325,6 +7961,7 @@ pub(crate) fn generate_dense_backend(
             &vbufs[..],
             &qsa_kbufs[..],
             &qsa_cbufs[..],
+            &mrope_history_buf,
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -6397,12 +8034,743 @@ pub(crate) fn generate_dense_backend(
     }
 
     // ── drive ───────────────────────────────────────────────────────────────────────
+    if let Some(parallel) = parallel_decode.as_deref_mut() {
+        if !c.qwen4exp {
+            return Err(anyhow!("parallel decode currently supports qwen4exp only"));
+        }
+        if mm.is_some() {
+            return Err(anyhow!(
+                "parallel decode does not yet support multimodal position rows"
+            ));
+        }
+        if !gpu_embed {
+            return Err(anyhow!("parallel decode requires Vulkan GPU embedding"));
+        }
+        let lanes = parallel.prompts.len();
+        if !(1..=8).contains(&lanes) || parallel.peers.len() + 1 != lanes {
+            return Err(anyhow!("parallel decode requires 1..=8 slots; got {lanes}"));
+        }
+        if parallel.samplers.len() != lanes {
+            return Err(anyhow!(
+                "parallel decode has {lanes} lanes but {} samplers",
+                parallel.samplers.len()
+            ));
+        }
+        if parallel.prompt_ends.len() != lanes || parallel.checkpoint_boundaries.len() != lanes {
+            return Err(anyhow!(
+                "parallel token step has {lanes} lanes, {} prompt ends and {} checkpoints",
+                parallel.prompt_ends.len(),
+                parallel.checkpoint_boundaries.len()
+            ));
+        }
+        let mut lane_starts = Vec::with_capacity(lanes);
+        lane_starts.push(cached.len());
+        for (lane, (slot, lane_prompt)) in parallel
+            .peers
+            .iter()
+            .zip(&parallel.prompts[1..])
+            .enumerate()
+        {
+            let lane_start = slot.cached.len();
+            if lane_start >= lane_prompt.len() || !lane_prompt.starts_with(&slot.cached) {
+                return Err(anyhow!(
+                    "parallel token lane {} has no input at cached depth {lane_start}",
+                    lane + 1,
+                ));
+            }
+            if lane_start + max_new > slot.max_ctx {
+                return Err(anyhow!(
+                    "parallel token lane {} exceeds its KV capacity {}",
+                    lane + 1,
+                    slot.max_ctx
+                ));
+            }
+            lane_starts.push(lane_start);
+        }
+        if cached.len() >= prompt.len() || cached.len() + max_new > max_ctx {
+            return Err(anyhow!(
+                "parallel token primary has no room for {max_new} step(s) at cached depth {}",
+                cached.len()
+            ));
+        }
+        for lane in 0..lanes {
+            let end = parallel.prompt_ends[lane];
+            if end == 0 || end > parallel.prompts[lane].len() {
+                return Err(anyhow!(
+                    "parallel token lane {lane} has invalid prompt end {end} for {} tokens",
+                    parallel.prompts[lane].len()
+                ));
+            }
+        }
+        let remaining_prefill = lane_starts
+            .iter()
+            .zip(parallel.prompt_ends)
+            .map(|(&position, &end)| end.saturating_sub(1).saturating_sub(position))
+            .collect::<Vec<_>>();
+        if remaining_prefill.windows(2).any(|pair| pair[0] < pair[1]) {
+            return Err(anyhow!(
+                "parallel token lanes must be ordered by descending remaining prefill"
+            ));
+        }
+        let qsa_ratio = c.compress_ratios.iter().copied().max().unwrap_or(4).max(1);
+        let qsa_threshold = c.indexer_top_k + qsa_ratio - 1;
+        let sparse = lane_starts[0] + 1 > qsa_threshold;
+        if lane_starts
+            .iter()
+            .any(|&lane_start| (lane_start + 1 > qsa_threshold) != sparse)
+        {
+            return Err(anyhow!(
+                "parallel decode cannot mix dense and sparse QSA rows in one graph"
+            ));
+        }
+
+        let profile_cohort = infr_core::pager_profile::active();
+        let profile_cohort_t0 = profile_cohort.then(std::time::Instant::now);
+        let profile_before = profile_cohort.then(infr_core::pager_profile::snapshot);
+        let profile_timeline_before =
+            profile_cohort.then(infr_core::pager_profile::device_timeline_snapshot);
+        let profile_layers_before =
+            profile_cohort.then(infr_core::pager_profile::paged_moe_layer_snapshot);
+        let profile_once_t0 = profile_cohort.then(std::time::Instant::now);
+        let ple_heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
+        let ple_row = ple_heads * c.ple_head_dim;
+        let (
+            ids_buf,
+            pos_batch,
+            hidden_batch,
+            logits_batch,
+            ids_out,
+            sample_u,
+            wide_batch,
+            ple_batch,
+        ) = {
+            let _gp = req.and_then(|request| request.gate_pass());
+            (
+                be.alloc(lanes * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(lanes * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc_uninit(lanes * ne * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc_uninit(lanes * c.vocab * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(lanes * 4, BufferUsage::Readback)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(lanes * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc_uninit(lanes * c.hc_mult * ne * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(lanes * ple_row * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        };
+
+        let mut curs = parallel.prompts.to_vec();
+        let mut generated = vec![Vec::<u32>::with_capacity(max_new); lanes];
+        let mut last_written = vec![None; lanes];
+        let mut prompt_secs = vec![0.0f64; lanes];
+        let mut decode_secs = vec![0.0f64; lanes];
+        let independent_rows = lanes > 1;
+        let profile_once = profile_once_t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        let mut profile_front = std::time::Duration::ZERO;
+        let mut profile_layer0 = std::time::Duration::ZERO;
+        let mut profile_ple_wait = std::time::Duration::ZERO;
+        let mut profile_ple_upload = std::time::Duration::ZERO;
+        let mut profile_main_setup = std::time::Duration::ZERO;
+        let mut profile_main_execute = std::time::Duration::ZERO;
+        let mut profile_tail = std::time::Duration::ZERO;
+        let mut profile_steps = 0usize;
+        let mut profile_decode_rows = 0usize;
+        let mut profile_prefill_rows = 0usize;
+        for step in 0..max_new {
+            let step_t0 = std::time::Instant::now();
+            let profile_front_t0 = profile_cohort.then(std::time::Instant::now);
+            let _gp = req.and_then(|request| request.gate_pass());
+            let positions = lane_starts
+                .iter()
+                .map(|&lane_start| lane_start + step)
+                .collect::<Vec<_>>();
+            let sample_from = sampling_suffix_start(&positions, parallel.prompt_ends)?;
+            let logits_rows = lanes - sample_from;
+            let batch_argmax = logits_rows > 0
+                && caps.argmax_rows
+                && ec.spec.gpu_argmax
+                && parallel.samplers[sample_from..]
+                    .iter()
+                    .all(crate::sampling::ParallelSampler::can_gpu_argmax);
+            let batch_gpu_sample = logits_rows > 0
+                && (logits_rows == 1 || caps.sample_rows)
+                && caps.gpu_sample
+                && ec.spec.gpu_sample
+                && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
+                && parallel.samplers[sample_from..]
+                    .iter()
+                    .all(|lane| lane.can_gpu_sample_with(sampler));
+            ensure_kv_depth!(positions[0] + 1);
+            for (peer, &position) in parallel.peers.iter_mut().zip(&positions[1..]) {
+                peer.ensure_segmented_depth(be, c, position + 1)?;
+            }
+            let ids = curs
+                .iter()
+                .zip(&positions)
+                .map(|(tokens, &position)| tokens[position] as i32)
+                .collect::<Vec<_>>();
+            let position_rows = positions
+                .iter()
+                .map(|&position| position as i32)
+                .collect::<Vec<_>>();
+            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&position_rows))
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let worker = ple_worker
+                .as_ref()
+                .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
+            let ple_ticket = worker.submit_batch(
+                curs.iter()
+                    .zip(&positions)
+                    .map(|(tokens, &position)| (tokens.as_slice(), position)),
+                c.ple_ngram_size,
+            )?;
+            let sequence_spans = independent_rows.then(|| {
+                positions
+                    .iter()
+                    .enumerate()
+                    .map(|(row, &position)| SequenceSpan {
+                        row_start: row as u32,
+                        rows: 1,
+                        start_pos: position as u32,
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            let (g0, h0) = build(
+                lanes,
+                positions[0],
+                0,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                independent_rows,
+                sequence_spans.as_deref(),
+                Some(0..1),
+            );
+            let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
+            let mut b0 = Bindings::new();
+            b0.bind(
+                h0.tok_ids.expect("GPU embedding needs ids"),
+                ids_buf.as_ref(),
+            );
+            b0.bind(h0.hidden, hidden_batch.as_ref());
+            b0.bind(h0.positions, pos_batch.as_ref());
+            bind_parallel_layer_io(
+                &mut b0,
+                &h0,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+                wide_batch.as_ref(),
+                None,
+                &*parallel.peers,
+                None,
+                independent_rows,
+            );
+            if let Some(t0) = profile_front_t0 {
+                profile_front += t0.elapsed();
+            }
+            let profile_layer0_t0 = profile_cohort.then(std::time::Instant::now);
+            be.execute(plan0.as_ref(), &b0)
+                .map_err(|e| anyhow!("{e}"))?;
+            if let Some(t0) = profile_layer0_t0 {
+                profile_layer0 += t0.elapsed();
+            }
+
+            let profile_ple_wait_t0 = profile_cohort.then(std::time::Instant::now);
+            let ple_rows = ple_ticket.wait()?;
+            if let Some(t0) = profile_ple_wait_t0 {
+                profile_ple_wait += t0.elapsed();
+            }
+            let expected_ple_values = lanes * ple_row;
+            if ple_rows.len() != expected_ple_values {
+                return Err(anyhow!(
+                    "parallel PLE produced {} values, expected {expected_ple_values}",
+                    ple_rows.len()
+                ));
+            }
+            let profile_ple_upload_t0 = profile_cohort.then(std::time::Instant::now);
+            be.upload(
+                ple_batch.as_ref(),
+                bytemuck::cast_slice(ple_rows.as_slice()),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            if let Some(t0) = profile_ple_upload_t0 {
+                profile_ple_upload += t0.elapsed();
+            }
+
+            let profile_main_setup_t0 = profile_cohort.then(std::time::Instant::now);
+            let (g1, h1) = build(
+                lanes,
+                positions[0],
+                logits_rows,
+                false,
+                None,
+                false,
+                false,
+                batch_argmax,
+                batch_gpu_sample,
+                false,
+                false,
+                independent_rows,
+                sequence_spans.as_deref(),
+                Some(1..c.n_layer),
+            );
+            let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
+            let mut b1 = Bindings::new();
+            b1.bind(h1.hidden, hidden_batch.as_ref());
+            b1.bind(h1.positions, pos_batch.as_ref());
+            bind_parallel_layer_io(
+                &mut b1,
+                &h1,
+                c.n_layer,
+                rf_buf,
+                yff_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &qsa_kbufs[..],
+                &qsa_cbufs[..],
+                &mrope_history_buf,
+                &wbufs[..],
+                qwen_wide_buf,
+                ple_embd_buf,
+                ple_state_buf,
+                wide_batch.as_ref(),
+                Some(ple_batch.as_ref()),
+                &*parallel.peers,
+                None,
+                independent_rows,
+            );
+            if logits_rows > 0 {
+                b1.bind(
+                    h1.logits.expect("parallel token build has logits"),
+                    logits_batch.as_ref(),
+                );
+            }
+            if batch_argmax {
+                b1.bind(
+                    h1.tok_id.expect("parallel greedy token step has ids"),
+                    ids_out.as_ref(),
+                );
+            }
+            if batch_gpu_sample {
+                let uniforms = parallel.samplers[sample_from..]
+                    .iter_mut()
+                    .map(crate::sampling::ParallelSampler::next_uniform)
+                    .collect::<Vec<_>>();
+                be.upload(sample_u.as_ref(), bytemuck::cast_slice(&uniforms))
+                    .map_err(|e| anyhow!("{e}"))?;
+                b1.bind(
+                    h1.u_in
+                        .expect("parallel stochastic token step has a uniform"),
+                    sample_u.as_ref(),
+                );
+                b1.bind(
+                    h1.tok_id.expect("parallel stochastic token step has an id"),
+                    ids_out.as_ref(),
+                );
+            }
+            if let Some(t0) = profile_main_setup_t0 {
+                profile_main_setup += t0.elapsed();
+            }
+            let profile_main_execute_t0 = profile_cohort.then(std::time::Instant::now);
+            be.execute(plan1.as_ref(), &b1)
+                .map_err(|e| anyhow!("{e}"))?;
+            if let Some(t0) = profile_main_execute_t0 {
+                profile_main_execute += t0.elapsed();
+            }
+
+            let profile_tail_t0 = profile_cohort.then(std::time::Instant::now);
+            let mut next = vec![0u32; logits_rows];
+            if batch_argmax || batch_gpu_sample {
+                be.download(ids_out.as_ref(), bytemuck::cast_slice_mut(&mut next))
+                    .map_err(|e| anyhow!("{e}"))?;
+            } else if logits_rows > 0 {
+                let mut logits = vec![0f32; logits_rows * c.vocab];
+                be.download(logits_batch.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                    .map_err(|e| anyhow!("{e}"))?;
+                for row in 0..logits_rows {
+                    let lane = sample_from + row;
+                    next[row] = parallel.samplers[lane]
+                        .sample(&mut logits[row * c.vocab..(row + 1) * c.vocab]);
+                }
+            }
+            for (written, &position) in last_written.iter_mut().zip(&positions) {
+                *written = Some(position);
+            }
+            for lane in 0..lanes {
+                if Some(positions[lane] + 1) == parallel.checkpoint_boundaries[lane] {
+                    if lane == 0 {
+                        if let Some(checkpoint) = turn_recurrent_ckpt.as_mut() {
+                            checkpoint.snapshot_all(
+                                be,
+                                &kbufs[..],
+                                &vbufs[..],
+                                ple_state_buf.as_deref(),
+                            )?;
+                        }
+                    } else {
+                        let slot = &mut parallel.peers[lane - 1];
+                        if let Some(checkpoint) = slot.turn_recurrent_ckpt.as_mut() {
+                            checkpoint.snapshot_all(
+                                be,
+                                &slot.kbufs,
+                                &slot.vbufs,
+                                slot.ple_state_buf.as_deref(),
+                            )?;
+                        }
+                    }
+                }
+            }
+            let step_secs = step_t0.elapsed().as_secs_f64();
+            for lane in 0..sample_from {
+                prompt_secs[lane] += step_secs;
+            }
+            for lane in sample_from..lanes {
+                decode_secs[lane] += step_secs;
+            }
+            let mut stop_batch = false;
+            for (row, &token) in next.iter().enumerate() {
+                let lane = sample_from + row;
+                generated[lane].push(token);
+                let is_eos =
+                    !ec.sampling.ignore_eos && (c.eos_ids.contains(&token) || token == c.eos);
+                let keep_going = !is_eos && (parallel.on_token)(lane, token);
+                if keep_going {
+                    curs[lane].push(token);
+                } else {
+                    stop_batch = true;
+                }
+            }
+            let should_stop = stop_batch
+                || parallel
+                    .yield_requested
+                    .is_some_and(|requested| requested.load(std::sync::atomic::Ordering::Acquire));
+            if let Some(t0) = profile_tail_t0 {
+                profile_tail += t0.elapsed();
+            }
+            profile_steps += 1;
+            profile_decode_rows += logits_rows;
+            profile_prefill_rows += sample_from;
+            if should_stop {
+                break;
+            }
+        }
+
+        let profile_teardown_t0 = profile_cohort.then(std::time::Instant::now);
+        *cached = resident_after_gen(&curs[0], last_written[0]);
+        for ((slot, tokens), written) in parallel
+            .peers
+            .iter_mut()
+            .zip(&curs[1..])
+            .zip(&last_written[1..])
+        {
+            slot.cached = resident_after_gen(tokens, *written);
+        }
+        let total_generated = generated.iter().map(Vec::len).sum();
+        parallel
+            .peer_outputs
+            .extend(generated.iter().skip(1).cloned());
+        parallel.prompt_secs.extend(prompt_secs);
+        parallel.decode_secs.extend(decode_secs);
+        let profile_teardown =
+            profile_teardown_t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        if let (Some(cohort_t0), Some(before), Some(timeline_before), Some(layers_before)) = (
+            profile_cohort_t0,
+            profile_before,
+            profile_timeline_before,
+            profile_layers_before,
+        ) {
+            let wall = cohort_t0.elapsed();
+            let phases = profile_once
+                + profile_front
+                + profile_layer0
+                + profile_ple_wait
+                + profile_ple_upload
+                + profile_main_setup
+                + profile_main_execute
+                + profile_tail
+                + profile_teardown;
+            let after = infr_core::pager_profile::snapshot();
+            let timeline_after = infr_core::pager_profile::device_timeline_snapshot();
+            let layers_after = infr_core::pager_profile::paged_moe_layer_snapshot();
+            let delta = |new: u64, old: u64| new.saturating_sub(old);
+            let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1e3;
+            let ns_ms = |ns: u64| ns as f64 / 1e6;
+            let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
+            let gpu_hits = delta(after.gpu_hits, before.gpu_hits);
+            let gpu_misses = delta(after.gpu_misses, before.gpu_misses);
+            let host_hits = delta(after.host_hits, before.host_hits);
+            let host_misses = delta(after.host_misses, before.host_misses);
+            let main_busy_ns = delta(timeline_after.main_busy_ns, timeline_before.main_busy_ns);
+            let dma_busy_ns = delta(timeline_after.dma_busy_ns, timeline_before.dma_busy_ns);
+            let overlap_ns = delta(timeline_after.overlap_ns, timeline_before.overlap_ns);
+            let gpu_union_ns = main_busy_ns
+                .saturating_add(dma_busy_ns)
+                .saturating_sub(overlap_ns);
+            let backend_execute_ns = delta(after.backend_execute_ns, before.backend_execute_ns);
+            let backend_setup_ns = delta(after.backend_setup_ns, before.backend_setup_ns);
+            let recorder_acquire_ns = delta(
+                after.command_recorder_acquire_ns,
+                before.command_recorder_acquire_ns,
+            );
+            let command_record_ns = delta(after.command_record_ns, before.command_record_ns);
+            let queue_submit_ns = delta(after.queue_submit_ns, before.queue_submit_ns);
+            let sync_wait_ns = delta(after.sync_wait_ns, before.sync_wait_ns);
+            let host_accounted_ns = backend_setup_ns
+                .saturating_add(recorder_acquire_ns)
+                .saturating_add(command_record_ns)
+                .saturating_add(queue_submit_ns)
+                .saturating_add(sync_wait_ns);
+            let backend_gpu_gap_ns = backend_execute_ns.saturating_sub(gpu_union_ns);
+            let backend_residual_ns = backend_execute_ns.saturating_sub(host_accounted_ns);
+            let per_step_ms = |ns: u64| {
+                if profile_steps == 0 {
+                    0.0
+                } else {
+                    ns as f64 / 1e6 / profile_steps as f64
+                }
+            };
+            let rows = profile_decode_rows + profile_prefill_rows;
+            tracing::info!(
+                "[parallel-token-profile] lanes={} steps={} rows={} decode_rows={} prefill_rows={} wall={:.1}ms row_rate={:.1}/s once={:.1}ms front={:.1}ms layer0={:.1}ms ple_wait={:.1}ms ple_upload={:.1}ms main_setup={:.1}ms main_execute={:.1}ms tail={:.1}ms teardown={:.1}ms unaccounted={:.1}ms",
+                lanes,
+                profile_steps,
+                rows,
+                profile_decode_rows,
+                profile_prefill_rows,
+                ms(wall),
+                if wall.is_zero() {
+                    0.0
+                } else {
+                    rows as f64 / wall.as_secs_f64()
+                },
+                ms(profile_once),
+                ms(profile_front),
+                ms(profile_layer0),
+                ms(profile_ple_wait),
+                ms(profile_ple_upload),
+                ms(profile_main_setup),
+                ms(profile_main_execute),
+                ms(profile_tail),
+                ms(profile_teardown),
+                ms(wall.saturating_sub(phases)),
+            );
+            tracing::info!(
+                "[parallel-token-pager] gpu_hits={} gpu_misses={} hit_rate={:.1}% evictions={} lookup={:.1}ms host_hits={} host_misses={} host_wait={:.1}ms host_read={:.1}MiB/{:.1}ms mmap={:.1}MiB/{:.1}ms push={:.1}MiB/{:.1}ms dma={:.1}MiB gpu_copy={:.1}ms gpu_main={:.1}ms gpu_dma={:.1}ms overlap={:.1}ms dma_hidden={:.1}% queue_submits={} submit_cpu={:.1}ms sync={:.1}ms paging_sync={:.1}ms backend_execute={:.1}ms setup={:.1}ms ple_plan={:.1}ms ple_work={:.1}ms ple_wait={:.1}ms ple_upload={:.1}ms",
+                gpu_hits,
+                gpu_misses,
+                if gpu_hits + gpu_misses == 0 {
+                    100.0
+                } else {
+                    100.0 * gpu_hits as f64 / (gpu_hits + gpu_misses) as f64
+                },
+                delta(after.gpu_evictions, before.gpu_evictions),
+                ns_ms(delta(after.gpu_lookup_ns, before.gpu_lookup_ns)),
+                host_hits,
+                host_misses,
+                ns_ms(delta(after.host_wait_ns, before.host_wait_ns)),
+                mib(delta(after.host_read_bytes, before.host_read_bytes)),
+                ns_ms(delta(after.host_read_ns, before.host_read_ns)),
+                mib(delta(after.mmap_fallback_bytes, before.mmap_fallback_bytes)),
+                ns_ms(delta(after.mmap_fallback_ns, before.mmap_fallback_ns)),
+                mib(delta(after.memcpy_bytes, before.memcpy_bytes)),
+                ns_ms(delta(after.memcpy_ns, before.memcpy_ns)),
+                mib(delta(
+                    after.dedicated_transfer_bytes,
+                    before.dedicated_transfer_bytes
+                )),
+                ns_ms(delta(
+                    after.dedicated_transfer_gpu_ns,
+                    before.dedicated_transfer_gpu_ns
+                )),
+                ns_ms(main_busy_ns),
+                ns_ms(dma_busy_ns),
+                ns_ms(overlap_ns),
+                if dma_busy_ns == 0 {
+                    0.0
+                } else {
+                    100.0 * overlap_ns as f64 / dma_busy_ns as f64
+                },
+                delta(after.queue_submits, before.queue_submits),
+                ns_ms(queue_submit_ns),
+                ns_ms(sync_wait_ns),
+                ns_ms(delta(after.paging_sync_wait_ns, before.paging_sync_wait_ns)),
+                ns_ms(backend_execute_ns),
+                ns_ms(backend_setup_ns),
+                ns_ms(delta(after.ple_plan_ns, before.ple_plan_ns)),
+                ns_ms(delta(after.ple_work_ns, before.ple_work_ns)),
+                ns_ms(delta(after.ple_wait_ns, before.ple_wait_ns)),
+                ns_ms(delta(after.ple_upload_ns, before.ple_upload_ns)),
+            );
+            tracing::info!(
+                "[parallel-token-gap] backend={:.1}ms gpu_union={:.1}ms backend_minus_gpu={:.1}ms ({:.3}ms/step) host_accounted={:.1}ms closure={:.1}% setup={:.1}ms acquire={:.1}ms record={:.1}ms submit={:.1}ms sync={:.1}ms residual={:.1}ms ({:.3}ms/step)",
+                ns_ms(backend_execute_ns),
+                ns_ms(gpu_union_ns),
+                ns_ms(backend_gpu_gap_ns),
+                per_step_ms(backend_gpu_gap_ns),
+                ns_ms(host_accounted_ns),
+                if backend_execute_ns == 0 {
+                    100.0
+                } else {
+                    100.0 * host_accounted_ns.min(backend_execute_ns) as f64
+                        / backend_execute_ns as f64
+                },
+                ns_ms(backend_setup_ns),
+                ns_ms(recorder_acquire_ns),
+                ns_ms(command_record_ns),
+                ns_ms(queue_submit_ns),
+                ns_ms(sync_wait_ns),
+                ns_ms(backend_residual_ns),
+                per_step_ms(backend_residual_ns),
+            );
+            tracing::info!(
+                "[parallel-token-host] record_segments={} record_span={:.1}ms recorder_acquires={} acquire={:.1}ms queue_idle={}({:.1}ms) fence={}({:.1}ms) paging_sync={}({:.1}ms) staging_acquire={}({:.1}ms) staging_wait={}({:.1}ms) dma_submit_cpu={:.1}ms dma_slot_wait={}({:.1}ms) dma_timeline_wait={}({:.1}ms) setup_layout={:.1}ms setup_scratch={:.1}ms setup_rope={:.1}ms setup_fusion={:.1}ms setup_moe_scan={:.1}ms",
+                delta(
+                    after.command_record_segments,
+                    before.command_record_segments
+                ),
+                ns_ms(command_record_ns),
+                delta(
+                    after.command_recorder_acquires,
+                    before.command_recorder_acquires
+                ),
+                ns_ms(recorder_acquire_ns),
+                delta(after.queue_idle_waits, before.queue_idle_waits),
+                ns_ms(delta(
+                    after.queue_idle_wait_ns,
+                    before.queue_idle_wait_ns
+                )),
+                delta(after.fence_waits, before.fence_waits),
+                ns_ms(delta(after.fence_wait_ns, before.fence_wait_ns)),
+                delta(after.paging_sync_waits, before.paging_sync_waits),
+                ns_ms(delta(
+                    after.paging_sync_wait_ns,
+                    before.paging_sync_wait_ns
+                )),
+                delta(after.staging_acquires, before.staging_acquires),
+                ns_ms(delta(
+                    after.staging_acquire_ns,
+                    before.staging_acquire_ns
+                )),
+                delta(after.staging_waits, before.staging_waits),
+                ns_ms(delta(after.staging_wait_ns, before.staging_wait_ns)),
+                ns_ms(delta(
+                    after.dedicated_transfer_submit_cpu_ns,
+                    before.dedicated_transfer_submit_cpu_ns
+                )),
+                delta(
+                    after.dedicated_transfer_slot_waits,
+                    before.dedicated_transfer_slot_waits
+                ),
+                ns_ms(delta(
+                    after.dedicated_transfer_slot_wait_ns,
+                    before.dedicated_transfer_slot_wait_ns
+                )),
+                delta(
+                    after.dedicated_transfer_timeline_waits,
+                    before.dedicated_transfer_timeline_waits
+                ),
+                ns_ms(delta(
+                    after.dedicated_transfer_timeline_wait_ns,
+                    before.dedicated_transfer_timeline_wait_ns
+                )),
+                ns_ms(delta(
+                    after.backend_setup_layout_ns,
+                    before.backend_setup_layout_ns
+                )),
+                ns_ms(delta(
+                    after.backend_setup_phase_scratch_ns,
+                    before.backend_setup_phase_scratch_ns
+                )),
+                ns_ms(delta(
+                    after.backend_setup_rope_ns,
+                    before.backend_setup_rope_ns
+                )),
+                ns_ms(delta(
+                    after.backend_setup_fusion_ns,
+                    before.backend_setup_fusion_ns
+                )),
+                ns_ms(delta(
+                    after.backend_setup_paged_moe_scan_ns,
+                    before.backend_setup_paged_moe_scan_ns
+                )),
+            );
+            for (layer, layer_after) in layers_after.into_iter().enumerate() {
+                let layer_before = layers_before.get(layer).copied().unwrap_or_default();
+                let stats = layer_after.saturating_sub(layer_before);
+                if stats.calls == 0 {
+                    continue;
+                }
+                tracing::info!(
+                    "[parallel-token-layer] layer={} calls={} wall={:.1}ms host_outside_sync={:.1}ms paging_sync={}({:.1}ms) main_done={:.1}ms dma_done={:.1}ms gpu_hits={} gpu_misses={} evictions={} push={:.1}MiB/{:.1}ms dma={:.1}MiB dma_submits={} queue_submits={} submit_cpu={:.1}ms record_segments={} record_span={:.1}ms recorder_acquire={:.1}ms staging_wait={:.1}ms dma_slot_wait={:.1}ms dma_timeline_wait={:.1}ms",
+                    layer,
+                    stats.calls,
+                    ns_ms(stats.wall_ns),
+                    ns_ms(stats.wall_ns.saturating_sub(stats.paging_sync_wait_ns)),
+                    stats.paging_sync_waits,
+                    ns_ms(stats.paging_sync_wait_ns),
+                    ns_ms(stats.main_done_ns),
+                    ns_ms(stats.dma_done_ns),
+                    stats.gpu_hits,
+                    stats.gpu_misses,
+                    stats.gpu_evictions,
+                    mib(stats.memcpy_bytes),
+                    ns_ms(stats.memcpy_ns),
+                    mib(stats.dedicated_transfer_bytes),
+                    stats.dedicated_transfer_submits,
+                    stats.queue_submits,
+                    ns_ms(stats.queue_submit_ns),
+                    stats.command_record_segments,
+                    ns_ms(stats.command_record_ns),
+                    ns_ms(stats.command_recorder_acquire_ns),
+                    ns_ms(stats.staging_wait_ns),
+                    ns_ms(stats.dedicated_transfer_slot_wait_ns),
+                    ns_ms(stats.dedicated_transfer_timeline_wait_ns),
+                );
+            }
+        }
+        return Ok((
+            generated.remove(0),
+            GenStats {
+                n_prompt: 0,
+                n_cached: start,
+                prompt_secs: 0.0,
+                n_gen: total_generated,
+                decode_secs: 0.0,
+            },
+        ));
+    }
+
     // The per-call decode IO buffers. These are `be.alloc`s, and on Vulkan an `alloc` zero-fills
     // through a one-shot command buffer — i.e. it RECORDS, so it needs the baton exactly like a
     // step does (see `StepGate`: the command pool is externally synchronised, and the backend hands
     // its handle out from under the mutex). Scoped so the baton is released before the prefill loop
     // below, which takes its own per-chunk turn.
-    let (tok_id_buf, dec_ids_buf, u_buf) = {
+    let (tok_id_buf, dec_ids_buf, u_buf, pos4_buf) = {
         let _gp = req.and_then(|r| r.gate_pass());
         let tok_id_buf = be
             .alloc(4, BufferUsage::Readback)
@@ -6420,7 +8788,11 @@ pub(crate) fn generate_dense_backend(
         let u_buf = be
             .alloc(64 * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
-        (tok_id_buf, dec_ids_buf, u_buf)
+        let pos4_buf = mm
+            .map(|_| be.alloc_uninit(4 * 4, BufferUsage::Staging))
+            .transpose()
+            .map_err(|e| anyhow!("{e}"))?;
+        (tok_id_buf, dec_ids_buf, u_buf, pos4_buf)
     };
     // Host-side mirror of `u_buf`'s 64 slots. `Backend::upload` has no partial-buffer/offset
     // form, so setting one slot re-uploads the whole 256 bytes from this mirror — negligible cost.
@@ -6466,6 +8838,33 @@ pub(crate) fn generate_dense_backend(
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
+    let prompt_work = prompt.len().saturating_sub(start);
+    let report_progress =
+        |phase: infr_core::GenerationPhase, prefill_tokens: usize, completion_tokens: usize| {
+            if let Some(req) = req {
+                let context_tokens = match phase {
+                    infr_core::GenerationPhase::Prefill => {
+                        start.saturating_add(prefill_tokens).min(prompt.len())
+                    }
+                    infr_core::GenerationPhase::Decode => {
+                        prompt.len().saturating_add(completion_tokens)
+                    }
+                };
+                req.report_progress(infr_core::GenerationProgress {
+                    phase,
+                    prompt_tokens: prompt.len() as u64,
+                    cached_prompt_tokens: start as u64,
+                    prefill_tokens: prefill_tokens.min(prompt_work) as u64,
+                    completion_tokens: completion_tokens as u64,
+                    context_tokens: context_tokens as u64,
+                    context_limit: max_ctx as u64,
+                });
+            }
+        };
+    // The first exact token count becomes available only after tokenization, slot selection and
+    // prefix reconciliation. Publish it before the first forward so a long Prefill is visible even
+    // while no text delta exists yet.
+    report_progress(infr_core::GenerationPhase::Prefill, 0, 0);
     // `prof.stages` (INFR_PROF_STAGES): split decode per-token wall time into host setup (build
     // graph + compile + bind) vs execute (record + submit + GPU + wait) to guide the
     // record-once-replay decision. Hoisted here, ABOVE the loop — the old read was a `getenv` on
@@ -6603,9 +9002,11 @@ pub(crate) fn generate_dense_backend(
             m: usize,
             /// Token ids (gpu_embed) or the host-embedded f32 rows.
             input: Box<dyn Buffer>,
+            gpu_embed: bool,
             /// The residual stream, when `input` holds ids and cannot serve as one.
             resid: Option<Box<dyn Buffer>>,
             pos: Box<dyn Buffer>,
+            pos4: Option<Box<dyn Buffer>>,
             /// gemma4-E2B per-layer token rows.
             ipl: Option<Box<dyn Buffer>>,
             /// Qwen3.8 caller-owned four-stream residual for this batch.
@@ -6695,11 +9096,17 @@ pub(crate) fn generate_dense_backend(
                         };
                         ensure_kv_depth!(cend);
                         let pf_m = cend - cstart;
+                        let chunk_has_image = mm.is_some_and(|plan| {
+                            plan.spans.iter().any(|span| {
+                                span.start < cend && span.start + span.n_tokens > cstart
+                            })
+                        });
+                        let gpu_embed_chunk = gpu_embed && !chunk_has_image;
                         if live[ci].is_none() {
                             // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
                             // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
                             // the old f32 rows upload (4*n_embd*pf_m bytes).
-                            let input = if gpu_embed {
+                            let input = if gpu_embed_chunk {
                                 let ids: Vec<i32> =
                                     prompt[cstart..cend].iter().map(|&t| t as i32).collect();
                                 let b = be
@@ -6719,6 +9126,22 @@ pub(crate) fn generate_dense_backend(
                                             .map(|&x| x * embed_scale),
                                     );
                                 }
+                                if let Some(plan) = mm {
+                                    for span in &plan.spans {
+                                        let lo = span.start.max(cstart);
+                                        let hi = (span.start + span.n_tokens).min(cend);
+                                        for token in lo..hi {
+                                            let dst = (token - cstart) * ne;
+                                            let src = (token - span.start) * ne;
+                                            for (out, &value) in pf_hidden[dst..dst + ne]
+                                                .iter_mut()
+                                                .zip(&span.embeds[src..src + ne])
+                                            {
+                                                *out = value * embed_scale;
+                                            }
+                                        }
+                                    }
+                                }
                                 let b = be
                                     .alloc(pf_m * ne * 4, BufferUsage::Staging)
                                     .map_err(|e| anyhow!("{e}"))?;
@@ -6734,7 +9157,7 @@ pub(crate) fn generate_dense_backend(
                             // binds — the interpreters' write-back is a length-checked `copy_from_slice`
                             // against the declared numel, and the host-embed path has always bound this
                             // shape, so nothing writes past it.
-                            let resid = if gpu_embed {
+                            let resid = if gpu_embed_chunk {
                                 Some(
                                     be.alloc(pf_m * ne * 4, BufferUsage::Activations)
                                         .map_err(|e| anyhow!("{e}"))?,
@@ -6742,13 +9165,32 @@ pub(crate) fn generate_dense_backend(
                             } else {
                                 None
                             };
-                            // Absolute positions [cstart, ..., cend-1].
-                            let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
+                            // Ordinary RoPE consumes logical T positions. After an image span these
+                            // differ from physical KV rows even though text rows collapse from 4D.
+                            let pf_positions: Vec<i32> = match mrope_positions.as_deref() {
+                                Some(table) => {
+                                    (cstart..cend).map(|token| table[token * 4]).collect()
+                                }
+                                None => (cstart as i32..cend as i32).collect(),
+                            };
                             let pos = be
                                 .alloc(pf_m * 4, BufferUsage::Staging)
                                 .map_err(|e| anyhow!("{e}"))?;
                             be.upload(pos.as_ref(), bytemuck::cast_slice(&pf_positions))
                                 .map_err(|e| anyhow!("{e}"))?;
+                            let pos4 = if let Some(plan) = mm {
+                                let b = be
+                                    .alloc_uninit(pf_m * 4 * 4, BufferUsage::Staging)
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                be.upload(
+                                    b.as_ref(),
+                                    bytemuck::cast_slice(&plan.prompt_pos4[cstart * 4..cend * 4]),
+                                )
+                                .map_err(|e| anyhow!("{e}"))?;
+                                Some(b)
+                            } else {
+                                None
+                            };
                             // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
                             // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
                             // prologue).
@@ -6786,8 +9228,16 @@ pub(crate) fn generate_dense_backend(
                                 let b = be
                                     .alloc(rows.len() * 4, BufferUsage::Staging)
                                     .map_err(|e| anyhow!("{e}"))?;
-                                be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
+                                let upload_t0 = infr_core::pager_profile::start();
+                                be.upload(b.as_ref(), bytemuck::cast_slice(rows.as_slice()))
                                     .map_err(|e| anyhow!("{e}"))?;
+                                if let Some(elapsed) = infr_core::pager_profile::elapsed(upload_t0)
+                                {
+                                    infr_core::pager_profile::record_ple_upload(
+                                        rows.len() * 4,
+                                        elapsed,
+                                    );
+                                }
                                 Some(b)
                             } else {
                                 None
@@ -6795,8 +9245,10 @@ pub(crate) fn generate_dense_backend(
                             live[ci] = Some(PfChunk {
                                 m: pf_m,
                                 input,
+                                gpu_embed: gpu_embed_chunk,
                                 resid,
                                 pos,
+                                pos4,
                                 ipl,
                                 qwen_wide,
                                 ple_embd,
@@ -6835,8 +9287,10 @@ pub(crate) fn generate_dense_backend(
                             false,
                             // The token-id input + in-graph gather belong to the span that STARTS the
                             // stack; a later span reads the residual stream that one left behind.
-                            gpu_embed && span.start == 0,
+                            ch.gpu_embed && span.start == 0,
                             false, // mtp_verify: ordinary chunked prefill, not MTP verify
+                            false, // independent_rows: one contiguous prompt chunk
+                            None,  // independent spans
                             Some(span.clone()),
                         );
                         let t_build = pf_t0.elapsed();
@@ -6851,6 +9305,9 @@ pub(crate) fn generate_dense_backend(
                             ch.resid.as_deref().unwrap_or(ch.input.as_ref()),
                         );
                         pf_b.bind(pf_h.positions, ch.pos.as_ref());
+                        if let (Some(id), Some(buf)) = (pf_h.positions4, &ch.pos4) {
+                            pf_b.bind(id, buf.as_ref());
+                        }
                         if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &ch.ipl) {
                             pf_b.bind(pid, ib.as_ref());
                         }
@@ -6867,6 +9324,7 @@ pub(crate) fn generate_dense_backend(
                             &vbufs[..],
                             &qsa_kbufs[..],
                             &qsa_cbufs[..],
+                            &mrope_history_buf,
                             &wbufs[..],
                             if c.qwen4exp {
                                 &ch.qwen_wide
@@ -6920,6 +9378,11 @@ pub(crate) fn generate_dense_backend(
                         );
                         }
                         prompt_t += pf_t0.elapsed();
+                        report_progress(
+                            infr_core::GenerationPhase::Prefill,
+                            cend.saturating_sub(start),
+                            decode_n,
+                        );
                         // Last span for this chunk: its uploads and its residual stream are dead.
                         if si + 1 == spans.len() {
                             live[ci] = None;
@@ -7016,6 +9479,8 @@ pub(crate) fn generate_dense_backend(
         let (g, h) = build(
             1, 0, 1, false, None, false, false, gpu_argmax, gpu_sample, gpu_embed,
             false, // mtp_verify: ordinary per-token decode, not MTP verify
+            false, // independent_rows: ordinary single-session decode
+            None,  // independent spans
             None,  // span: the whole model in one graph
         );
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
@@ -7041,6 +9506,7 @@ pub(crate) fn generate_dense_backend(
             &vbufs[..],
             &qsa_kbufs[..],
             &qsa_cbufs[..],
+            &mrope_history_buf,
             &wbufs[..],
             qwen_wide_buf,
             ple_embd_buf,
@@ -7197,6 +9663,7 @@ pub(crate) fn generate_dense_backend(
                     if fed > 0 {
                         last_written = Some(pos + fed - 1);
                     }
+                    report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
                     if stop {
                         break;
                     }
@@ -7208,19 +9675,30 @@ pub(crate) fn generate_dense_backend(
         }
         let step_t0 = std::time::Instant::now();
         let tok = cur[pos] as usize;
+        let image_row = mm.and_then(|plan| {
+            plan.spans.iter().find_map(|span| {
+                (pos >= span.start && pos < span.start + span.n_tokens)
+                    .then_some((&span.embeds, (pos - span.start) * ne))
+            })
+        });
+        let gpu_embed_tok = gpu_embed && image_row.is_none();
         // The 4-byte token id, uploaded whenever the graph declared the ids Input: for the embed
         // gather (`gpu_embed`), and for a deepseek4 hash-routed layer's `ffn_gate_tid2eid`
         // selection gather (`hash_ids`), which needs it independently of how the embedding was
         // produced. Not a round trip — this is the id the host already fed this step.
-        if gpu_embed || hash_ids {
+        if gpu_embed_tok || hash_ids {
             be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[tok as i32]))
                 .map_err(|e| anyhow!("{e}"))?;
         }
-        if !gpu_embed {
+        if !gpu_embed_tok {
             // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
             // table slice is already the row to upload — hand it straight to the backend rather
             // than allocating a throwaway `Vec<f32>` per token to copy it.
-            let row = &token_embd.get()?[tok * ne..tok * ne + ne];
+            let table = token_embd.get()?;
+            let row = match image_row {
+                Some((embeds, offset)) => &embeds[offset..offset + ne],
+                None => &table[tok * ne..tok * ne + ne],
+            };
             if embed_scale == 1.0 {
                 be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
                     .map_err(|e| anyhow!("{e}"))?;
@@ -7230,8 +9708,28 @@ pub(crate) fn generate_dense_backend(
                     .map_err(|e| anyhow!("{e}"))?;
             }
         }
-        be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
+        let rope_pos = mrope_positions
+            .as_deref()
+            .map_or(pos as i32, |table| table[pos * 4]);
+        be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[rope_pos]))
             .map_err(|e| anyhow!("{e}"))?;
+        if let (Some(plan), Some(buffer)) = (mm, &pos4_buf) {
+            let row: [i32; 4] = if pos < prompt.len() {
+                plan.prompt_pos4[pos * 4..pos * 4 + 4]
+                    .try_into()
+                    .expect("validated multimodal prompt position row")
+            } else {
+                let delta = i32::try_from(pos - prompt.len())
+                    .map_err(|_| anyhow!("multimodal decode position exceeds i32"))?;
+                let value = plan
+                    .decode_base
+                    .checked_add(delta)
+                    .ok_or_else(|| anyhow!("multimodal decode position overflow"))?;
+                [value, value, value, 0]
+            };
+            be.upload(buffer.as_ref(), bytemuck::cast_slice(&row))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
 
         // gemma4 E2B host ipl path: this token's per-layer TOKEN embedding row (gather+dequant
         // only). `ipl_buf` is None under `gpu_ple` — the graph gathers on-device.
@@ -7301,8 +9799,10 @@ pub(crate) fn generate_dense_backend(
                 false,
                 false,
                 false,
-                gpu_embed,
+                gpu_embed_tok,
                 false,
+                false,
+                None,
                 Some(0..1),
             );
             let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
@@ -7313,6 +9813,9 @@ pub(crate) fn generate_dense_backend(
             // A partial span exposes hidden as an Input even when EmbedGather writes it.
             b0.bind(h0.hidden, hidden_buf.as_ref());
             b0.bind(h0.positions, pos_buf.as_ref());
+            if let (Some(id), Some(buf)) = (h0.positions4, &pos4_buf) {
+                b0.bind(id, buf.as_ref());
+            }
             bind_layer_io(
                 &mut b0,
                 &h0,
@@ -7323,6 +9826,7 @@ pub(crate) fn generate_dense_backend(
                 &vbufs[..],
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
+                &mrope_history_buf,
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7346,8 +9850,12 @@ pub(crate) fn generate_dense_backend(
                     ple_buf.len_bytes()
                 ));
             }
-            be.upload(ple_buf.as_ref(), bytemuck::cast_slice(&ple_rows))
+            let upload_t0 = infr_core::pager_profile::start();
+            be.upload(ple_buf.as_ref(), bytemuck::cast_slice(ple_rows.as_slice()))
                 .map_err(|e| anyhow!("{e}"))?;
+            if let Some(elapsed) = infr_core::pager_profile::elapsed(upload_t0) {
+                infr_core::pager_profile::record_ple_upload(ple_rows.len() * 4, elapsed);
+            }
 
             let (g1, h1) = build(
                 1,
@@ -7361,12 +9869,17 @@ pub(crate) fn generate_dense_backend(
                 gpu_sample,
                 false,
                 false,
+                false,
+                None,
                 Some(1..c.n_layer),
             );
             let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
             let mut b1 = Bindings::new();
             b1.bind(h1.hidden, hidden_buf.as_ref());
             b1.bind(h1.positions, pos_buf.as_ref());
+            if let (Some(id), Some(buf)) = (h1.positions4, &pos4_buf) {
+                b1.bind(id, buf.as_ref());
+            }
             bind_layer_io(
                 &mut b1,
                 &h1,
@@ -7377,6 +9890,7 @@ pub(crate) fn generate_dense_backend(
                 &vbufs[..],
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
+                &mrope_history_buf,
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7405,6 +9919,8 @@ pub(crate) fn generate_dense_backend(
             let (g, h) = build(
                 1, pos, 1, false, None, false, want_h, gpu_argmax, gpu_sample, gpu_embed,
                 false, // mtp_verify: ordinary per-token decode, not MTP verify
+                false, // independent_rows: ordinary single-session decode
+                None,  // independent spans
                 None,  // span: the whole model in one graph
             );
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
@@ -7430,6 +9946,7 @@ pub(crate) fn generate_dense_backend(
                 &vbufs[..],
                 &qsa_kbufs[..],
                 &qsa_cbufs[..],
+                &mrope_history_buf,
                 &wbufs[..],
                 qwen_wide_buf,
                 ple_embd_buf,
@@ -7511,6 +10028,7 @@ pub(crate) fn generate_dense_backend(
                     cur.push(t);
                     decode_n += 1;
                 }
+                report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
                 if done || out.len() >= max_new || crate::sampling::abort_requested(req) {
                     break;
                 }
@@ -7535,6 +10053,7 @@ pub(crate) fn generate_dense_backend(
                 out.push(next);
                 decode_t += step_t0.elapsed();
                 decode_n += 1;
+                report_progress(infr_core::GenerationPhase::Decode, prompt_work, decode_n);
                 if !is_eos {
                     on_token(next); // stream the token (EOS is not emitted)
                 }
@@ -7551,6 +10070,11 @@ pub(crate) fn generate_dense_backend(
             decode_t += step_t0.elapsed();
         } else {
             prompt_t += step_t0.elapsed();
+            report_progress(
+                infr_core::GenerationPhase::Prefill,
+                pos.saturating_add(1).saturating_sub(start),
+                decode_n,
+            );
         }
         pos += 1;
     }
@@ -7659,7 +10183,110 @@ pub(crate) fn generate_dense_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::{recurrent_extension_start, resident_after_gen, validate_token_ids};
+    use super::{
+        allocate_parallel_prefill_rows, dense_request_exceeds_capacity, mrope_rows_are_plain_rope,
+        parallel_prefill_progress, recurrent_extension_start, resident_after_gen,
+        sampling_suffix_start, validate_token_ids,
+    };
+
+    #[test]
+    fn generated_mrope_rows_collapse_to_plain_rope() {
+        let positions = [3, 4, 5, 0, 100, 100, 100, 0, 101, 101, 101, 0];
+        assert!(mrope_rows_are_plain_rope(
+            &positions,
+            1,
+            2,
+            [11, 11, 10, 0],
+            32
+        ));
+    }
+
+    #[test]
+    fn image_mrope_rows_keep_four_dimensional_rope() {
+        let positions = [100, 4, 7, 0];
+        assert!(!mrope_rows_are_plain_rope(
+            &positions,
+            0,
+            1,
+            [11, 11, 10, 0],
+            32
+        ));
+    }
+
+    #[test]
+    fn plain_rope_requires_consecutive_logical_positions() {
+        let positions = [100, 100, 100, 0, 102, 102, 102, 0];
+        assert!(!mrope_rows_are_plain_rope(
+            &positions,
+            0,
+            2,
+            [11, 11, 10, 0],
+            32
+        ));
+    }
+
+    #[test]
+    fn parallel_token_steps_do_not_double_count_the_uncached_prompt_tail() {
+        let prompt_tokens = 88_803usize;
+        let cached_tokens = 88_751usize;
+        let generated_tokens = 75_036usize;
+        let max_steps = prompt_tokens
+            .saturating_sub(1)
+            .saturating_sub(cached_tokens)
+            + generated_tokens;
+        let context_limit = 163_840;
+
+        assert_eq!(max_steps, 75_087);
+        assert!(dense_request_exceeds_capacity(
+            prompt_tokens,
+            max_steps,
+            context_limit,
+            false
+        ));
+        assert!(!dense_request_exceeds_capacity(
+            prompt_tokens,
+            max_steps,
+            context_limit,
+            true
+        ));
+        assert!(cached_tokens + max_steps <= context_limit);
+    }
+
+    #[test]
+    fn parallel_prefill_progress_reports_cached_and_evaluated_tokens() {
+        let progress = parallel_prefill_progress(4_096, 1_024, 2_560, 32_768);
+        assert_eq!(progress.phase, infr_core::GenerationPhase::Prefill);
+        assert_eq!(progress.prompt_tokens, 4_096);
+        assert_eq!(progress.cached_prompt_tokens, 1_024);
+        assert_eq!(progress.prefill_tokens, 1_536);
+        assert_eq!(progress.context_tokens, 2_560);
+        assert_eq!(progress.context_limit, 32_768);
+    }
+
+    #[test]
+    fn parallel_prefill_redistributes_unused_rows() {
+        assert_eq!(
+            allocate_parallel_prefill_rows(&[10, 2_000], 1_024),
+            [10, 1_014]
+        );
+        assert_eq!(
+            allocate_parallel_prefill_rows(&[2_000, 2_000], 1_025),
+            [513, 512]
+        );
+        assert_eq!(allocate_parallel_prefill_rows(&[10, 20], 1_024), [10, 20]);
+        assert!(allocate_parallel_prefill_rows(&[], 1_024).is_empty());
+    }
+
+    #[test]
+    fn token_step_samples_only_a_contiguous_suffix() {
+        assert_eq!(
+            sampling_suffix_start(&[10, 20, 30], &[15, 21, 31]).unwrap(),
+            1
+        );
+        assert_eq!(sampling_suffix_start(&[10, 20], &[15, 25]).unwrap(), 2);
+        assert!(sampling_suffix_start(&[20, 10], &[21, 15]).is_err());
+        assert!(sampling_suffix_start(&[10], &[11, 12]).is_err());
+    }
 
     #[test]
     fn recurrent_empty_cache_never_reuses_device_state() {

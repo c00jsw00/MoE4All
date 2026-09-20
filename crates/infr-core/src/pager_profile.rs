@@ -6,6 +6,7 @@
 //! investigated.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use std::io::Write as _;
@@ -13,6 +14,149 @@ use std::io::Write as _;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static PRINTED: AtomicBool = AtomicBool::new(false);
 static COUNTERS: Counters = Counters::new();
+static DEVICE_INTERVALS: Mutex<Vec<DeviceInterval>> = Mutex::new(Vec::new());
+static PAGED_MOE_LAYERS: Mutex<Vec<PagedMoeLayerStats>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceIntervalKind {
+    MainQueue,
+    DedicatedTransfer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendSetupKind {
+    Layout,
+    PhaseScratch,
+    Rope,
+    Fusion,
+    PagedMoeScan,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeviceInterval {
+    kind: DeviceIntervalKind,
+    start_tick: u64,
+    end_tick: u64,
+    valid_bits: u32,
+    period_ns: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeviceTimelineStats {
+    pub main_intervals: usize,
+    pub dma_intervals: usize,
+    pub span_ns: u64,
+    pub main_busy_ns: u64,
+    pub dma_busy_ns: u64,
+    pub overlap_ns: u64,
+    pub outside_intervals_ns: u64,
+}
+
+/// Lightweight counter sample around one paged-MoE boundary. Unlike [`Snapshot`], this contains
+/// only counters needed to explain the decode critical path, so taking it once per layer stays
+/// cheap enough for an opt-in production-shaped profile.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PagedMoeHotSnapshot {
+    gpu_hits: u64,
+    gpu_misses: u64,
+    gpu_evictions: u64,
+    memcpy_bytes: u64,
+    memcpy_ns: u64,
+    dedicated_transfer_submits: u64,
+    dedicated_transfer_bytes: u64,
+    dedicated_transfer_submit_cpu_ns: u64,
+    dedicated_transfer_slot_wait_ns: u64,
+    dedicated_transfer_timeline_wait_ns: u64,
+    queue_submits: u64,
+    queue_submit_ns: u64,
+    command_record_segments: u64,
+    command_record_ns: u64,
+    command_recorder_acquire_ns: u64,
+    paging_sync_waits: u64,
+    paging_sync_wait_ns: u64,
+    staging_wait_ns: u64,
+    device_main_raw_ns: u64,
+    device_dma_raw_ns: u64,
+}
+
+/// Aggregate for all profiled visits to one model layer. `main_done_ns` and `dma_done_ns` name
+/// queue intervals whose timestamp queries became available while crossing this layer boundary;
+/// pipelining means they describe work completed at the boundary, not necessarily work issued by
+/// the same layer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PagedMoeLayerStats {
+    pub calls: u64,
+    pub wall_ns: u64,
+    pub gpu_hits: u64,
+    pub gpu_misses: u64,
+    pub gpu_evictions: u64,
+    pub memcpy_bytes: u64,
+    pub memcpy_ns: u64,
+    pub dedicated_transfer_submits: u64,
+    pub dedicated_transfer_bytes: u64,
+    pub dedicated_transfer_submit_cpu_ns: u64,
+    pub dedicated_transfer_slot_wait_ns: u64,
+    pub dedicated_transfer_timeline_wait_ns: u64,
+    pub queue_submits: u64,
+    pub queue_submit_ns: u64,
+    pub command_record_segments: u64,
+    pub command_record_ns: u64,
+    pub command_recorder_acquire_ns: u64,
+    pub paging_sync_waits: u64,
+    pub paging_sync_wait_ns: u64,
+    pub staging_wait_ns: u64,
+    pub main_done_ns: u64,
+    pub dma_done_ns: u64,
+}
+
+impl PagedMoeLayerStats {
+    pub fn saturating_sub(self, before: Self) -> Self {
+        Self {
+            calls: self.calls.saturating_sub(before.calls),
+            wall_ns: self.wall_ns.saturating_sub(before.wall_ns),
+            gpu_hits: self.gpu_hits.saturating_sub(before.gpu_hits),
+            gpu_misses: self.gpu_misses.saturating_sub(before.gpu_misses),
+            gpu_evictions: self.gpu_evictions.saturating_sub(before.gpu_evictions),
+            memcpy_bytes: self.memcpy_bytes.saturating_sub(before.memcpy_bytes),
+            memcpy_ns: self.memcpy_ns.saturating_sub(before.memcpy_ns),
+            dedicated_transfer_submits: self
+                .dedicated_transfer_submits
+                .saturating_sub(before.dedicated_transfer_submits),
+            dedicated_transfer_bytes: self
+                .dedicated_transfer_bytes
+                .saturating_sub(before.dedicated_transfer_bytes),
+            dedicated_transfer_submit_cpu_ns: self
+                .dedicated_transfer_submit_cpu_ns
+                .saturating_sub(before.dedicated_transfer_submit_cpu_ns),
+            dedicated_transfer_slot_wait_ns: self
+                .dedicated_transfer_slot_wait_ns
+                .saturating_sub(before.dedicated_transfer_slot_wait_ns),
+            dedicated_transfer_timeline_wait_ns: self
+                .dedicated_transfer_timeline_wait_ns
+                .saturating_sub(before.dedicated_transfer_timeline_wait_ns),
+            queue_submits: self.queue_submits.saturating_sub(before.queue_submits),
+            queue_submit_ns: self.queue_submit_ns.saturating_sub(before.queue_submit_ns),
+            command_record_segments: self
+                .command_record_segments
+                .saturating_sub(before.command_record_segments),
+            command_record_ns: self
+                .command_record_ns
+                .saturating_sub(before.command_record_ns),
+            command_recorder_acquire_ns: self
+                .command_recorder_acquire_ns
+                .saturating_sub(before.command_recorder_acquire_ns),
+            paging_sync_waits: self
+                .paging_sync_waits
+                .saturating_sub(before.paging_sync_waits),
+            paging_sync_wait_ns: self
+                .paging_sync_wait_ns
+                .saturating_sub(before.paging_sync_wait_ns),
+            staging_wait_ns: self.staging_wait_ns.saturating_sub(before.staging_wait_ns),
+            main_done_ns: self.main_done_ns.saturating_sub(before.main_done_ns),
+            dma_done_ns: self.dma_done_ns.saturating_sub(before.dma_done_ns),
+        }
+    }
+}
 
 struct Counters {
     gpu_lookups: AtomicU64,
@@ -46,14 +190,62 @@ struct Counters {
     staging_wait_ns: AtomicU64,
     prefetch_windows: AtomicU64,
     prefetch_compute_live_at_start: AtomicU64,
+    prefetch_compute_live_after_prepare: AtomicU64,
     prefetch_compute_live_after_enqueue: AtomicU64,
+    prefetch_push_bytes: AtomicU64,
+    prefetch_push_prepare_ns: AtomicU64,
+    prefetch_push_enqueue_ns: AtomicU64,
+    prefetch_confirmed_overlap_ns: AtomicU64,
+    prefetch_bytes_submitted_while_compute_live: AtomicU64,
+    decode_prefetch_calibrations: AtomicU64,
+    decode_prefetch_candidates: AtomicU64,
+    decode_prefetch_vram_resident: AtomicU64,
+    decode_prefetch_host_loading: AtomicU64,
+    decode_prefetch_ram_experts: AtomicU64,
+    decode_prefetch_ram_bytes: AtomicU64,
+    decode_prefetch_ram_ns: AtomicU64,
+    decode_prefetch_ssd_jobs: AtomicU64,
+    decode_prefetch_ssd_blocks: AtomicU64,
+    decode_prefetch_deadline_stops: AtomicU64,
+    decode_prefetch_overruns: AtomicU64,
+    decode_prefetch_target_finishes: AtomicU64,
+    decode_prefetch_target_finish_ns: AtomicU64,
+    decode_prefetch_quiesce_lock_waits: AtomicU64,
+    decode_prefetch_quiesce_lock_wait_ns: AtomicU64,
 
     gpu_copies: AtomicU64,
     gpu_copy_bytes: AtomicU64,
+    dedicated_transfer_submits: AtomicU64,
+    dedicated_transfer_regions: AtomicU64,
+    dedicated_transfer_bytes: AtomicU64,
+    dedicated_transfer_submit_cpu_ns: AtomicU64,
+    dedicated_transfer_gpu_timed_submits: AtomicU64,
+    dedicated_transfer_gpu_timed_bytes: AtomicU64,
+    dedicated_transfer_gpu_ns: AtomicU64,
+    dedicated_transfer_slot_waits: AtomicU64,
+    dedicated_transfer_slot_wait_ns: AtomicU64,
+    dedicated_transfer_timeline_waits: AtomicU64,
+    dedicated_transfer_timeline_wait_ns: AtomicU64,
+    device_main_raw_ns: AtomicU64,
+    device_dma_raw_ns: AtomicU64,
 
     queue_submits: AtomicU64,
     queue_submit_ns: AtomicU64,
     submitted_dispatches: AtomicU64,
+    command_record_segments: AtomicU64,
+    command_record_dispatches: AtomicU64,
+    command_record_ns: AtomicU64,
+    command_recorder_acquires: AtomicU64,
+    command_recorder_acquire_ns: AtomicU64,
+    backend_executes: AtomicU64,
+    backend_execute_ns: AtomicU64,
+    backend_setups: AtomicU64,
+    backend_setup_ns: AtomicU64,
+    backend_setup_layout_ns: AtomicU64,
+    backend_setup_phase_scratch_ns: AtomicU64,
+    backend_setup_rope_ns: AtomicU64,
+    backend_setup_fusion_ns: AtomicU64,
+    backend_setup_paged_moe_scan_ns: AtomicU64,
 
     sync_waits: AtomicU64,
     sync_wait_ns: AtomicU64,
@@ -72,6 +264,21 @@ struct Counters {
     splitter_cap_max: AtomicU64,
     splitter_result_submits: AtomicU64,
     splitter_result_dispatches: AtomicU64,
+
+    ple_gathers: AtomicU64,
+    ple_tokens: AtomicU64,
+    ple_row_requests: AtomicU64,
+    ple_unique_rows: AtomicU64,
+    ple_logical_pages: AtomicU64,
+    ple_output_bytes: AtomicU64,
+    ple_parallel_gathers: AtomicU64,
+    ple_plan_ns: AtomicU64,
+    ple_work_ns: AtomicU64,
+    ple_waits: AtomicU64,
+    ple_wait_ns: AtomicU64,
+    ple_uploads: AtomicU64,
+    ple_upload_bytes: AtomicU64,
+    ple_upload_ns: AtomicU64,
 
     lru_mark_calls: AtomicU64,
     lru_mark_scan_steps: AtomicU64,
@@ -119,14 +326,62 @@ impl Counters {
             staging_wait_ns: AtomicU64::new(0),
             prefetch_windows: AtomicU64::new(0),
             prefetch_compute_live_at_start: AtomicU64::new(0),
+            prefetch_compute_live_after_prepare: AtomicU64::new(0),
             prefetch_compute_live_after_enqueue: AtomicU64::new(0),
+            prefetch_push_bytes: AtomicU64::new(0),
+            prefetch_push_prepare_ns: AtomicU64::new(0),
+            prefetch_push_enqueue_ns: AtomicU64::new(0),
+            prefetch_confirmed_overlap_ns: AtomicU64::new(0),
+            prefetch_bytes_submitted_while_compute_live: AtomicU64::new(0),
+            decode_prefetch_calibrations: AtomicU64::new(0),
+            decode_prefetch_candidates: AtomicU64::new(0),
+            decode_prefetch_vram_resident: AtomicU64::new(0),
+            decode_prefetch_host_loading: AtomicU64::new(0),
+            decode_prefetch_ram_experts: AtomicU64::new(0),
+            decode_prefetch_ram_bytes: AtomicU64::new(0),
+            decode_prefetch_ram_ns: AtomicU64::new(0),
+            decode_prefetch_ssd_jobs: AtomicU64::new(0),
+            decode_prefetch_ssd_blocks: AtomicU64::new(0),
+            decode_prefetch_deadline_stops: AtomicU64::new(0),
+            decode_prefetch_overruns: AtomicU64::new(0),
+            decode_prefetch_target_finishes: AtomicU64::new(0),
+            decode_prefetch_target_finish_ns: AtomicU64::new(0),
+            decode_prefetch_quiesce_lock_waits: AtomicU64::new(0),
+            decode_prefetch_quiesce_lock_wait_ns: AtomicU64::new(0),
 
             gpu_copies: AtomicU64::new(0),
             gpu_copy_bytes: AtomicU64::new(0),
+            dedicated_transfer_submits: AtomicU64::new(0),
+            dedicated_transfer_regions: AtomicU64::new(0),
+            dedicated_transfer_bytes: AtomicU64::new(0),
+            dedicated_transfer_submit_cpu_ns: AtomicU64::new(0),
+            dedicated_transfer_gpu_timed_submits: AtomicU64::new(0),
+            dedicated_transfer_gpu_timed_bytes: AtomicU64::new(0),
+            dedicated_transfer_gpu_ns: AtomicU64::new(0),
+            dedicated_transfer_slot_waits: AtomicU64::new(0),
+            dedicated_transfer_slot_wait_ns: AtomicU64::new(0),
+            dedicated_transfer_timeline_waits: AtomicU64::new(0),
+            dedicated_transfer_timeline_wait_ns: AtomicU64::new(0),
+            device_main_raw_ns: AtomicU64::new(0),
+            device_dma_raw_ns: AtomicU64::new(0),
 
             queue_submits: AtomicU64::new(0),
             queue_submit_ns: AtomicU64::new(0),
             submitted_dispatches: AtomicU64::new(0),
+            command_record_segments: AtomicU64::new(0),
+            command_record_dispatches: AtomicU64::new(0),
+            command_record_ns: AtomicU64::new(0),
+            command_recorder_acquires: AtomicU64::new(0),
+            command_recorder_acquire_ns: AtomicU64::new(0),
+            backend_executes: AtomicU64::new(0),
+            backend_execute_ns: AtomicU64::new(0),
+            backend_setups: AtomicU64::new(0),
+            backend_setup_ns: AtomicU64::new(0),
+            backend_setup_layout_ns: AtomicU64::new(0),
+            backend_setup_phase_scratch_ns: AtomicU64::new(0),
+            backend_setup_rope_ns: AtomicU64::new(0),
+            backend_setup_fusion_ns: AtomicU64::new(0),
+            backend_setup_paged_moe_scan_ns: AtomicU64::new(0),
 
             sync_waits: AtomicU64::new(0),
             sync_wait_ns: AtomicU64::new(0),
@@ -145,6 +400,21 @@ impl Counters {
             splitter_cap_max: AtomicU64::new(0),
             splitter_result_submits: AtomicU64::new(0),
             splitter_result_dispatches: AtomicU64::new(0),
+
+            ple_gathers: AtomicU64::new(0),
+            ple_tokens: AtomicU64::new(0),
+            ple_row_requests: AtomicU64::new(0),
+            ple_unique_rows: AtomicU64::new(0),
+            ple_logical_pages: AtomicU64::new(0),
+            ple_output_bytes: AtomicU64::new(0),
+            ple_parallel_gathers: AtomicU64::new(0),
+            ple_plan_ns: AtomicU64::new(0),
+            ple_work_ns: AtomicU64::new(0),
+            ple_waits: AtomicU64::new(0),
+            ple_wait_ns: AtomicU64::new(0),
+            ple_uploads: AtomicU64::new(0),
+            ple_upload_bytes: AtomicU64::new(0),
+            ple_upload_ns: AtomicU64::new(0),
 
             lru_mark_calls: AtomicU64::new(0),
             lru_mark_scan_steps: AtomicU64::new(0),
@@ -238,14 +508,60 @@ pub struct Snapshot {
     pub staging_wait_ns: u64,
     pub prefetch_windows: u64,
     pub prefetch_compute_live_at_start: u64,
+    pub prefetch_compute_live_after_prepare: u64,
     pub prefetch_compute_live_after_enqueue: u64,
+    pub prefetch_push_bytes: u64,
+    pub prefetch_push_prepare_ns: u64,
+    pub prefetch_push_enqueue_ns: u64,
+    pub prefetch_confirmed_overlap_ns: u64,
+    pub prefetch_bytes_submitted_while_compute_live: u64,
+    pub decode_prefetch_calibrations: u64,
+    pub decode_prefetch_candidates: u64,
+    pub decode_prefetch_vram_resident: u64,
+    pub decode_prefetch_host_loading: u64,
+    pub decode_prefetch_ram_experts: u64,
+    pub decode_prefetch_ram_bytes: u64,
+    pub decode_prefetch_ram_ns: u64,
+    pub decode_prefetch_ssd_jobs: u64,
+    pub decode_prefetch_ssd_blocks: u64,
+    pub decode_prefetch_deadline_stops: u64,
+    pub decode_prefetch_overruns: u64,
+    pub decode_prefetch_target_finishes: u64,
+    pub decode_prefetch_target_finish_ns: u64,
+    pub decode_prefetch_quiesce_lock_waits: u64,
+    pub decode_prefetch_quiesce_lock_wait_ns: u64,
 
     pub gpu_copies: u64,
     pub gpu_copy_bytes: u64,
+    pub dedicated_transfer_submits: u64,
+    pub dedicated_transfer_regions: u64,
+    pub dedicated_transfer_bytes: u64,
+    pub dedicated_transfer_submit_cpu_ns: u64,
+    pub dedicated_transfer_gpu_timed_submits: u64,
+    pub dedicated_transfer_gpu_timed_bytes: u64,
+    pub dedicated_transfer_gpu_ns: u64,
+    pub dedicated_transfer_slot_waits: u64,
+    pub dedicated_transfer_slot_wait_ns: u64,
+    pub dedicated_transfer_timeline_waits: u64,
+    pub dedicated_transfer_timeline_wait_ns: u64,
 
     pub queue_submits: u64,
     pub queue_submit_ns: u64,
     pub submitted_dispatches: u64,
+    pub command_record_segments: u64,
+    pub command_record_dispatches: u64,
+    pub command_record_ns: u64,
+    pub command_recorder_acquires: u64,
+    pub command_recorder_acquire_ns: u64,
+    pub backend_executes: u64,
+    pub backend_execute_ns: u64,
+    pub backend_setups: u64,
+    pub backend_setup_ns: u64,
+    pub backend_setup_layout_ns: u64,
+    pub backend_setup_phase_scratch_ns: u64,
+    pub backend_setup_rope_ns: u64,
+    pub backend_setup_fusion_ns: u64,
+    pub backend_setup_paged_moe_scan_ns: u64,
 
     pub sync_waits: u64,
     pub sync_wait_ns: u64,
@@ -264,6 +580,21 @@ pub struct Snapshot {
     pub splitter_cap_max: u64,
     pub splitter_result_submits: u64,
     pub splitter_result_dispatches: u64,
+
+    pub ple_gathers: u64,
+    pub ple_tokens: u64,
+    pub ple_row_requests: u64,
+    pub ple_unique_rows: u64,
+    pub ple_logical_pages: u64,
+    pub ple_output_bytes: u64,
+    pub ple_parallel_gathers: u64,
+    pub ple_plan_ns: u64,
+    pub ple_work_ns: u64,
+    pub ple_waits: u64,
+    pub ple_wait_ns: u64,
+    pub ple_uploads: u64,
+    pub ple_upload_bytes: u64,
+    pub ple_upload_ns: u64,
 
     pub lru_mark_calls: u64,
     pub lru_mark_scan_steps: u64,
@@ -422,7 +753,12 @@ pub fn record_mmap_fallback(bytes: usize, elapsed: Duration) {
 
 #[inline]
 pub fn record_memcpy(bytes: usize, elapsed: Duration) {
-    COUNTERS.memcpys.fetch_add(1, Ordering::Relaxed);
+    record_memcpy_batch(1, bytes, elapsed);
+}
+
+#[inline]
+pub fn record_memcpy_batch(copies: usize, bytes: usize, elapsed: Duration) {
+    COUNTERS.memcpys.fetch_add(copies as u64, Ordering::Relaxed);
     COUNTERS
         .memcpy_bytes
         .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -445,23 +781,158 @@ pub fn record_staging_wait(elapsed: Duration) {
         .fetch_add(ns(elapsed), Ordering::Relaxed);
 }
 
-/// Record whether layer N was still executing when N+1's copy window opened and after every
-/// N+1 copy command had been enqueued. This is a non-blocking host-side fence sample; GPU
-/// completion overlap still belongs to an RGP timeline, but this proves the scheduler did not
-/// serialize the copy submission behind N.
+/// Record host-side work and non-blocking fence samples for one hit-first demand-copy window.
+/// `confirmed_overlap` is deliberately a lower bound: only an interval whose fence was live at
+/// both ends is counted. Dedicated-queue timestamps account for the copy's GPU duration separately.
 #[inline]
 pub fn record_prefetch_window(compute_live_at_start: bool, compute_live_after_enqueue: bool) {
+    record_prefetch_window_detailed(
+        compute_live_at_start,
+        compute_live_after_enqueue,
+        compute_live_after_enqueue,
+        0,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+}
+
+#[inline]
+pub fn record_prefetch_window_detailed(
+    compute_live_at_start: bool,
+    compute_live_after_prepare: bool,
+    compute_live_after_enqueue: bool,
+    bytes: usize,
+    prepare_elapsed: Duration,
+    enqueue_elapsed: Duration,
+) {
     COUNTERS.prefetch_windows.fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .prefetch_push_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+    COUNTERS
+        .prefetch_push_prepare_ns
+        .fetch_add(ns(prepare_elapsed), Ordering::Relaxed);
+    COUNTERS
+        .prefetch_push_enqueue_ns
+        .fetch_add(ns(enqueue_elapsed), Ordering::Relaxed);
     if compute_live_at_start {
         COUNTERS
             .prefetch_compute_live_at_start
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if compute_live_after_prepare {
+        COUNTERS
+            .prefetch_compute_live_after_prepare
             .fetch_add(1, Ordering::Relaxed);
     }
     if compute_live_after_enqueue {
         COUNTERS
             .prefetch_compute_live_after_enqueue
             .fetch_add(1, Ordering::Relaxed);
+        COUNTERS
+            .prefetch_bytes_submitted_while_compute_live
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
+    let mut confirmed_overlap = Duration::ZERO;
+    if compute_live_at_start && compute_live_after_prepare {
+        confirmed_overlap = confirmed_overlap.saturating_add(prepare_elapsed);
+    }
+    if compute_live_after_prepare && compute_live_after_enqueue {
+        confirmed_overlap = confirmed_overlap.saturating_add(enqueue_elapsed);
+    }
+    COUNTERS
+        .prefetch_confirmed_overlap_ns
+        .fetch_add(ns(confirmed_overlap), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_calibration() {
+    COUNTERS
+        .decode_prefetch_calibrations
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_candidate() {
+    COUNTERS
+        .decode_prefetch_candidates
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_vram_resident() {
+    COUNTERS
+        .decode_prefetch_vram_resident
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_host_loading() {
+    COUNTERS
+        .decode_prefetch_host_loading
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_ram(bytes: usize) {
+    COUNTERS
+        .decode_prefetch_ram_experts
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .decode_prefetch_ram_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_ram_timed(bytes: usize, elapsed: Duration) {
+    record_decode_prefetch_ram(bytes);
+    COUNTERS
+        .decode_prefetch_ram_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_ssd(blocks: usize) {
+    COUNTERS
+        .decode_prefetch_ssd_jobs
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .decode_prefetch_ssd_blocks
+        .fetch_add(blocks as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_deadline_stop() {
+    COUNTERS
+        .decode_prefetch_deadline_stops
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_overrun() {
+    COUNTERS
+        .decode_prefetch_overruns
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_target_finish(elapsed: Duration) {
+    COUNTERS
+        .decode_prefetch_target_finishes
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .decode_prefetch_target_finish_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_decode_prefetch_quiesce_lock_wait(elapsed: Duration) {
+    COUNTERS
+        .decode_prefetch_quiesce_lock_waits
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .decode_prefetch_quiesce_lock_wait_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
 }
 
 #[inline]
@@ -473,6 +944,98 @@ pub fn record_gpu_copy(bytes: usize) {
 }
 
 #[inline]
+pub fn record_dedicated_transfer_submit(bytes: u64, regions: u64) {
+    COUNTERS
+        .dedicated_transfer_submits
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .dedicated_transfer_regions
+        .fetch_add(regions, Ordering::Relaxed);
+    COUNTERS
+        .dedicated_transfer_bytes
+        .fetch_add(bytes, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_dedicated_transfer_submit_cpu(elapsed: Duration) {
+    COUNTERS
+        .dedicated_transfer_submit_cpu_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_dedicated_transfer_gpu_time(bytes: u64, elapsed: Duration) {
+    COUNTERS
+        .dedicated_transfer_gpu_timed_submits
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .dedicated_transfer_gpu_timed_bytes
+        .fetch_add(bytes, Ordering::Relaxed);
+    COUNTERS
+        .dedicated_transfer_gpu_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_dedicated_transfer_slot_wait(elapsed: Duration) {
+    COUNTERS
+        .dedicated_transfer_slot_waits
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .dedicated_transfer_slot_wait_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_dedicated_transfer_timeline_wait(elapsed: Duration) {
+    COUNTERS
+        .dedicated_transfer_timeline_waits
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .dedicated_transfer_timeline_wait_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+/// Record one queue interval in the physical device timestamp domain. This vector exists only for
+/// opt-in profiling and is folded once at shutdown; normal execution never takes its mutex.
+pub fn record_device_interval(
+    kind: DeviceIntervalKind,
+    start_tick: u64,
+    end_tick: u64,
+    valid_bits: u32,
+    period_ns: f32,
+) {
+    if valid_bits == 0 || !period_ns.is_finite() || period_ns <= 0.0 {
+        return;
+    }
+    let mask = if valid_bits >= 64 {
+        u64::MAX as u128
+    } else {
+        (1u128 << valid_bits) - 1
+    };
+    let modulus = mask + 1;
+    let start = start_tick as u128 & mask;
+    let mut end = end_tick as u128 & mask;
+    if end < start {
+        end += modulus;
+    }
+    let elapsed_ns =
+        ((end.saturating_sub(start) as f64 * period_ns as f64).min(u64::MAX as f64)) as u64;
+    match kind {
+        DeviceIntervalKind::MainQueue => &COUNTERS.device_main_raw_ns,
+        DeviceIntervalKind::DedicatedTransfer => &COUNTERS.device_dma_raw_ns,
+    }
+    .fetch_add(elapsed_ns, Ordering::Relaxed);
+    DEVICE_INTERVALS.lock().unwrap().push(DeviceInterval {
+        kind,
+        start_tick,
+        end_tick,
+        valid_bits,
+        period_ns,
+    });
+}
+
+#[inline]
 pub fn record_queue_submit(dispatches: usize, elapsed: Duration) {
     COUNTERS.queue_submits.fetch_add(1, Ordering::Relaxed);
     COUNTERS
@@ -481,6 +1044,57 @@ pub fn record_queue_submit(dispatches: usize, elapsed: Duration) {
     COUNTERS
         .submitted_dispatches
         .fetch_add(dispatches as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_command_recording(dispatches: usize, elapsed: Duration) {
+    COUNTERS
+        .command_record_segments
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .command_record_dispatches
+        .fetch_add(dispatches as u64, Ordering::Relaxed);
+    COUNTERS
+        .command_record_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_command_recorder_acquire(elapsed: Duration) {
+    COUNTERS
+        .command_recorder_acquires
+        .fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .command_recorder_acquire_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_backend_execute(elapsed: Duration) {
+    COUNTERS.backend_executes.fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .backend_execute_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_backend_setup(elapsed: Duration) {
+    COUNTERS.backend_setups.fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .backend_setup_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_backend_setup_part(kind: BackendSetupKind, elapsed: Duration) {
+    let counter = match kind {
+        BackendSetupKind::Layout => &COUNTERS.backend_setup_layout_ns,
+        BackendSetupKind::PhaseScratch => &COUNTERS.backend_setup_phase_scratch_ns,
+        BackendSetupKind::Rope => &COUNTERS.backend_setup_rope_ns,
+        BackendSetupKind::Fusion => &COUNTERS.backend_setup_fusion_ns,
+        BackendSetupKind::PagedMoeScan => &COUNTERS.backend_setup_paged_moe_scan_ns,
+    };
+    counter.fetch_add(ns(elapsed), Ordering::Relaxed);
 }
 
 #[inline]
@@ -537,6 +1151,65 @@ pub fn record_splitter_forward(
         .fetch_add(dispatches as u64, Ordering::Relaxed);
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn record_ple_gather(
+    tokens: usize,
+    row_requests: usize,
+    unique_rows: usize,
+    logical_pages: usize,
+    output_bytes: usize,
+    parallel: bool,
+    plan_elapsed: Duration,
+    work_elapsed: Duration,
+) {
+    COUNTERS.ple_gathers.fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .ple_tokens
+        .fetch_add(tokens as u64, Ordering::Relaxed);
+    COUNTERS
+        .ple_row_requests
+        .fetch_add(row_requests as u64, Ordering::Relaxed);
+    COUNTERS
+        .ple_unique_rows
+        .fetch_add(unique_rows as u64, Ordering::Relaxed);
+    COUNTERS
+        .ple_logical_pages
+        .fetch_add(logical_pages as u64, Ordering::Relaxed);
+    COUNTERS
+        .ple_output_bytes
+        .fetch_add(output_bytes as u64, Ordering::Relaxed);
+    if parallel {
+        COUNTERS
+            .ple_parallel_gathers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    COUNTERS
+        .ple_plan_ns
+        .fetch_add(ns(plan_elapsed), Ordering::Relaxed);
+    COUNTERS
+        .ple_work_ns
+        .fetch_add(ns(work_elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_ple_wait(elapsed: Duration) {
+    COUNTERS.ple_waits.fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .ple_wait_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_ple_upload(bytes: usize, elapsed: Duration) {
+    COUNTERS.ple_uploads.fetch_add(1, Ordering::Relaxed);
+    COUNTERS
+        .ple_upload_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+    COUNTERS
+        .ple_upload_ns
+        .fetch_add(ns(elapsed), Ordering::Relaxed);
+}
+
 pub fn record_lru_work(stats: LruWorkStats) {
     if !stats.has_activity() {
         return;
@@ -573,6 +1246,96 @@ pub fn record_lru_work(stats: LruWorkStats) {
         .fetch_max(stats.victim_max_queue_len, Ordering::Relaxed);
 }
 
+/// Read the counters needed to attribute one paged-MoE boundary. Call only when [`active`] is
+/// true; keeping that branch at the caller avoids dozens of relaxed loads in normal execution.
+pub fn paged_moe_hot_snapshot() -> PagedMoeHotSnapshot {
+    PagedMoeHotSnapshot {
+        gpu_hits: load(&COUNTERS.gpu_hits),
+        gpu_misses: load(&COUNTERS.gpu_misses),
+        gpu_evictions: load(&COUNTERS.gpu_evictions),
+        memcpy_bytes: load(&COUNTERS.memcpy_bytes),
+        memcpy_ns: load(&COUNTERS.memcpy_ns),
+        dedicated_transfer_submits: load(&COUNTERS.dedicated_transfer_submits),
+        dedicated_transfer_bytes: load(&COUNTERS.dedicated_transfer_bytes),
+        dedicated_transfer_submit_cpu_ns: load(&COUNTERS.dedicated_transfer_submit_cpu_ns),
+        dedicated_transfer_slot_wait_ns: load(&COUNTERS.dedicated_transfer_slot_wait_ns),
+        dedicated_transfer_timeline_wait_ns: load(&COUNTERS.dedicated_transfer_timeline_wait_ns),
+        queue_submits: load(&COUNTERS.queue_submits),
+        queue_submit_ns: load(&COUNTERS.queue_submit_ns),
+        command_record_segments: load(&COUNTERS.command_record_segments),
+        command_record_ns: load(&COUNTERS.command_record_ns),
+        command_recorder_acquire_ns: load(&COUNTERS.command_recorder_acquire_ns),
+        paging_sync_waits: load(&COUNTERS.paging_sync_waits),
+        paging_sync_wait_ns: load(&COUNTERS.paging_sync_wait_ns),
+        staging_wait_ns: load(&COUNTERS.staging_wait_ns),
+        device_main_raw_ns: load(&COUNTERS.device_main_raw_ns),
+        device_dma_raw_ns: load(&COUNTERS.device_dma_raw_ns),
+    }
+}
+
+/// Attribute host work and queue intervals completed while crossing one paged-MoE layer boundary.
+pub fn record_paged_moe_layer(
+    layer: u32,
+    wall: Duration,
+    before: PagedMoeHotSnapshot,
+    after: PagedMoeHotSnapshot,
+) {
+    let mut layers = PAGED_MOE_LAYERS.lock().unwrap();
+    let layer = layer as usize;
+    if layers.len() <= layer {
+        layers.resize(layer + 1, PagedMoeLayerStats::default());
+    }
+    let stats = &mut layers[layer];
+    let delta = |new: u64, old: u64| new.saturating_sub(old);
+    stats.calls += 1;
+    stats.wall_ns = stats.wall_ns.saturating_add(ns(wall));
+    stats.gpu_hits += delta(after.gpu_hits, before.gpu_hits);
+    stats.gpu_misses += delta(after.gpu_misses, before.gpu_misses);
+    stats.gpu_evictions += delta(after.gpu_evictions, before.gpu_evictions);
+    stats.memcpy_bytes += delta(after.memcpy_bytes, before.memcpy_bytes);
+    stats.memcpy_ns += delta(after.memcpy_ns, before.memcpy_ns);
+    stats.dedicated_transfer_submits += delta(
+        after.dedicated_transfer_submits,
+        before.dedicated_transfer_submits,
+    );
+    stats.dedicated_transfer_bytes += delta(
+        after.dedicated_transfer_bytes,
+        before.dedicated_transfer_bytes,
+    );
+    stats.dedicated_transfer_submit_cpu_ns += delta(
+        after.dedicated_transfer_submit_cpu_ns,
+        before.dedicated_transfer_submit_cpu_ns,
+    );
+    stats.dedicated_transfer_slot_wait_ns += delta(
+        after.dedicated_transfer_slot_wait_ns,
+        before.dedicated_transfer_slot_wait_ns,
+    );
+    stats.dedicated_transfer_timeline_wait_ns += delta(
+        after.dedicated_transfer_timeline_wait_ns,
+        before.dedicated_transfer_timeline_wait_ns,
+    );
+    stats.queue_submits += delta(after.queue_submits, before.queue_submits);
+    stats.queue_submit_ns += delta(after.queue_submit_ns, before.queue_submit_ns);
+    stats.command_record_segments += delta(
+        after.command_record_segments,
+        before.command_record_segments,
+    );
+    stats.command_record_ns += delta(after.command_record_ns, before.command_record_ns);
+    stats.command_recorder_acquire_ns += delta(
+        after.command_recorder_acquire_ns,
+        before.command_recorder_acquire_ns,
+    );
+    stats.paging_sync_waits += delta(after.paging_sync_waits, before.paging_sync_waits);
+    stats.paging_sync_wait_ns += delta(after.paging_sync_wait_ns, before.paging_sync_wait_ns);
+    stats.staging_wait_ns += delta(after.staging_wait_ns, before.staging_wait_ns);
+    stats.main_done_ns += delta(after.device_main_raw_ns, before.device_main_raw_ns);
+    stats.dma_done_ns += delta(after.device_dma_raw_ns, before.device_dma_raw_ns);
+}
+
+pub fn paged_moe_layer_snapshot() -> Vec<PagedMoeLayerStats> {
+    PAGED_MOE_LAYERS.lock().unwrap().clone()
+}
+
 pub fn snapshot() -> Snapshot {
     Snapshot {
         gpu_lookups: load(&COUNTERS.gpu_lookups),
@@ -606,14 +1369,62 @@ pub fn snapshot() -> Snapshot {
         staging_wait_ns: load(&COUNTERS.staging_wait_ns),
         prefetch_windows: load(&COUNTERS.prefetch_windows),
         prefetch_compute_live_at_start: load(&COUNTERS.prefetch_compute_live_at_start),
+        prefetch_compute_live_after_prepare: load(&COUNTERS.prefetch_compute_live_after_prepare),
         prefetch_compute_live_after_enqueue: load(&COUNTERS.prefetch_compute_live_after_enqueue),
+        prefetch_push_bytes: load(&COUNTERS.prefetch_push_bytes),
+        prefetch_push_prepare_ns: load(&COUNTERS.prefetch_push_prepare_ns),
+        prefetch_push_enqueue_ns: load(&COUNTERS.prefetch_push_enqueue_ns),
+        prefetch_confirmed_overlap_ns: load(&COUNTERS.prefetch_confirmed_overlap_ns),
+        prefetch_bytes_submitted_while_compute_live: load(
+            &COUNTERS.prefetch_bytes_submitted_while_compute_live,
+        ),
+        decode_prefetch_calibrations: load(&COUNTERS.decode_prefetch_calibrations),
+        decode_prefetch_candidates: load(&COUNTERS.decode_prefetch_candidates),
+        decode_prefetch_vram_resident: load(&COUNTERS.decode_prefetch_vram_resident),
+        decode_prefetch_host_loading: load(&COUNTERS.decode_prefetch_host_loading),
+        decode_prefetch_ram_experts: load(&COUNTERS.decode_prefetch_ram_experts),
+        decode_prefetch_ram_bytes: load(&COUNTERS.decode_prefetch_ram_bytes),
+        decode_prefetch_ram_ns: load(&COUNTERS.decode_prefetch_ram_ns),
+        decode_prefetch_ssd_jobs: load(&COUNTERS.decode_prefetch_ssd_jobs),
+        decode_prefetch_ssd_blocks: load(&COUNTERS.decode_prefetch_ssd_blocks),
+        decode_prefetch_deadline_stops: load(&COUNTERS.decode_prefetch_deadline_stops),
+        decode_prefetch_overruns: load(&COUNTERS.decode_prefetch_overruns),
+        decode_prefetch_target_finishes: load(&COUNTERS.decode_prefetch_target_finishes),
+        decode_prefetch_target_finish_ns: load(&COUNTERS.decode_prefetch_target_finish_ns),
+        decode_prefetch_quiesce_lock_waits: load(&COUNTERS.decode_prefetch_quiesce_lock_waits),
+        decode_prefetch_quiesce_lock_wait_ns: load(&COUNTERS.decode_prefetch_quiesce_lock_wait_ns),
 
         gpu_copies: load(&COUNTERS.gpu_copies),
         gpu_copy_bytes: load(&COUNTERS.gpu_copy_bytes),
+        dedicated_transfer_submits: load(&COUNTERS.dedicated_transfer_submits),
+        dedicated_transfer_regions: load(&COUNTERS.dedicated_transfer_regions),
+        dedicated_transfer_bytes: load(&COUNTERS.dedicated_transfer_bytes),
+        dedicated_transfer_submit_cpu_ns: load(&COUNTERS.dedicated_transfer_submit_cpu_ns),
+        dedicated_transfer_gpu_timed_submits: load(&COUNTERS.dedicated_transfer_gpu_timed_submits),
+        dedicated_transfer_gpu_timed_bytes: load(&COUNTERS.dedicated_transfer_gpu_timed_bytes),
+        dedicated_transfer_gpu_ns: load(&COUNTERS.dedicated_transfer_gpu_ns),
+        dedicated_transfer_slot_waits: load(&COUNTERS.dedicated_transfer_slot_waits),
+        dedicated_transfer_slot_wait_ns: load(&COUNTERS.dedicated_transfer_slot_wait_ns),
+        dedicated_transfer_timeline_waits: load(&COUNTERS.dedicated_transfer_timeline_waits),
+        dedicated_transfer_timeline_wait_ns: load(&COUNTERS.dedicated_transfer_timeline_wait_ns),
 
         queue_submits: load(&COUNTERS.queue_submits),
         queue_submit_ns: load(&COUNTERS.queue_submit_ns),
         submitted_dispatches: load(&COUNTERS.submitted_dispatches),
+        command_record_segments: load(&COUNTERS.command_record_segments),
+        command_record_dispatches: load(&COUNTERS.command_record_dispatches),
+        command_record_ns: load(&COUNTERS.command_record_ns),
+        command_recorder_acquires: load(&COUNTERS.command_recorder_acquires),
+        command_recorder_acquire_ns: load(&COUNTERS.command_recorder_acquire_ns),
+        backend_executes: load(&COUNTERS.backend_executes),
+        backend_execute_ns: load(&COUNTERS.backend_execute_ns),
+        backend_setups: load(&COUNTERS.backend_setups),
+        backend_setup_ns: load(&COUNTERS.backend_setup_ns),
+        backend_setup_layout_ns: load(&COUNTERS.backend_setup_layout_ns),
+        backend_setup_phase_scratch_ns: load(&COUNTERS.backend_setup_phase_scratch_ns),
+        backend_setup_rope_ns: load(&COUNTERS.backend_setup_rope_ns),
+        backend_setup_fusion_ns: load(&COUNTERS.backend_setup_fusion_ns),
+        backend_setup_paged_moe_scan_ns: load(&COUNTERS.backend_setup_paged_moe_scan_ns),
 
         sync_waits: load(&COUNTERS.sync_waits),
         sync_wait_ns: load(&COUNTERS.sync_wait_ns),
@@ -632,6 +1443,21 @@ pub fn snapshot() -> Snapshot {
         splitter_cap_max: load(&COUNTERS.splitter_cap_max),
         splitter_result_submits: load(&COUNTERS.splitter_result_submits),
         splitter_result_dispatches: load(&COUNTERS.splitter_result_dispatches),
+
+        ple_gathers: load(&COUNTERS.ple_gathers),
+        ple_tokens: load(&COUNTERS.ple_tokens),
+        ple_row_requests: load(&COUNTERS.ple_row_requests),
+        ple_unique_rows: load(&COUNTERS.ple_unique_rows),
+        ple_logical_pages: load(&COUNTERS.ple_logical_pages),
+        ple_output_bytes: load(&COUNTERS.ple_output_bytes),
+        ple_parallel_gathers: load(&COUNTERS.ple_parallel_gathers),
+        ple_plan_ns: load(&COUNTERS.ple_plan_ns),
+        ple_work_ns: load(&COUNTERS.ple_work_ns),
+        ple_waits: load(&COUNTERS.ple_waits),
+        ple_wait_ns: load(&COUNTERS.ple_wait_ns),
+        ple_uploads: load(&COUNTERS.ple_uploads),
+        ple_upload_bytes: load(&COUNTERS.ple_upload_bytes),
+        ple_upload_ns: load(&COUNTERS.ple_upload_ns),
 
         lru_mark_calls: load(&COUNTERS.lru_mark_calls),
         lru_mark_scan_steps: load(&COUNTERS.lru_mark_scan_steps),
@@ -705,13 +1531,23 @@ pub fn print_summary_if_enabled() {
     );
     let _ = writeln!(
         out,
-        "layer prefetch overlap: windows={} compute_live_at_push_start={} ({:.1}%) compute_live_after_push={} ({:.1}%) [GPU completion: verify with RGP]",
+        "hit-first demand overlap: windows={} bytes={} prepare={} enqueue={} confirmed_host_overlap_lower_bound={} compute_live=start {} ({:.1}%) / after_prepare {} ({:.1}%) / after_enqueue {} ({:.1}%) bytes_enqueued_before_compute_done={}",
         s.prefetch_windows,
+        fmt_bytes(s.prefetch_push_bytes),
+        fmt_ns(s.prefetch_push_prepare_ns),
+        fmt_ns(s.prefetch_push_enqueue_ns),
+        fmt_ns(s.prefetch_confirmed_overlap_ns),
         s.prefetch_compute_live_at_start,
         if s.prefetch_windows == 0 {
             0.0
         } else {
             100.0 * s.prefetch_compute_live_at_start as f64 / s.prefetch_windows as f64
+        },
+        s.prefetch_compute_live_after_prepare,
+        if s.prefetch_windows == 0 {
+            0.0
+        } else {
+            100.0 * s.prefetch_compute_live_after_prepare as f64 / s.prefetch_windows as f64
         },
         s.prefetch_compute_live_after_enqueue,
         if s.prefetch_windows == 0 {
@@ -719,12 +1555,70 @@ pub fn print_summary_if_enabled() {
         } else {
             100.0 * s.prefetch_compute_live_after_enqueue as f64 / s.prefetch_windows as f64
         },
+        fmt_bytes(s.prefetch_bytes_submitted_while_compute_live),
     );
     let _ = writeln!(
         out,
-        "gpu upload: copies={} bytes={} gpu_copy_device_time=n/a (use INFR_PROF_OPS copy_buffer)",
+        "decode expert prefetch: calibrations={} candidates={} vram_resident={} host_loading={} ram_experts={} ram_bytes={} ram_transfer_wall={} ram_effective_bw={:.2} GiB/s ssd_jobs={} ssd_blocks={} deadline_stops={} overruns={} target_finishes={} finish_wall={} quiesce_lock_waits={} quiesce_lock_wait={}",
+        s.decode_prefetch_calibrations,
+        s.decode_prefetch_candidates,
+        s.decode_prefetch_vram_resident,
+        s.decode_prefetch_host_loading,
+        s.decode_prefetch_ram_experts,
+        fmt_bytes(s.decode_prefetch_ram_bytes),
+        fmt_ns(s.decode_prefetch_ram_ns),
+        bandwidth_gib_per_sec(s.decode_prefetch_ram_bytes, s.decode_prefetch_ram_ns),
+        s.decode_prefetch_ssd_jobs,
+        s.decode_prefetch_ssd_blocks,
+        s.decode_prefetch_deadline_stops,
+        s.decode_prefetch_overruns,
+        s.decode_prefetch_target_finishes,
+        fmt_ns(s.decode_prefetch_target_finish_ns),
+        s.decode_prefetch_quiesce_lock_waits,
+        fmt_ns(s.decode_prefetch_quiesce_lock_wait_ns),
+    );
+    let _ = writeln!(
+        out,
+        "gpu upload: logical_copies={} bytes={}",
         s.gpu_copies,
         fmt_bytes(s.gpu_copy_bytes),
+    );
+    let _ = writeln!(
+        out,
+        "dedicated DMA: submits={} regions={} bytes={} cpu_submit_time={} gpu_timed_submits={} gpu_timed_bytes={} gpu_copy_time={} gpu_bw={:.2} GiB/s slot_reuse_waits={} slot_reuse_wait={} explicit_timeline_waits={} explicit_timeline_wait={}",
+        s.dedicated_transfer_submits,
+        s.dedicated_transfer_regions,
+        fmt_bytes(s.dedicated_transfer_bytes),
+        fmt_ns(s.dedicated_transfer_submit_cpu_ns),
+        s.dedicated_transfer_gpu_timed_submits,
+        fmt_bytes(s.dedicated_transfer_gpu_timed_bytes),
+        fmt_ns(s.dedicated_transfer_gpu_ns),
+        bandwidth_gib_per_sec(
+            s.dedicated_transfer_gpu_timed_bytes,
+            s.dedicated_transfer_gpu_ns,
+        ),
+        s.dedicated_transfer_slot_waits,
+        fmt_ns(s.dedicated_transfer_slot_wait_ns),
+        s.dedicated_transfer_timeline_waits,
+        fmt_ns(s.dedicated_transfer_timeline_wait_ns),
+    );
+    let timeline = device_timeline_snapshot();
+    let _ = writeln!(
+        out,
+        "device queue timeline: span={} main_intervals={} main_busy={} dma_intervals={} dma_busy={} concurrent_overlap={} dma_hidden={:.1}% visible_dma_tail={} outside_timestamped_intervals={}",
+        fmt_ns(timeline.span_ns),
+        timeline.main_intervals,
+        fmt_ns(timeline.main_busy_ns),
+        timeline.dma_intervals,
+        fmt_ns(timeline.dma_busy_ns),
+        fmt_ns(timeline.overlap_ns),
+        if timeline.dma_busy_ns == 0 {
+            0.0
+        } else {
+            100.0 * timeline.overlap_ns as f64 / timeline.dma_busy_ns as f64
+        },
+        fmt_ns(timeline.dma_busy_ns.saturating_sub(timeline.overlap_ns)),
+        fmt_ns(timeline.outside_intervals_ns),
     );
     let _ = writeln!(
         out,
@@ -737,6 +1631,47 @@ pub fn print_summary_if_enabled() {
         } else {
             s.submitted_dispatches as f64 / s.queue_submits as f64
         },
+    );
+    let _ = writeln!(
+        out,
+        "host orchestration: backend_executes={} execute_wall={} avg_execute={} setup_calls={} setup_time={} avg_setup={} recorder_acquires={} acquire_time={} avg_acquire={} recorded_segments={} record_lifetime={} record_dispatches={} avg_record_per_segment={}",
+        s.backend_executes,
+        fmt_ns(s.backend_execute_ns),
+        fmt_ns(s.backend_execute_ns.checked_div(s.backend_executes).unwrap_or(0)),
+        s.backend_setups,
+        fmt_ns(s.backend_setup_ns),
+        fmt_ns(s.backend_setup_ns.checked_div(s.backend_setups).unwrap_or(0)),
+        s.command_recorder_acquires,
+        fmt_ns(s.command_recorder_acquire_ns),
+        fmt_ns(
+            s.command_recorder_acquire_ns
+                .checked_div(s.command_recorder_acquires)
+                .unwrap_or(0)
+        ),
+        s.command_record_segments,
+        fmt_ns(s.command_record_ns),
+        s.command_record_dispatches,
+        fmt_ns(
+            s.command_record_ns
+                .checked_div(s.command_record_segments)
+                .unwrap_or(0)
+        ),
+    );
+    let _ = writeln!(
+        out,
+        "backend setup detail: layout={} phase_scratch={} rope={} fusion={} paged_moe_scan={} other={}",
+        fmt_ns(s.backend_setup_layout_ns),
+        fmt_ns(s.backend_setup_phase_scratch_ns),
+        fmt_ns(s.backend_setup_rope_ns),
+        fmt_ns(s.backend_setup_fusion_ns),
+        fmt_ns(s.backend_setup_paged_moe_scan_ns),
+        fmt_ns(s.backend_setup_ns.saturating_sub(
+            s.backend_setup_layout_ns
+                .saturating_add(s.backend_setup_phase_scratch_ns)
+                .saturating_add(s.backend_setup_rope_ns)
+                .saturating_add(s.backend_setup_fusion_ns)
+                .saturating_add(s.backend_setup_paged_moe_scan_ns)
+        )),
     );
     let _ = writeln!(
         out,
@@ -767,6 +1702,25 @@ pub fn print_summary_if_enabled() {
         cap_range,
         s.splitter_result_submits,
         s.splitter_result_dispatches,
+    );
+    let _ = writeln!(
+        out,
+        "qwen3.8 PLE: gathers={} tokens={} row_requests={} unique_rows={} duplicate_rows={} logical_4KiB_pages={} output={} parallel_gathers={} plan={} mmap_dequant={} residual_waits={} residual_wait={} uploads={} upload_bytes={} upload_time={}",
+        s.ple_gathers,
+        s.ple_tokens,
+        s.ple_row_requests,
+        s.ple_unique_rows,
+        s.ple_row_requests.saturating_sub(s.ple_unique_rows),
+        s.ple_logical_pages,
+        fmt_bytes(s.ple_output_bytes),
+        s.ple_parallel_gathers,
+        fmt_ns(s.ple_plan_ns),
+        fmt_ns(s.ple_work_ns),
+        s.ple_waits,
+        fmt_ns(s.ple_wait_ns),
+        s.ple_uploads,
+        fmt_bytes(s.ple_upload_bytes),
+        fmt_ns(s.ple_upload_ns),
     );
     let _ = writeln!(
         out,
@@ -829,6 +1783,119 @@ fn bandwidth_gib_per_sec(bytes: u64, ns: u64) -> f64 {
         const GIB: f64 = (1u64 << 30) as f64;
         bytes as f64 * 1_000_000_000.0 / ns as f64 / GIB
     }
+}
+
+/// Fold all recorded queue intervals into cumulative busy/overlap totals. Callers may subtract two
+/// snapshots taken at idle cohort boundaries to attribute device work without resetting the
+/// process-wide profiler.
+pub fn device_timeline_snapshot() -> DeviceTimelineStats {
+    let intervals = DEVICE_INTERVALS.lock().unwrap();
+    if intervals.is_empty() {
+        return DeviceTimelineStats::default();
+    }
+    let valid_bits = intervals.iter().map(|i| i.valid_bits).min().unwrap_or(0);
+    let period_ns = intervals[0].period_ns;
+    if valid_bits == 0
+        || intervals
+            .iter()
+            .any(|i| (i.period_ns - period_ns).abs() > f32::EPSILON * period_ns.abs().max(1.0))
+    {
+        return DeviceTimelineStats::default();
+    }
+    let mask = if valid_bits >= 64 {
+        u64::MAX as u128
+    } else {
+        (1u128 << valid_bits) - 1
+    };
+    let modulus = mask + 1;
+    let normalize = |interval: &DeviceInterval| {
+        let start = interval.start_tick as u128 & mask;
+        let mut end = interval.end_tick as u128 & mask;
+        if end < start {
+            end += modulus;
+        }
+        let start_ns = (start as f64 * period_ns as f64) as u128;
+        let end_ns = (end as f64 * period_ns as f64) as u128;
+        (start_ns, end_ns)
+    };
+    let main_raw: Vec<_> = intervals
+        .iter()
+        .filter(|i| i.kind == DeviceIntervalKind::MainQueue)
+        .map(normalize)
+        .collect();
+    let dma_raw: Vec<_> = intervals
+        .iter()
+        .filter(|i| i.kind == DeviceIntervalKind::DedicatedTransfer)
+        .map(normalize)
+        .collect();
+    let main_intervals = main_raw.len();
+    let dma_intervals = dma_raw.len();
+    let main = merge_intervals(main_raw);
+    let dma = merge_intervals(dma_raw);
+    let main_busy = interval_duration(&main);
+    let dma_busy = interval_duration(&dma);
+    let overlap = interval_intersection_duration(&main, &dma);
+    let first = main
+        .iter()
+        .chain(dma.iter())
+        .map(|&(start, _)| start)
+        .min()
+        .unwrap_or(0);
+    let last = main
+        .iter()
+        .chain(dma.iter())
+        .map(|&(_, end)| end)
+        .max()
+        .unwrap_or(first);
+    let span = last.saturating_sub(first);
+    let union_busy = main_busy.saturating_add(dma_busy).saturating_sub(overlap);
+    DeviceTimelineStats {
+        main_intervals,
+        dma_intervals,
+        span_ns: span.min(u64::MAX as u128) as u64,
+        main_busy_ns: main_busy.min(u64::MAX as u128) as u64,
+        dma_busy_ns: dma_busy.min(u64::MAX as u128) as u64,
+        overlap_ns: overlap.min(u64::MAX as u128) as u64,
+        outside_intervals_ns: span.saturating_sub(union_busy).min(u64::MAX as u128) as u64,
+    }
+}
+
+fn merge_intervals(mut intervals: Vec<(u128, u128)>) -> Vec<(u128, u128)> {
+    intervals.retain(|(start, end)| end >= start);
+    intervals.sort_unstable_by_key(|&(start, end)| (start, end));
+    let mut merged: Vec<(u128, u128)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+fn interval_duration(intervals: &[(u128, u128)]) -> u128 {
+    intervals
+        .iter()
+        .map(|&(start, end)| end.saturating_sub(start))
+        .sum()
+}
+
+fn interval_intersection_duration(a: &[(u128, u128)], b: &[(u128, u128)]) -> u128 {
+    let (mut ai, mut bi, mut total) = (0usize, 0usize, 0u128);
+    while ai < a.len() && bi < b.len() {
+        let start = a[ai].0.max(b[bi].0);
+        let end = a[ai].1.min(b[bi].1);
+        total = total.saturating_add(end.saturating_sub(start));
+        if a[ai].1 <= b[bi].1 {
+            ai += 1;
+        } else {
+            bi += 1;
+        }
+    }
+    total
 }
 
 fn cap_label(cap: u64) -> String {
@@ -905,5 +1972,15 @@ mod tests {
         assert_eq!(s.victim_queue_len_sum, 20);
         assert_eq!(s.victim_max_queue_len, 10);
         assert!(s.has_activity());
+    }
+
+    #[test]
+    fn device_interval_union_and_overlap_are_not_double_counted() {
+        let a = merge_intervals(vec![(0, 10), (8, 20), (30, 40)]);
+        let b = merge_intervals(vec![(5, 12), (18, 35)]);
+        assert_eq!(a, vec![(0, 20), (30, 40)]);
+        assert_eq!(interval_duration(&a), 30);
+        assert_eq!(interval_duration(&b), 24);
+        assert_eq!(interval_intersection_duration(&a, &b), 14);
     }
 }

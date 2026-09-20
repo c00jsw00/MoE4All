@@ -300,6 +300,56 @@ function Select-EmbeddingModelPath {
     }
 }
 
+function Find-VisionProjectorPath {
+    param([Parameter(Mandatory = $true)][string]$ModelPath)
+
+    try {
+        $directory = Split-Path -Parent (ConvertTo-FullPath $ModelPath)
+        $projectors = @(Get-ChildItem -LiteralPath $directory -File | Where-Object {
+            $_.Extension -ieq '.gguf' -and $_.Name -like 'mmproj*'
+        } | Sort-Object Name)
+        if ($projectors.Count -eq 1) {
+            return $projectors[0].FullName
+        }
+    } catch {
+        # Discovery is only a default; the explicit prompt below remains authoritative.
+    }
+    return ''
+}
+
+function Select-VisionProjectorPath {
+    param([AllowEmptyString()][string]$Default = '')
+
+    while ($true) {
+        $inputPath = Read-TextValue -Label '视觉 mmproj GGUF 文件或目录 / Vision mmproj GGUF file or directory' -Default $Default -Required
+        try {
+            $path = ConvertTo-FullPath $inputPath
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                if ([System.IO.Path]::GetExtension($path) -ine '.gguf') {
+                    throw '文件扩展名不是 .gguf。The file extension is not .gguf.'
+                }
+                return $path
+            }
+            if (Test-Path -LiteralPath $path -PathType Container) {
+                $projectors = @(Get-ChildItem -LiteralPath $path -File | Where-Object {
+                    $_.Extension -ieq '.gguf' -and $_.Name -like 'mmproj*'
+                } | Sort-Object Name)
+                if ($projectors.Count -eq 1) {
+                    return $projectors[0].FullName
+                }
+                if ($projectors.Count -eq 0) {
+                    throw '目录中没有 mmproj*.gguf。The directory contains no mmproj*.gguf file.'
+                }
+                throw "目录中有 $($projectors.Count) 个 mmproj GGUF，请输入具体文件路径。The directory contains $($projectors.Count) mmproj GGUF files; enter the exact file path."
+            }
+            throw '路径不存在。The path does not exist.'
+        } catch {
+            Write-Host $_.Exception.Message -ForegroundColor Yellow
+            $Default = ''
+        }
+    }
+}
+
 function Add-SetArgument {
     param(
         [Parameter(Mandatory = $true)][System.Collections.Generic.List[string]]$Arguments,
@@ -596,8 +646,19 @@ $topP = [string](Get-SavedValue 'top_p' '')
 $seed = [string](Get-SavedValue 'seed' '')
 $serverAddr = [string](Get-SavedValue 'server_addr' '127.0.0.1:8080')
 $serverParallel = [string](Get-SavedValue 'server_parallel' '1')
+$defaultSessionCacheDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MoE4All\kv-sessions'
+$serverSessionCache = [bool](Get-SavedValue 'server_session_cache' $false)
+$sessionCacheDir = [string](Get-SavedValue 'session_cache_dir' $defaultSessionCacheDir)
+$sessionIdleSecs = [string](Get-SavedValue 'session_idle_secs' '120')
+$sessionCacheMax = [string](Get-SavedValue 'session_cache_max' '5GiB')
+$sessionCacheTtlHours = [string](Get-SavedValue 'session_cache_ttl_hours' '24')
 $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
+$serverVision = [bool](Get-SavedValue 'server_vision' $false)
+$visionProjectorPath = [string](Get-SavedValue 'vision_projector' '')
+if ([string]::IsNullOrWhiteSpace($visionProjectorPath) -or -not (Test-Path -LiteralPath $visionProjectorPath -PathType Leaf)) {
+    $visionProjectorPath = Find-VisionProjectorPath -ModelPath $modelPath
+}
 $serverEmbedding = [bool](Get-SavedValue 'server_embedding' $false)
 $embeddingModelPath = [string](Get-SavedValue 'embedding_model' '')
 $embeddingIdleTimeout = [string](Get-SavedValue 'embedding_idle_timeout' '300')
@@ -671,6 +732,22 @@ if ($launchMode -eq 'benchmark') {
         Write-Host 'Use 127.0.0.1 locally. For LAN access use 0.0.0.0 and enable an API key.' -ForegroundColor DarkGray
         $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
         $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
+        $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
+        if ($serverSessionCache) {
+            Write-Host '闲置会话会在后台写入 SSD 并释放显存；再次访问时自动恢复。仅支持动态分段 Q8 KV。' -ForegroundColor DarkGray
+            Write-Host 'Idle sessions are written to SSD in the background and restored on demand. Dynamic segmented Q8 KV is required.' -ForegroundColor DarkGray
+            $sessionCacheDir = Read-TextValue -Label 'KV 缓存目录 / KV cache directory' -Default $sessionCacheDir -Required
+            $sessionCacheDir = ConvertTo-FullPath $sessionCacheDir
+            $sessionIdleSecs = Read-IntegerValue -Label '会话闲置多少秒后写入 SSD / Spill after idle seconds' -Default $sessionIdleSecs -Minimum 0
+            $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
+            $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
+        }
+        $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
+        if ($serverVision) {
+            Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
+            Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
+            $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
+        }
         $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
         if ($serverEmbedding) {
             Write-Host 'Embedding 首次请求时从 GGUF/SSD 载入统一显存；空闲超时后释放，不建立额外 RAM 权重缓存。' -ForegroundColor DarkGray
@@ -794,6 +871,18 @@ if ($launchMode -eq 'server') {
     }
     [void]$nativeArgs.Add('--addr'); [void]$nativeArgs.Add($serverAddr)
     [void]$nativeArgs.Add('--parallel'); [void]$nativeArgs.Add($serverParallel)
+    if ($serverSessionCache) {
+        Add-SetArgument $nativeArgs 'kv.session_cache_dir' $sessionCacheDir
+        Add-SetArgument $nativeArgs 'kv.session_idle_secs' $sessionIdleSecs
+        Add-SetArgument $nativeArgs 'kv.session_cache_max' $sessionCacheMax
+        Add-SetArgument $nativeArgs 'kv.session_cache_ttl_hours' $sessionCacheTtlHours
+    } else {
+        # An explicit empty CLI layer disables a cache inherited from infr.toml or the environment.
+        Add-SetArgument $nativeArgs 'kv.session_cache_dir' ''
+    }
+    if ($serverVision) {
+        [void]$nativeArgs.Add('--mmproj'); [void]$nativeArgs.Add($visionProjectorPath)
+    }
     if ($serverEmbedding) {
         [void]$nativeArgs.Add('--embedding-model'); [void]$nativeArgs.Add($embeddingModelPath)
         [void]$nativeArgs.Add('--embedding-idle-timeout'); [void]$nativeArgs.Add($embeddingIdleTimeout)
@@ -819,6 +908,10 @@ $state = [ordered]@{
     reasoning_effort = $reasoningEffort
     temperature = $temperature; top_k = $topK; top_p = $topP; seed = $seed
     server_addr = $serverAddr; server_parallel = $serverParallel; server_auth = $serverAuth
+    server_session_cache = $serverSessionCache; session_cache_dir = $sessionCacheDir
+    session_idle_secs = $sessionIdleSecs; session_cache_max = $sessionCacheMax
+    session_cache_ttl_hours = $sessionCacheTtlHours
+    server_vision = $serverVision; vision_projector = $visionProjectorPath
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout
     custom_sets = $customSets; last_command = $commandText
@@ -850,6 +943,10 @@ if ($launchMode -eq 'server') {
     Write-Host 'For OpenAI clients, use the /v1 address above as the Base URL.' -ForegroundColor DarkGray
     if ($serverEmbedding) {
         Write-Host "Embedding API: http://$clientAddress/v1/embeddings" -ForegroundColor Cyan
+    }
+    if ($serverVision) {
+        Write-Host '视觉聊天已启用：在 /v1/chat/completions 的 content parts 中发送 image_url data URI。' -ForegroundColor Cyan
+        Write-Host 'Vision chat enabled: send an image_url data URI in /v1/chat/completions content parts.' -ForegroundColor Cyan
     }
     Write-Host '按 Ctrl+C 停止服务器。Press Ctrl+C to stop the server.' -ForegroundColor Yellow
 } elseif ($launchMode -eq 'chat') {

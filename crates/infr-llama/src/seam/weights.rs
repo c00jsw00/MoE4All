@@ -453,12 +453,16 @@ pub(crate) struct SeamKv {
     /// prefill only the prior visible answer plus the new user turn, even when chat-history
     /// normalization makes the newly rendered prompt diverge from `cached`.
     pub(super) turn_recurrent_ckpt: Option<TurnRecurrentCkpt>,
+    /// Additional serve slots whose persistent device allocations were materialized beside slot
+    /// 0 before the unified arena consumed the measured remainder. Startup drains this vector
+    /// immediately; ordinary one-shot/session paths always keep it empty.
+    pub(super) preallocated_siblings: Vec<SeamKv>,
 }
 
 #[derive(Default)]
 pub(super) struct SegmentedKvState {
     pub(super) enabled: bool,
-    committed_tokens: usize,
+    pub(super) committed_tokens: usize,
 }
 
 impl SegmentedKvState {
@@ -586,16 +590,16 @@ pub(super) struct MtpDeltaCkpt {
 /// allocated once per slot and reused; `copied` lets layer-major prefill capture each recurrent
 /// layer exactly when that layer reaches the boundary without any per-operation allocation.
 pub(super) struct TurnRecurrentCkpt {
-    kbufs: Vec<Box<dyn Buffer>>,
-    vbufs: Vec<Box<dyn Buffer>>,
+    pub(super) kbufs: Vec<Box<dyn Buffer>>,
+    pub(super) vbufs: Vec<Box<dyn Buffer>>,
     /// Qwen3.8's model-level PLE convolution history is recurrent state too. Keeping it beside
     /// the per-layer DeltaNet snapshots makes one stable conversation boundary self-contained.
-    ple_state: Option<Box<dyn Buffer>>,
-    layers: Vec<usize>,
-    tokens: Vec<u32>,
-    copied: Vec<bool>,
-    ple_copied: bool,
-    valid: bool,
+    pub(super) ple_state: Option<Box<dyn Buffer>>,
+    pub(super) layers: Vec<usize>,
+    pub(super) tokens: Vec<u32>,
+    pub(super) copied: Vec<bool>,
+    pub(super) ple_copied: bool,
+    pub(super) valid: bool,
 }
 
 fn checkpoint_extension_start(checkpoint: &[u32], prompt: &[u32]) -> Option<usize> {
@@ -622,6 +626,49 @@ impl TurnRecurrentCkpt {
         src_ple: Option<&dyn Buffer>,
         tokens: &[u32],
     ) -> AResult<()> {
+        Self::begin_sized(
+            slot,
+            be,
+            cfg,
+            |layer| Some(src_k[layer].len_bytes()),
+            |layer| Some(src_v[layer].len_bytes()),
+            src_ple.map(Buffer::len_bytes),
+            tokens,
+        )
+    }
+
+    /// Cold-load variant used while segmented KV planes are intentionally still unbound. Every
+    /// recurrent layer is already a concrete fixed allocation; dynamic planes remain `None` and
+    /// are never inspected because they are not checkpoint state.
+    pub(super) fn begin_before_dynamic_kv(
+        slot: &mut Option<Self>,
+        be: &dyn Backend,
+        cfg: &Config,
+        src_k: &[Option<Box<dyn Buffer>>],
+        src_v: &[Option<Box<dyn Buffer>>],
+        src_ple: Option<&dyn Buffer>,
+        tokens: &[u32],
+    ) -> AResult<()> {
+        Self::begin_sized(
+            slot,
+            be,
+            cfg,
+            |layer| src_k[layer].as_ref().map(|buffer| buffer.len_bytes()),
+            |layer| src_v[layer].as_ref().map(|buffer| buffer.len_bytes()),
+            src_ple.map(Buffer::len_bytes),
+            tokens,
+        )
+    }
+
+    fn begin_sized(
+        slot: &mut Option<Self>,
+        be: &dyn Backend,
+        cfg: &Config,
+        mut k_len: impl FnMut(usize) -> Option<usize>,
+        mut v_len: impl FnMut(usize) -> Option<usize>,
+        ple_len: Option<usize>,
+        tokens: &[u32],
+    ) -> AResult<()> {
         if slot.is_none() {
             let layers: Vec<usize> = (0..cfg.n_layer)
                 .filter(|&l| cfg.is_recurrent_layer(l))
@@ -632,18 +679,24 @@ impl TurnRecurrentCkpt {
             let mut kbufs = Vec::with_capacity(layers.len());
             let mut vbufs = Vec::with_capacity(layers.len());
             for &l in &layers {
+                let kb = k_len(l).ok_or_else(|| {
+                    anyhow!("recurrent checkpoint layer {l} has no fixed K/state allocation")
+                })?;
+                let vb = v_len(l).ok_or_else(|| {
+                    anyhow!("recurrent checkpoint layer {l} has no fixed V/state allocation")
+                })?;
                 kbufs.push(
-                    be.alloc(src_k[l].len_bytes().max(1), BufferUsage::KvCache)
+                    be.alloc(kb.max(1), BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 vbufs.push(
-                    be.alloc(src_v[l].len_bytes().max(1), BufferUsage::KvCache)
+                    be.alloc(vb.max(1), BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
             }
-            let ple_state = src_ple
-                .map(|src| {
-                    be.alloc(src.len_bytes().max(1), BufferUsage::KvCache)
+            let ple_state = ple_len
+                .map(|bytes| {
+                    be.alloc(bytes.max(1), BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))
                 })
                 .transpose()?;
@@ -660,7 +713,7 @@ impl TurnRecurrentCkpt {
             });
         }
         let ck = slot.as_mut().expect("checkpoint was just allocated");
-        if ck.ple_state.is_some() != src_ple.is_some() {
+        if ck.ple_state.is_some() != ple_len.is_some() {
             return Err(anyhow!(
                 "stable recurrent checkpoint PLE shape changed within one session"
             ));
@@ -668,7 +721,7 @@ impl TurnRecurrentCkpt {
         ck.tokens.clear();
         ck.tokens.extend_from_slice(tokens);
         ck.copied.fill(false);
-        ck.ple_copied = src_ple.is_none();
+        ck.ple_copied = ple_len.is_none();
         ck.valid = false;
         Ok(())
     }
@@ -776,6 +829,10 @@ pub(crate) struct SeamWeights {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamKv {
+    pub(crate) fn take_preallocated_siblings(&mut self) -> Vec<SeamKv> {
+        std::mem::take(&mut self.preallocated_siblings)
+    }
+
     /// The context this slot's KV cache was allocated for — the AUTHORITY on a session's window,
     /// because the cold init may have re-clamped the caller's `want_ctx` against the device's live
     /// free memory (`crate::seam::reclamp_ctx_to_live_room`). A caller that keeps its own copy
@@ -832,6 +889,28 @@ impl SeamKv {
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
         self.invalidate_turn_checkpoint();
+    }
+
+    /// Commit this slot's segmented planes through `tokens`. The ordinary runner invokes the same
+    /// state method through its local macro; layer-synchronous decode needs it once per lane.
+    pub(super) fn ensure_segmented_depth(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        tokens: usize,
+    ) -> AResult<()> {
+        self.segmented_kv.ensure_depth(
+            be,
+            cfg,
+            self.max_ctx,
+            self.k_fmt,
+            self.v_fmt,
+            &self.kbufs,
+            &self.vbufs,
+            &self.qsa_kbufs,
+            &self.qsa_cbufs,
+            tokens,
+        )
     }
 
     /// Benchmark-only synthetic context: mark the first `tokens.len()` positions as resident without
@@ -1166,6 +1245,27 @@ impl SeamKv {
                 }
             }
         }
+        let ple_state_buf = if cfg.qwen4exp {
+            let hist = (cfg.ple_conv_kernel - 1) * cfg.ple_ngram_size;
+            Some(
+                be.alloc(hist * cfg.hc_mult * cfg.n_embd * 4, BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
+        let mut turn_recurrent_ckpt = None;
+        if cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3 {
+            TurnRecurrentCkpt::begin(
+                &mut turn_recurrent_ckpt,
+                be,
+                cfg,
+                &kbufs,
+                &vbufs,
+                ple_state_buf.as_deref(),
+                &[],
+            )?;
+        }
         Ok(SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
             stable: std::sync::Arc::clone(&self.stable),
@@ -1214,15 +1314,7 @@ impl SeamKv {
             } else {
                 None
             },
-            ple_state_buf: if cfg.qwen4exp {
-                let hist = (cfg.ple_conv_kernel - 1) * cfg.ple_ngram_size;
-                Some(
-                    be.alloc(hist * cfg.hc_mult * cfg.n_embd * 4, BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                )
-            } else {
-                None
-            },
+            ple_state_buf,
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
@@ -1241,7 +1333,8 @@ impl SeamKv {
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
-            turn_recurrent_ckpt: None,
+            turn_recurrent_ckpt,
+            preallocated_siblings: Vec::new(),
         })
     }
 

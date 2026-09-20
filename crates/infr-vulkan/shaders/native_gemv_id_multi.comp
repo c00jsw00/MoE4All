@@ -28,7 +28,7 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #ifdef PAGED
 layout(push_constant) uniform PC {
     uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
-    uint arena_lo; uint arena_hi; uint slot_bytes; uint active_mask;
+    uint arena_lo; uint arena_hi; uint slot_bytes; uint active_mask; uint row_mask_bank;
 #ifdef SHARED_Q8
     uint shared_lo; uint shared_hi; uint routed_used;
 #endif
@@ -68,6 +68,19 @@ layout(binding = 3) buffer YB { float y_buf[]; };
 #endif
 
 shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)
+
+#ifdef PAGED
+uint active_mask_for_row(uint row) {
+    if (pc.row_mask_bank == 0u) { return pc.active_mask; }
+#ifdef SHARED_Q8
+    uint routed_used = pc.routed_used;
+#else
+    uint routed_used = pc.n_used;
+#endif
+    uint mask_base = pc.rows * routed_used + (pc.row_mask_bank - 1u) * pc.rows;
+    return ids[mask_base + row];
+}
+#endif
 
 #if defined(PAGED) || defined(STREAMED)
 // Arena read via 64-bit device address (see native_weight_addr.glsl): the LUT (PAGED) or `ids`
@@ -142,7 +155,7 @@ void main() {
     uint row = slot_global / pc.n_used;
     uint slot = slot_global - row * pc.n_used;
 #ifdef PAGED
-    if ((pc.active_mask & (1u << (slot_global % pc.n_used))) == 0u) { return; }
+    if ((active_mask_for_row(row) & (1u << slot)) == 0u) { return; }
 #endif
     uint t = gl_LocalInvocationID.x;
 #ifdef PAGED

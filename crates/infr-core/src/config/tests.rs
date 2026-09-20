@@ -115,10 +115,15 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.device.subgroup_pref, None);
     // §6.3 / §6.4.
     assert_eq!(d.kv.slots, 4);
+    assert_eq!(d.kv.session_cache_dir, None);
+    assert_eq!(d.kv.session_idle_secs, 120);
+    assert_eq!(d.kv.session_cache_max, crate::SizeSpec::Bytes(5u64 << 30));
+    assert_eq!(d.kv.session_cache_ttl_hours, 24);
     assert!(d.kv.ring);
     assert!(d.kv.dynamic);
     assert!(!d.kv.force_q8);
     assert_eq!(d.paging.trace, None);
+    assert!(!d.paging.expert_prefetch);
 
     // §6.5 / §10.2: the mmv tier is ON by default — `INFR_NO_MMV` is presence-INV.
     assert!(d.kernels.vulkan.mmv);
@@ -206,6 +211,66 @@ fn pager_trace_path_is_config_backed() {
 
     let cfg = Config::load_from_layers(&[cli_layer(&["paging.trace=cli.csv"])]);
     assert_eq!(cfg.paging.trace.as_deref(), Some(Path::new("cli.csv")));
+}
+
+#[test]
+fn expert_prefetch_is_default_off_and_explicitly_enableable() {
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_EXPERT_PREFETCH", "1")])]);
+    assert!(cfg.paging.expert_prefetch);
+
+    let cfg = Config::load_from_layers(&[cli_layer(&["paging.expert_prefetch=true"])]);
+    assert!(cfg.paging.expert_prefetch);
+}
+
+#[test]
+fn cold_session_cache_parses_from_every_configuration_layer() {
+    let from_file = Config::load_from_layers(&[file_layer(
+        "[kv]\nsession_cache_dir = 'cold-kv'\nsession_idle_secs = 30\nsession_cache_max = '12GiB'\nsession_cache_ttl_hours = 6\n",
+    )]);
+    assert_eq!(
+        from_file.kv.session_cache_dir.as_deref(),
+        Some(Path::new("cold-kv"))
+    );
+    assert_eq!(from_file.kv.session_idle_secs, 30);
+    assert_eq!(
+        from_file.kv.session_cache_max,
+        crate::SizeSpec::Bytes(12u64 << 30)
+    );
+    assert_eq!(from_file.kv.session_cache_ttl_hours, 6);
+
+    let from_env = Config::load_from_layers(&[env_layer(&[
+        ("INFR_KV_SESSION_CACHE_DIR", "env-kv"),
+        ("INFR_KV_SESSION_IDLE_SECS", "45"),
+        ("INFR_KV_SESSION_CACHE_MAX", "8GiB"),
+        ("INFR_KV_SESSION_CACHE_TTL_HOURS", "9"),
+    ])]);
+    assert_eq!(
+        from_env.kv.session_cache_dir.as_deref(),
+        Some(Path::new("env-kv"))
+    );
+    assert_eq!(from_env.kv.session_idle_secs, 45);
+    assert_eq!(
+        from_env.kv.session_cache_max,
+        crate::SizeSpec::Bytes(8u64 << 30)
+    );
+    assert_eq!(from_env.kv.session_cache_ttl_hours, 9);
+
+    let from_cli = Config::load_from_layers(&[cli_layer(&[
+        "kv.session_cache_dir=cli-kv",
+        "kv.session_idle_secs=60",
+        "kv.session_cache_max=4GiB",
+        "kv.session_cache_ttl_hours=12",
+    ])]);
+    assert_eq!(
+        from_cli.kv.session_cache_dir.as_deref(),
+        Some(Path::new("cli-kv"))
+    );
+    assert_eq!(from_cli.kv.session_idle_secs, 60);
+    assert_eq!(
+        from_cli.kv.session_cache_max,
+        crate::SizeSpec::Bytes(4u64 << 30)
+    );
+    assert_eq!(from_cli.kv.session_cache_ttl_hours, 12);
 }
 
 /// A CLI flag beats the environment.
@@ -1346,6 +1411,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_MMV",
         "INFR_NO_MMV_M4",
         "INFR_NO_MMV_O4",
+        "INFR_EXPERT_PREFETCH",
         "INFR_NO_MOE_SM_POOL",
         "INFR_NO_MROW",
         "INFR_NO_MROW16",
@@ -1461,6 +1527,10 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_SHUTDOWN_FILE",
         "INFR_EMBEDDING_RUNNER",
         "INFR_NO_HOST_DMA",
+        "INFR_KV_SESSION_CACHE_DIR",
+        "INFR_KV_SESSION_IDLE_SECS",
+        "INFR_KV_SESSION_CACHE_MAX",
+        "INFR_KV_SESSION_CACHE_TTL_HOURS",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

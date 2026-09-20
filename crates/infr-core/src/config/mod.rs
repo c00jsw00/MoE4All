@@ -180,6 +180,18 @@ cfg_struct! {
         force_q8: bool = false,
         /// `INFR_KV_SLOTS`: prefix-cache slots.
         slots: usize = 4,
+        /// Directory for cold conversation state. `None` disables disk persistence so user prompt
+        /// state is never written implicitly; setting it enables serial multi-session eviction and
+        /// restart recovery for segmented Vulkan KV caches.
+        session_cache_dir: Option<PathBuf> = None,
+        /// Idle time before a free resident conversation becomes eligible for cold storage. The
+        /// check runs at scheduler boundaries, where the GPU is already under session control.
+        session_idle_secs: u64 = 120,
+        /// Maximum bytes retained under [`KvCfg::session_cache_dir`]. Percent values are rejected
+        /// by the session store because a disk-cache budget has no meaningful hardware base.
+        session_cache_max: SizeSpec = SizeSpec::Bytes(5u64 << 30),
+        /// Remove cold sessions older than this many hours while opening/maintaining the cache.
+        session_cache_ttl_hours: u64 = 24,
         /// `INFR_NO_KV_RING` (inverted): the SWA ring cache.
         ring: bool = true,
         /// Lazily commit supported Qwen KV caches in 32K-token increments. Backends/models without
@@ -216,6 +228,10 @@ cfg_struct! {
         /// Upload future streamed MoE layers on the host worker while the GPU computes the current
         /// layer. `INFR_SYNC_PREFILL_UPLOAD` disables the overlap for diagnostics.
         prefill_upload_async: bool = true,
+        /// Predict the next Qwen3.8 Decode router from the current layer input and admit useful
+        /// expert blocks at the cold LRU edge while the GPU executes intervening work.
+        /// Experimental and opt-in: `INFR_EXPERT_PREFETCH` enables it for A/B diagnostics.
+        expert_prefetch: bool = false,
         /// `INFR_MOE_SIZE_CACHE_BIAS`: optional Decode arena weighting between distinct per-expert
         /// tensor sizes. Positive values favor larger tensors and negative values favor smaller.
         /// `None` auto-enables the validated `+2` bias only for a balanced two-size layout where

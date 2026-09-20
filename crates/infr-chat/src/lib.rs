@@ -26,11 +26,18 @@ pub use tools::{
     split_reasoning, split_think, ToolCall,
 };
 
+/// Internal sentinel placed where an OpenAI content-part image occurred. It survives Jinja
+/// rendering, after which [`render_chat_oai`] replaces it with the model's vision special tokens.
+pub const IMAGE_PART_PLACEHOLDER: char = '\u{fffc}';
+pub const VISION_MARKER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
 /// One chat message (OpenAI-shaped; tool fields preserved for the agentic round-trip).
 #[derive(Clone, Debug, Default)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Image payloads (`data:` URI or bare base64) in the same order as placeholders in content.
+    pub images: Vec<String>,
     /// Previous assistant reasoning, supplied separately from the visible answer.
     pub reasoning_content: Option<String>,
     /// The assistant's OUTGOING tool calls (OpenAI `message.tool_calls`), replayed into the prompt on

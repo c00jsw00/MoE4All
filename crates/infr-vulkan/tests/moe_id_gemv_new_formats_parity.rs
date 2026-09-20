@@ -345,6 +345,7 @@ fn new_dtype_id_gemv_paged_matches_host_under_eviction_churn() {
                 out_f,
                 1,
                 u32::MAX,
+                0,
             );
             rec.finish().unwrap();
 
@@ -399,11 +400,18 @@ fn paged_iq2xs_multirow_matches_host() {
         .map(|i| ((i * 17 + i / in_f * 23) % 61) as f32 * 0.0125 - 0.35)
         .collect();
     let ids = [0u32, 2, 3, 1, 2, 0];
+    let hit_masks = [0b01u32, 0b10, 0b11];
+    let miss_masks = [0b10u32, 0b01, 0b00];
+    let mut ids_and_masks = ids.to_vec();
+    ids_and_masks.extend_from_slice(&hit_masks);
+    ids_and_masks.extend_from_slice(&miss_masks);
 
     let x_buf = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
-    let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+    let ids_buf = be
+        .alloc(ids_and_masks.len() * 4, BufferUsage::Activations)
+        .unwrap();
     be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
-    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids_and_masks))
         .unwrap();
     let mut pager = GpuPager::new(&be, n_expert, n_expert, stride_bytes).unwrap();
     let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
@@ -433,6 +441,7 @@ fn paged_iq2xs_multirow_matches_host() {
         out_f,
         rows,
         u32::MAX,
+        0,
     );
     rec.finish().unwrap();
 
@@ -453,6 +462,55 @@ fn paged_iq2xs_multirow_matches_host() {
             &got[pair * out_f..(pair + 1) * out_f],
             &want,
         );
+    }
+
+    let sentinel = vec![-17.0f32; rows * n_used * out_f];
+    be.upload(y.as_ref(), bytemuck::cast_slice(&sentinel))
+        .unwrap();
+    let rec = be.recorder().unwrap();
+    rec.linear_native_id_multi_paged(
+        dt,
+        pager.arena_addr(),
+        pager.slot_bytes() as u32,
+        pager.lut_buffer(),
+        ids_buf.as_ref(),
+        n_used,
+        0,
+        x_buf.as_ref(),
+        false,
+        y.as_ref(),
+        in_f,
+        out_f,
+        rows,
+        0,
+        1,
+    );
+    rec.finish().unwrap();
+    be.download(y.as_ref(), &mut out).unwrap();
+    let got: &[f32] = bytemuck::cast_slice(&out);
+    for (pair, &eid) in ids.iter().enumerate() {
+        let row = pair / n_used;
+        let slot = pair % n_used;
+        let slot_out = &got[pair * out_f..(pair + 1) * out_f];
+        if hit_masks[row] & (1 << slot) == 0 {
+            assert!(
+                slot_out.iter().all(|&v| v == -17.0),
+                "row {row} slot {slot} ignored its per-row mask"
+            );
+        } else {
+            let want = host_gemv(
+                &host[eid as usize],
+                &x[row * in_f..(row + 1) * in_f],
+                in_f,
+                out_f,
+            );
+            assert_close(
+                dt,
+                &format!("paged row-mask row {row} expert {eid}"),
+                slot_out,
+                &want,
+            );
+        }
     }
 }
 
@@ -515,6 +573,7 @@ fn paged_sg_id_gemv_matches_host() {
             out_f,
             1,
             u32::MAX,
+            0,
         );
         rec.finish().unwrap();
 
@@ -550,6 +609,7 @@ fn paged_sg_id_gemv_matches_host() {
             out_f,
             1,
             active_mask,
+            0,
         );
         rec.finish().unwrap();
         be.download(y.as_ref(), &mut out).unwrap();

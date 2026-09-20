@@ -20,11 +20,14 @@
 
 use std::{
     convert::Infallible,
+    io::{self, Write},
     net::SocketAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -39,10 +42,140 @@ use axum::{
     Json, Router,
 };
 use infr_core::config::Config;
-use infr_engine::{ChatMessage, ChatTemplateOptions, Delta, ToolCall};
+use infr_engine::{ChatMessage, ChatTemplateOptions, Delta, ToolCall, IMAGE_PART_PLACEHOLDER};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
+
+// ---------------------------------------------------------------------------
+// Coordinated terminal output
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct TerminalState {
+    dashboard: Option<String>,
+    dashboard_lines: usize,
+}
+
+static TERMINAL_COORDINATED: AtomicBool = AtomicBool::new(false);
+static TERMINAL_STATE: OnceLock<Mutex<TerminalState>> = OnceLock::new();
+
+fn terminal_state() -> &'static Mutex<TerminalState> {
+    TERMINAL_STATE.get_or_init(|| Mutex::new(TerminalState::default()))
+}
+
+/// Enable the stderr coordinator used by the CLI's tracing subscriber. A library embedding the
+/// server without this writer keeps the ordinary structured log presentation.
+pub fn configure_terminal_output(enabled: bool) {
+    TERMINAL_COORDINATED.store(enabled, Ordering::Relaxed);
+}
+
+fn terminal_dashboard_available() -> bool {
+    TERMINAL_COORDINATED.load(Ordering::Relaxed)
+}
+
+fn terminal_dashboard_active() -> bool {
+    terminal_dashboard_available()
+        && terminal_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dashboard
+            .is_some()
+}
+
+fn clear_terminal_region(out: &mut dyn Write, lines: usize) -> io::Result<()> {
+    if lines == 0 {
+        return Ok(());
+    }
+    write!(out, "\x1b[{lines}A")?;
+    for row in 0..lines {
+        write!(out, "\r\x1b[2K")?;
+        if row + 1 < lines {
+            write!(out, "\x1b[1B")?;
+        }
+    }
+    if lines > 1 {
+        write!(out, "\x1b[{}A", lines - 1)?;
+    }
+    write!(out, "\r")
+}
+
+fn draw_terminal_frame(out: &mut dyn Write, frame: &str) -> io::Result<usize> {
+    let lines = frame.lines().count();
+    out.write_all(frame.as_bytes())?;
+    if !frame.ends_with('\n') {
+        out.write_all(b"\n")?;
+    }
+    Ok(lines)
+}
+
+fn set_terminal_dashboard(frame: Option<String>) {
+    if !terminal_dashboard_available() {
+        return;
+    }
+    let mut state = terminal_state().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = io::stderr().lock();
+    let _ = clear_terminal_region(&mut out, state.dashboard_lines);
+    state.dashboard_lines = 0;
+    state.dashboard = frame;
+    if let Some(frame) = state.dashboard.as_deref() {
+        state.dashboard_lines = draw_terminal_frame(&mut out, frame).unwrap_or(0);
+    }
+    let _ = out.flush();
+}
+
+fn terminal_write_log(bytes: &[u8]) {
+    if !terminal_dashboard_available() {
+        let mut out = io::stderr().lock();
+        let _ = out.write_all(bytes);
+        let _ = out.flush();
+        return;
+    }
+
+    // Keep the same lock order as `set_terminal_dashboard`: state, then stderr. Tracing may emit
+    // while the reporter redraws, so reversing these two locks could deadlock the terminal.
+    let mut state = terminal_state().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = io::stderr().lock();
+    let _ = clear_terminal_region(&mut out, state.dashboard_lines);
+    let _ = out.write_all(bytes);
+    if !bytes.ends_with(b"\n") {
+        let _ = out.write_all(b"\n");
+    }
+    state.dashboard_lines = 0;
+    if let Some(frame) = state.dashboard.as_deref() {
+        state.dashboard_lines = draw_terminal_frame(&mut out, frame).unwrap_or(0);
+    }
+    let _ = out.flush();
+}
+
+/// One tracing event buffered until its formatter releases the writer, then printed atomically
+/// around the live table. Outside an interactive serve session this is just stderr.
+pub struct TerminalLogWriter {
+    bytes: Vec<u8>,
+}
+
+impl Write for TerminalLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for TerminalLogWriter {
+    fn drop(&mut self) {
+        if !self.bytes.is_empty() {
+            terminal_write_log(&self.bytes);
+        }
+    }
+}
+
+pub fn terminal_log_writer() -> TerminalLogWriter {
+    TerminalLogWriter { bytes: Vec::new() }
+}
 
 /// Why generation ended — the OpenAI `finish_reason`. The generator reports it; the handlers
 /// serialize it (a tool call still overrides to [`Finish::ToolCalls`] at the wire layer).
@@ -88,10 +221,12 @@ pub trait ChatGenerator: Send + Sync {
     /// * `tools` is the request's `tools` array as a borrowed [`serde_json::Value`] — passed by
     ///   reference so the generator parses the ONE it was already given instead of a
     ///   `Value`→string→`Value` round-trip (see audit finding 6).
-    /// * `cancel` is a PER-REQUEST abort latch. The server sets it when the client disconnects (an
-    ///   SSE `send` starts failing); the generator must poll it in its decode loop and stop promptly
-    ///   so the GPU slot is freed rather than held to `max_tokens`. It is ORed with the process-wide
-    ///   shutdown latch, never a replacement for it.
+    /// * `cancel` is a PER-REQUEST abort latch. The server sets it when the client disconnects or a
+    ///   request deadline expires; the generator must poll it at prefill/decode work boundaries so
+    ///   the GPU slot is released promptly. It is ORed with the process-wide shutdown latch, never
+    ///   a replacement for it.
+    /// * `progress` receives exact cumulative model-token snapshots. Implementations should call it
+    ///   only at natural work boundaries; it is optional so non-server frontends stay unaffected.
     /// * Returns a [`ChatOutcome`] carrying the finish reason AND the real prompt/completion token
     ///   counts so the handler can populate `usage` truthfully.
     fn chat(
@@ -100,7 +235,8 @@ pub trait ChatGenerator: Send + Sync {
         tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &GenParams,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
+        progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome>;
 }
@@ -602,6 +738,9 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     pub usage: UsageInfo,
+    /// llama.cpp-compatible timing names plus INFR's live context figures. Unknown response fields
+    /// are ignored by OpenAI clients; local harnesses can use these instead of timing UTF-8 chunks.
+    pub timings: TimingInfo,
 }
 
 #[derive(Debug, Serialize)]
@@ -637,17 +776,36 @@ pub struct OAIFunction {
     pub arguments: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PromptTokensDetails {
     pub cached_tokens: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UsageInfo {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub prompt_tokens_details: PromptTokensDetails,
+}
+
+/// De-facto llama.cpp timing vocabulary, extended with the context values a local runtime already
+/// knows exactly. `prompt_n` is only the suffix actually evaluated; `cached_n` is reported
+/// separately, while `context_n` is the full logical prompt + completion depth.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TimingInfo {
+    pub prompt_n: u32,
+    pub prompt_ms: f64,
+    pub prompt_per_token_ms: f64,
+    pub prompt_per_second: f64,
+    pub predicted_n: u32,
+    pub predicted_ms: f64,
+    pub predicted_per_token_ms: f64,
+    pub predicted_per_second: f64,
+    pub cached_n: u32,
+    pub context_n: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u32>,
 }
 
 impl UsageInfo {
@@ -676,6 +834,17 @@ pub struct ChatCompletionChunk {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+}
+
+/// Terminal SSE frame. Keeping metrics out of ordinary delta frames avoids repeating the same
+/// object on every token, while putting `usage` on the finish frame makes streaming counts visible
+/// to clients such as DeepSeek Harness even when they did not request a separate usage-only chunk.
+#[derive(Debug, Serialize)]
+struct ChatCompletionFinalChunk {
+    #[serde(flatten)]
+    chunk: ChatCompletionChunk,
+    usage: UsageInfo,
+    timings: TimingInfo,
 }
 
 #[derive(Debug, Serialize)]
@@ -719,10 +888,9 @@ fn next_req_id() -> u64 {
 /// The server-wide counters behind the periodic throughput line, and the two gauges behind
 /// `active`/`queued`.
 ///
-/// **Everything here is an atomic and nothing here is a lock.** The only counter touched from
-/// inside a generation is [`Self::bump_gen`], one relaxed `fetch_add` per emitted delta — the
-/// decode loop must not acquire anything, because it is holding the GPU baton for every other
-/// sequence behind it (the same reason the SSE channel is unbounded).
+/// **Everything here is an atomic and nothing here is a lock.** Exact progress updates use relaxed
+/// additions to these counters. Presentation state is protected by a separate per-request mutex,
+/// never by a global lock shared between generations.
 ///
 /// The four `interval_*` counters are DRAINED (swapped to zero) by each report, which is what makes
 /// the reported numbers cover the interval rather than the process lifetime. There is deliberately
@@ -730,14 +898,12 @@ fn next_req_id() -> u64 {
 /// a rate into an average-since-boot.
 #[derive(Debug, Default)]
 struct ServeStats {
-    /// Prompt tokens PREFILLED in this interval. Folded once per request, at completion — the real
-    /// count from [`ChatOutcome`], which is not knowable before the generator has tokenized.
+    /// Prompt tokens PREFILLED in this interval. Exact runners add completed chunks live; legacy
+    /// generators without progress callbacks fold the authoritative count at completion.
     interval_prompt_tokens: AtomicU64,
-    /// Tokens GENERATED in this interval, live. Incremented per delta while a generation runs (so a
-    /// long request shows up in the intervals it spans, not only in the one it ends in) and
-    /// RECONCILED at completion against `ChatOutcome::completion_tokens`, which is authoritative:
-    /// a delta is a text piece and is only approximately a token (a think-tag boundary can split
-    /// or merge one). The correction is signed, hence `i64`.
+    /// Tokens GENERATED in this interval, live. Exact runners add model tokens directly, including
+    /// reasoning tokens. Legacy generators count text deltas and reconcile at completion against
+    /// `ChatOutcome::completion_tokens`; the correction is signed, hence `i64`.
     interval_gen_tokens: AtomicI64,
     /// Requests that COMPLETED in this interval (success or failure).
     interval_completed: AtomicU64,
@@ -757,6 +923,12 @@ struct ServeStats {
 }
 
 impl ServeStats {
+    /// Prompt rows completed by a live model request. Progress-aware generators call this after a
+    /// natural Prefill work unit, so a long context load appears in the interval where it ran.
+    fn bump_prompt(&self, n: u64) {
+        self.interval_prompt_tokens.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// One decoded piece. The ONE call on the hot path — a single relaxed add.
     fn bump_gen(&self, n: i64) {
         self.interval_gen_tokens.fetch_add(n, Ordering::Relaxed);
@@ -783,17 +955,19 @@ impl ServeStats {
     /// is new information about tokens nobody has counted yet, the same shape as `prompt_tokens`
     /// arriving at completion.
     fn fold_completion(&self, rec: &ReqRecord) {
-        self.interval_prompt_tokens.fetch_add(
-            u64::from(rec.prompt_tokens.saturating_sub(rec.cached_prompt_tokens)),
-            Ordering::Relaxed,
-        );
-        let correction = i64::from(rec.gen_tokens) - rec.deltas as i64;
-        if correction > 0 {
-            self.bump_gen(correction);
-        } else if correction < 0 && rec.window == self.window() {
-            // Retract at most what this request itself put into the window that is still open.
-            let retractable = rec.deltas_in_window.min(i64::MAX as u64) as i64;
-            self.bump_gen(-correction.abs().min(retractable));
+        if !rec.progress_accounted {
+            self.interval_prompt_tokens.fetch_add(
+                u64::from(rec.prompt_tokens.saturating_sub(rec.cached_prompt_tokens)),
+                Ordering::Relaxed,
+            );
+            let correction = i64::from(rec.gen_tokens) - rec.deltas as i64;
+            if correction > 0 {
+                self.bump_gen(correction);
+            } else if correction < 0 && rec.window == self.window() {
+                // Retract at most what this request itself put into the window that is still open.
+                let retractable = rec.deltas_in_window.min(i64::MAX as u64) as i64;
+                self.bump_gen(-correction.abs().min(retractable));
+            }
         }
         self.interval_completed.fetch_add(1, Ordering::Relaxed);
     }
@@ -924,14 +1098,500 @@ impl Drop for ActiveGuard {
     }
 }
 
-/// The per-request tally kept INSIDE the generation, as plain locals in the blocking task. It is
-/// folded into [`ServeStats`] once, at completion — the request's own timing needs no sharing, and
-/// making it shared would put a second atomic (or worse) on the decode path for nothing.
+#[derive(Debug)]
+struct RequestProgressState {
+    latest: Option<infr_core::GenerationProgress>,
+    prefill_elapsed: Option<Duration>,
+    last_log_elapsed: Duration,
+    accounted_prefill: u64,
+    accounted_decode: u64,
+}
+
+/// Exact model-token progress for one request. The runner calls it once per Prefill chunk or
+/// generated token; presentation is throttled here, while interval accounting remains exact.
+struct RequestProgress {
+    req_id: u64,
+    model: String,
+    started: Instant,
+    log_period: Option<Duration>,
+    stats: Arc<ServeStats>,
+    seen: AtomicBool,
+    state: Mutex<RequestProgressState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FinishedProgress {
+    latest: infr_core::GenerationProgress,
+    prefill: Duration,
+    decode: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestDisplay {
+    phase: &'static str,
+    speed: f64,
+    context_tokens: Option<u64>,
+    context_limit: Option<u64>,
+}
+
+impl RequestProgress {
+    fn new(
+        req_id: u64,
+        model: String,
+        log_period: Option<Duration>,
+        stats: Arc<ServeStats>,
+    ) -> Self {
+        Self {
+            req_id,
+            model,
+            started: Instant::now(),
+            log_period,
+            stats,
+            seen: AtomicBool::new(false),
+            state: Mutex::new(RequestProgressState {
+                latest: None,
+                prefill_elapsed: None,
+                last_log_elapsed: Duration::ZERO,
+                accounted_prefill: 0,
+                accounted_decode: 0,
+            }),
+        }
+    }
+
+    fn callback(self: &Arc<Self>) -> infr_core::GenerationProgressCallback {
+        let this = Arc::clone(self);
+        Arc::new(move |progress| this.observe(progress))
+    }
+
+    fn seen(&self) -> bool {
+        self.seen.load(Ordering::Relaxed)
+    }
+
+    fn observe(&self, progress: infr_core::GenerationProgress) {
+        self.seen.store(true, Ordering::Relaxed);
+        let elapsed = self.started.elapsed();
+        let (emit, prefill_elapsed) = {
+            let mut state = self.state.lock().expect("request progress poisoned");
+            let restarted = state.latest.is_some_and(|previous| {
+                progress.prompt_tokens != previous.prompt_tokens
+                    || progress.cached_prompt_tokens != previous.cached_prompt_tokens
+                    || progress.prefill_tokens < previous.prefill_tokens
+                    || progress.completion_tokens < previous.completion_tokens
+            });
+            if restarted {
+                // A failed constrained tool-call attempt may restart generation with a clean
+                // prompt. Keep elapsed time cumulative, but let the successful attempt establish
+                // the request's real Prefill/Decode boundary.
+                state.prefill_elapsed = None;
+            }
+            let prefill_delta = if restarted {
+                progress.prefill_tokens
+            } else {
+                progress
+                    .prefill_tokens
+                    .saturating_sub(state.accounted_prefill)
+            };
+            let decode_delta = if restarted {
+                progress.completion_tokens
+            } else {
+                progress
+                    .completion_tokens
+                    .saturating_sub(state.accounted_decode)
+            };
+            self.stats.bump_prompt(prefill_delta);
+            self.stats
+                .bump_gen(decode_delta.min(i64::MAX as u64) as i64);
+            state.accounted_prefill = progress.prefill_tokens;
+            state.accounted_decode = progress.completion_tokens;
+
+            let first = state.latest.is_none();
+            let phase_changed = state
+                .latest
+                .is_some_and(|previous| previous.phase != progress.phase);
+            if progress.phase == infr_core::GenerationPhase::Decode
+                && state.prefill_elapsed.is_none()
+            {
+                state.prefill_elapsed = Some(elapsed);
+            }
+            let periodic = self
+                .log_period
+                .is_some_and(|period| elapsed.saturating_sub(state.last_log_elapsed) >= period);
+            let emit = first || phase_changed || periodic;
+            if emit {
+                state.last_log_elapsed = elapsed;
+            }
+            state.latest = Some(progress);
+            (emit, state.prefill_elapsed)
+        };
+
+        if emit && !terminal_dashboard_active() {
+            self.log(progress, elapsed, prefill_elapsed);
+        }
+    }
+
+    fn log(
+        &self,
+        progress: infr_core::GenerationProgress,
+        elapsed: Duration,
+        prefill_elapsed: Option<Duration>,
+    ) {
+        let phase = match progress.phase {
+            infr_core::GenerationPhase::Prefill => "prefill",
+            infr_core::GenerationPhase::Decode => "decode",
+        };
+        let prefill_total = progress
+            .prompt_tokens
+            .saturating_sub(progress.cached_prompt_tokens);
+        let prefill_time = prefill_elapsed.unwrap_or(elapsed);
+        let decode_time =
+            prefill_elapsed.map_or(Duration::ZERO, |done| elapsed.saturating_sub(done));
+        tracing::info!(
+            req = self.req_id,
+            model = %self.model,
+            phase,
+            context_tokens = progress.context_tokens,
+            context_limit = progress.context_limit,
+            prefill_tokens = progress.prefill_tokens,
+            prefill_total,
+            cached_tokens = progress.cached_prompt_tokens,
+            gen_tokens = progress.completion_tokens,
+            prefill_tps = format_args!("{:.1}", per_second(progress.prefill_tokens, prefill_time)),
+            decode_tps = format_args!("{:.1}", per_second(progress.completion_tokens, decode_time)),
+            elapsed_ms = format_args!("{:.0}", elapsed.as_secs_f64() * 1000.0),
+            "request progress"
+        );
+    }
+
+    fn display_snapshot(&self) -> RequestDisplay {
+        let elapsed = self.started.elapsed();
+        let state = self.state.lock().expect("request progress poisoned");
+        let Some(progress) = state.latest else {
+            return RequestDisplay {
+                phase: "Starting",
+                speed: 0.0,
+                context_tokens: None,
+                context_limit: None,
+            };
+        };
+        let (phase, tokens, phase_time) = match progress.phase {
+            infr_core::GenerationPhase::Prefill => (
+                "Prefill",
+                progress.prefill_tokens,
+                state.prefill_elapsed.unwrap_or(elapsed),
+            ),
+            infr_core::GenerationPhase::Decode => {
+                let prefill = state.prefill_elapsed.unwrap_or(elapsed);
+                (
+                    "Decode",
+                    progress.completion_tokens,
+                    elapsed.saturating_sub(prefill),
+                )
+            }
+        };
+        RequestDisplay {
+            phase,
+            speed: per_second(tokens, phase_time),
+            context_tokens: Some(progress.context_tokens),
+            context_limit: Some(progress.context_limit),
+        }
+    }
+
+    /// Reconcile a final count if a backend returned between natural progress callbacks, then
+    /// return the exact context snapshot and model-visible phase timings.
+    fn finish(&self, outcome: ChatOutcome) -> Option<FinishedProgress> {
+        let elapsed = self.started.elapsed();
+        let mut state = self.state.lock().expect("request progress poisoned");
+        let latest = state.latest?;
+        let target_prefill = u64::from(
+            outcome
+                .prompt_tokens
+                .saturating_sub(outcome.cached_prompt_tokens),
+        );
+        let target_decode = u64::from(outcome.completion_tokens);
+        if target_prefill > state.accounted_prefill {
+            self.stats
+                .bump_prompt(target_prefill - state.accounted_prefill);
+            state.accounted_prefill = target_prefill;
+        }
+        if target_decode > state.accounted_decode {
+            self.stats
+                .bump_gen((target_decode - state.accounted_decode).min(i64::MAX as u64) as i64);
+            state.accounted_decode = target_decode;
+        }
+        let prefill = state.prefill_elapsed.unwrap_or(elapsed);
+        Some(FinishedProgress {
+            latest,
+            prefill,
+            decode: elapsed.saturating_sub(prefill),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardSlotKind {
+    Chat,
+    Embedding,
+}
+
+#[derive(Clone)]
+enum DashboardActivity {
+    Chat {
+        req_id: u64,
+        progress: Arc<RequestProgress>,
+    },
+    Embedding {
+        req_id: u64,
+        inputs: usize,
+        started: Instant,
+    },
+}
+
+#[derive(Clone)]
+struct DashboardSlot {
+    kind: DashboardSlotKind,
+    ordinal: usize,
+    capacity: usize,
+    model: Arc<str>,
+    activity: Option<DashboardActivity>,
+}
+
+struct ActivityDashboard {
+    slots: Mutex<Vec<DashboardSlot>>,
+}
+
+impl ActivityDashboard {
+    fn new(models: &[ModelEntry], embeddings: &[EmbeddingEntry]) -> Self {
+        let mut slots = Vec::new();
+        for model in models {
+            for ordinal in 1..=model.capacity {
+                slots.push(DashboardSlot {
+                    kind: DashboardSlotKind::Chat,
+                    ordinal,
+                    capacity: model.capacity,
+                    model: model.id.clone(),
+                    activity: None,
+                });
+            }
+        }
+        for model in embeddings {
+            for ordinal in 1..=model.capacity {
+                slots.push(DashboardSlot {
+                    kind: DashboardSlotKind::Embedding,
+                    ordinal,
+                    capacity: model.capacity,
+                    model: model.id.clone(),
+                    activity: None,
+                });
+            }
+        }
+        Self {
+            slots: Mutex::new(slots),
+        }
+    }
+
+    fn claim_chat(
+        self: &Arc<Self>,
+        model: &str,
+        req_id: u64,
+        progress: Arc<RequestProgress>,
+    ) -> DashboardActivityGuard {
+        self.claim(
+            DashboardSlotKind::Chat,
+            model,
+            req_id,
+            DashboardActivity::Chat { req_id, progress },
+        )
+    }
+
+    fn claim_embedding(
+        self: &Arc<Self>,
+        model: &str,
+        req_id: u64,
+        inputs: usize,
+    ) -> DashboardActivityGuard {
+        self.claim(
+            DashboardSlotKind::Embedding,
+            model,
+            req_id,
+            DashboardActivity::Embedding {
+                req_id,
+                inputs,
+                started: Instant::now(),
+            },
+        )
+    }
+
+    fn claim(
+        self: &Arc<Self>,
+        kind: DashboardSlotKind,
+        model: &str,
+        req_id: u64,
+        activity: DashboardActivity,
+    ) -> DashboardActivityGuard {
+        let mut slots = self.slots.lock().expect("activity dashboard poisoned");
+        let index = slots.iter().position(|slot| {
+            slot.kind == kind && slot.model.as_ref() == model && slot.activity.is_none()
+        });
+        if let Some(index) = index {
+            slots[index].activity = Some(activity);
+        }
+        DashboardActivityGuard {
+            dashboard: Arc::clone(self),
+            index,
+            req_id,
+        }
+    }
+
+    fn release(&self, index: usize, req_id: u64) {
+        let mut slots = self.slots.lock().expect("activity dashboard poisoned");
+        if slots
+            .get(index)
+            .and_then(|slot| slot.activity.as_ref())
+            .is_some_and(|activity| match activity {
+                DashboardActivity::Chat { req_id: live, .. }
+                | DashboardActivity::Embedding { req_id: live, .. } => *live == req_id,
+            })
+        {
+            slots[index].activity = None;
+        }
+    }
+
+    fn render(&self, window: &StatsWindow) -> String {
+        render_activity_table(
+            &self
+                .slots
+                .lock()
+                .expect("activity dashboard poisoned")
+                .clone(),
+            window,
+        )
+    }
+}
+
+struct DashboardActivityGuard {
+    dashboard: Arc<ActivityDashboard>,
+    index: Option<usize>,
+    req_id: u64,
+}
+
+impl Drop for DashboardActivityGuard {
+    fn drop(&mut self) {
+        if let Some(index) = self.index {
+            self.dashboard.release(index, self.req_id);
+        }
+    }
+}
+
+fn abbreviated(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_owned();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut out = value.chars().take(keep).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn grouped_u64(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn table_row(slot: &str, work: &str, state: &str, speed: &str, context: &str) -> String {
+    format!(
+        "| {:<13} | {:<31} | {:<9} | {:>13} | {:>21} |\n",
+        abbreviated(slot, 13),
+        abbreviated(work, 31),
+        abbreviated(state, 9),
+        abbreviated(speed, 13),
+        abbreviated(context, 21),
+    )
+}
+
+fn render_activity_table(slots: &[DashboardSlot], window: &StatsWindow) -> String {
+    const BORDER: &str =
+        "+---------------+---------------------------------+-----------+---------------+-----------------------+\n";
+    let mut out = String::new();
+    out.push_str("INFR live resources\n");
+    out.push_str(BORDER);
+    out.push_str(&table_row("Slot", "Work", "State", "Speed", "Context"));
+    out.push_str(BORDER);
+    for slot in slots {
+        let slot_name = match slot.kind {
+            DashboardSlotKind::Chat => format!("KV {}/{}", slot.ordinal, slot.capacity),
+            DashboardSlotKind::Embedding if slot.capacity == 1 => "Embedding".to_owned(),
+            DashboardSlotKind::Embedding => {
+                format!("Embed {}/{}", slot.ordinal, slot.capacity)
+            }
+        };
+        let (work, state, speed, context) = match slot.activity.as_ref() {
+            Some(DashboardActivity::Chat { req_id, progress }) => {
+                let live = progress.display_snapshot();
+                let speed = if live.speed > 0.0 {
+                    format!("{:.1} tok/s", live.speed)
+                } else {
+                    "-".to_owned()
+                };
+                let context = match (live.context_tokens, live.context_limit) {
+                    (Some(current), Some(limit)) => {
+                        format!("{} / {}", grouped_u64(current), grouped_u64(limit))
+                    }
+                    _ => "-".to_owned(),
+                };
+                (
+                    format!("#{req_id} {}", abbreviated(slot.model.as_ref(), 22)),
+                    live.phase.to_owned(),
+                    speed,
+                    context,
+                )
+            }
+            Some(DashboardActivity::Embedding {
+                req_id,
+                inputs,
+                started,
+            }) => (
+                format!("#{req_id} {inputs} input(s)"),
+                "Embedding".to_owned(),
+                format!("{:.1}s", started.elapsed().as_secs_f64()),
+                "-".to_owned(),
+            ),
+            None => (
+                abbreviated(slot.model.as_ref(), 31),
+                "Idle".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+            ),
+        };
+        out.push_str(&table_row(&slot_name, &work, &state, &speed, &context));
+    }
+    out.push_str(BORDER);
+    out.push_str(&format!(
+        "Total: prefill {:.1} tok/s | decode {:.1} tok/s | active {} | queued {} | done {} | failed {}",
+        window.prefill_tps(),
+        window.decode_tps(),
+        window.active,
+        window.queued,
+        window.completed,
+        window.failed,
+    ));
+    out
+}
+
+/// Text-output fallback kept inside the blocking task. Exact runners account model tokens through
+/// [`RequestProgress`]; generators that never invoke that callback retain the previous delta-based
+/// accounting and completion reconciliation.
 #[derive(Debug)]
 struct ReqTally {
     started: Instant,
-    /// When the FIRST delta arrived: the boundary between prefill and decode. `None` means the
-    /// generation produced nothing.
+    /// When the FIRST delta arrived: the fallback boundary when exact progress is unavailable.
     first_delta: Option<Instant>,
     /// Text deltas seen (content + reasoning). Reconciled against the real token count at the end.
     deltas: u64,
@@ -962,28 +1622,65 @@ impl ReqTally {
     /// and the add are not atomic together, so a drain landing exactly between them can misplace a
     /// single token; that is one token on an interval line, and closing it would mean a lock on the
     /// decode path, which is the one thing this whole structure exists to avoid.
+    #[cfg(test)]
     fn on_text_delta(&mut self, stats: &ServeStats) {
+        self.on_text_delta_inner(stats, true);
+    }
+
+    /// Progress-aware generators account exact model tokens through [`RequestProgress`]. Text
+    /// deltas still delimit visible output, but must not double-count reasoning/content pieces.
+    fn on_text_delta_progress(&mut self, stats: &ServeStats, progress: &RequestProgress) {
+        self.on_text_delta_inner(stats, !progress.seen());
+    }
+
+    fn on_text_delta_inner(&mut self, stats: &ServeStats, count_live: bool) {
         if self.first_delta.is_none() {
             self.first_delta = Some(Instant::now());
         }
-        let w = stats.window();
-        if w != self.window {
-            self.window = w;
-            self.deltas_in_window = 0;
-        }
         self.deltas += 1;
-        self.deltas_in_window += 1;
-        stats.bump_gen(1);
+        if count_live {
+            let w = stats.window();
+            if w != self.window {
+                self.window = w;
+                self.deltas_in_window = 0;
+            }
+            self.deltas_in_window += 1;
+            stats.bump_gen(1);
+        }
     }
 
     /// Close the tally out against the generator's authoritative counts.
+    #[cfg(test)]
     fn finish(&self, outcome: ChatOutcome, finish: Finish) -> ReqRecord {
+        self.finish_with_progress(outcome, finish, None)
+    }
+
+    fn finish_with_progress(
+        &self,
+        outcome: ChatOutcome,
+        finish: Finish,
+        progress: Option<FinishedProgress>,
+    ) -> ReqRecord {
         let total = self.started.elapsed();
         // TTFT is the prefill boundary. With no delta at all (an empty completion) there is no
         // boundary to draw, so the whole request counts as prefill and decode time is zero.
-        let prefill = self
+        let fallback_prefill = self
             .first_delta
             .map_or(total, |t| t.saturating_duration_since(self.started));
+        let (prefill, decode, progress_accounted, context_limit) = match progress {
+            Some(progress) => (
+                progress.prefill,
+                progress.decode,
+                true,
+                u32::try_from(progress.latest.context_limit).ok(),
+            ),
+            None => (
+                fallback_prefill,
+                total.saturating_sub(fallback_prefill),
+                false,
+                None,
+            ),
+        };
         ReqRecord {
             prompt_tokens: outcome.prompt_tokens,
             cached_prompt_tokens: outcome.cached_prompt_tokens.min(outcome.prompt_tokens),
@@ -992,9 +1689,11 @@ impl ReqTally {
             window: self.window,
             deltas_in_window: self.deltas_in_window,
             prefill,
-            decode: total.saturating_sub(prefill),
+            decode,
             total,
             finish,
+            progress_accounted,
+            context_limit,
         }
     }
 }
@@ -1010,12 +1709,15 @@ struct ReqRecord {
     window: u64,
     /// How many of `deltas` were counted into `window`.
     deltas_in_window: u64,
-    /// Time to the first delta — the prefill.
+    /// Runner-reported Prefill duration, or time to first delta for a legacy generator.
     prefill: Duration,
-    /// From the first delta to the end — the decode.
+    /// Runner-reported Decode duration, or time after first delta for a legacy generator.
     decode: Duration,
     total: Duration,
     finish: Finish,
+    /// Exact progress already fed prompt/decode tokens into the live interval counters.
+    progress_accounted: bool,
+    context_limit: Option<u32>,
 }
 
 impl ReqRecord {
@@ -1034,6 +1736,33 @@ impl ReqRecord {
     }
 }
 
+impl TimingInfo {
+    fn from_record(rec: &ReqRecord) -> Self {
+        fn per_token_ms(n: u32, elapsed: Duration) -> f64 {
+            if n > 0 {
+                elapsed.as_secs_f64() * 1000.0 / f64::from(n)
+            } else {
+                0.0
+            }
+        }
+
+        let prompt_n = rec.prompt_tokens.saturating_sub(rec.cached_prompt_tokens);
+        Self {
+            prompt_n,
+            prompt_ms: rec.prefill.as_secs_f64() * 1000.0,
+            prompt_per_token_ms: per_token_ms(prompt_n, rec.prefill),
+            prompt_per_second: rec.prefill_tps(),
+            predicted_n: rec.gen_tokens,
+            predicted_ms: rec.decode.as_secs_f64() * 1000.0,
+            predicted_per_token_ms: per_token_ms(rec.gen_tokens, rec.decode),
+            predicted_per_second: rec.decode_tps(),
+            cached_n: rec.cached_prompt_tokens,
+            context_n: rec.prompt_tokens.saturating_add(rec.gen_tokens),
+            context_limit: rec.context_limit,
+        }
+    }
+}
+
 /// Emit one request's completion line at INFO. The counterpart to the arrival line
 /// ([`log_request_start`]), joined to it by `req`.
 fn log_request_done(req_id: u64, model: &str, stream: bool, rec: &ReqRecord) {
@@ -1042,9 +1771,14 @@ fn log_request_done(req_id: u64, model: &str, stream: bool, rec: &ReqRecord) {
         model,
         stream,
         prompt_tokens = rec.prompt_tokens,
+        cached_tokens = rec.cached_prompt_tokens,
         gen_tokens = rec.gen_tokens,
+        context_tokens = rec.prompt_tokens.saturating_add(rec.gen_tokens),
+        context_limit = ?rec.context_limit,
         prefill_tps = format_args!("{:.1}", rec.prefill_tps()),
         decode_tps = format_args!("{:.1}", rec.decode_tps()),
+        prefill_ms = format_args!("{:.0}", rec.prefill.as_secs_f64() * 1000.0),
+        decode_ms = format_args!("{:.0}", rec.decode.as_secs_f64() * 1000.0),
         total_ms = format_args!("{:.0}", rec.total.as_secs_f64() * 1000.0),
         finish = rec.finish.as_str(),
         "request done"
@@ -1093,8 +1827,17 @@ fn stats_interval(cfg: &Config) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
-/// The periodic throughput reporter: drain the interval counters every `period` and, IF anything
-/// happened, log one line.
+struct TerminalDashboardGuard;
+
+impl Drop for TerminalDashboardGuard {
+    fn drop(&mut self) {
+        set_terminal_dashboard(None);
+    }
+}
+
+/// The periodic throughput reporter: drain the interval counters every `period`. Interactive
+/// terminals get a one-second live table; redirected/non-terminal stderr keeps the existing
+/// activity-only structured log line.
 ///
 /// **Shutdown.** It polls the same process-wide latch [`shutdown_latched`] does, at the same 50 ms
 /// granularity, so a Ctrl-C ends it at the next poll rather than up to a full period later — and it
@@ -1103,30 +1846,52 @@ fn stats_interval(cfg: &Config) -> Option<Duration> {
 /// tokens generated in the last partial interval are not silently dropped.
 async fn stats_reporter(state: AppState, period: Duration) {
     const POLL: Duration = Duration::from_millis(50);
-    let mut last = Instant::now();
+    const DASHBOARD_REFRESH: Duration = Duration::from_secs(1);
+    let dashboard_enabled = terminal_dashboard_available();
+    let _dashboard_guard = dashboard_enabled.then_some(TerminalDashboardGuard);
+    let mut last_drain = Instant::now();
+    let mut last_draw = Instant::now();
+    let mut latest = StatsWindow::default();
+    (latest.busy_slots, latest.total_slots) = state.slot_occupancy();
+    if dashboard_enabled {
+        set_terminal_dashboard(Some(state.dashboard.render(&latest)));
+    }
+
     loop {
         tokio::time::sleep(POLL).await;
         let shutting_down = infr_core::shutdown::shutdown_requested();
-        if !shutting_down && last.elapsed() < period {
-            continue;
+        let drain_due = shutting_down || last_drain.elapsed() >= period;
+        if drain_due {
+            latest = state.stats.drain(last_drain.elapsed());
+            (latest.busy_slots, latest.total_slots) = state.slot_occupancy();
+            last_drain = Instant::now();
+            if !dashboard_enabled && latest.has_activity() {
+                tracing::info!(
+                    interval_s = format_args!("{:.1}", latest.elapsed.as_secs_f64()),
+                    prefill_tps = format_args!("{:.1}", latest.prefill_tps()),
+                    decode_tps = format_args!("{:.1}", latest.decode_tps()),
+                    gen_tokens = latest.gen_tokens,
+                    prompt_tokens = latest.prompt_tokens,
+                    completed = latest.completed,
+                    failed = latest.failed,
+                    active = latest.active,
+                    queued = latest.queued,
+                    kv_slots = format_args!("{}/{}", latest.busy_slots, latest.total_slots),
+                    "serve stats"
+                );
+            }
         }
-        let mut window = state.stats.drain(last.elapsed());
-        (window.busy_slots, window.total_slots) = state.slot_occupancy();
-        last = Instant::now();
-        if window.has_activity() {
-            tracing::info!(
-                interval_s = format_args!("{:.1}", window.elapsed.as_secs_f64()),
-                prefill_tps = format_args!("{:.1}", window.prefill_tps()),
-                decode_tps = format_args!("{:.1}", window.decode_tps()),
-                gen_tokens = window.gen_tokens,
-                prompt_tokens = window.prompt_tokens,
-                completed = window.completed,
-                failed = window.failed,
-                active = window.active,
-                queued = window.queued,
-                kv_slots = format_args!("{}/{}", window.busy_slots, window.total_slots),
-                "serve stats"
-            );
+
+        if dashboard_enabled && (drain_due || last_draw.elapsed() >= DASHBOARD_REFRESH) {
+            // Between counter drains, refresh only gauges and per-request snapshots. The footer's
+            // rates remain the latest complete interval instead of being distorted by extra drains.
+            if !drain_due {
+                latest.active = state.stats.active.load(Ordering::Relaxed);
+                latest.queued = state.stats.queued.load(Ordering::Relaxed);
+                (latest.busy_slots, latest.total_slots) = state.slot_occupancy();
+            }
+            set_terminal_dashboard(Some(state.dashboard.render(&latest)));
+            last_draw = Instant::now();
         }
         if shutting_down {
             return;
@@ -1214,6 +1979,9 @@ pub struct AppState {
     /// [`stats_reporter`] that `serve_state` spawns; a state built for tests simply has no reporter
     /// draining it.
     stats: Arc<ServeStats>,
+    /// Presentation-only slot registry. It mirrors admission permits but never participates in
+    /// scheduling; request progress is read from each request's existing local state.
+    dashboard: Arc<ActivityDashboard>,
 }
 
 impl AppState {
@@ -1226,13 +1994,16 @@ impl AppState {
         n_parallel: usize,
         cfg: Arc<Config>,
     ) -> Self {
+        let models = Arc::new(vec![ModelEntry::new(
+            &model_id.into(),
+            Some(generator),
+            n_parallel,
+        )]);
+        let embeddings = Arc::new(Vec::new());
         Self {
-            models: Arc::new(vec![ModelEntry::new(
-                &model_id.into(),
-                Some(generator),
-                n_parallel,
-            )]),
-            embeddings: Arc::new(Vec::new()),
+            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
+            models,
+            embeddings,
             cfg,
             stats: Arc::default(),
         }
@@ -1250,13 +2021,17 @@ impl AppState {
             !entries.is_empty(),
             "AppState::multi needs at least one model"
         );
-        let models = entries
-            .into_iter()
-            .map(|(id, gen, n)| ModelEntry::new(&id, Some(gen), n))
-            .collect();
+        let models = Arc::new(
+            entries
+                .into_iter()
+                .map(|(id, gen, n)| ModelEntry::new(&id, Some(gen), n))
+                .collect::<Vec<_>>(),
+        );
+        let embeddings = Arc::new(Vec::new());
         Self {
-            models: Arc::new(models),
-            embeddings: Arc::new(Vec::new()),
+            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
+            models,
+            embeddings,
             cfg,
             stats: Arc::default(),
         }
@@ -1266,9 +2041,12 @@ impl AppState {
     /// so an auth/cap test drives `serve.*` through a `Config` value rather than the environment
     /// (R7).
     pub fn headless(model_id: impl Into<String>, cfg: Arc<Config>) -> Self {
+        let models = Arc::new(vec![ModelEntry::new(&model_id.into(), None, 1)]);
+        let embeddings = Arc::new(Vec::new());
         Self {
-            models: Arc::new(vec![ModelEntry::new(&model_id.into(), None, 1)]),
-            embeddings: Arc::new(Vec::new()),
+            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
+            models,
+            embeddings,
             cfg,
             stats: Arc::default(),
         }
@@ -1308,6 +2086,7 @@ impl AppState {
         let mut embeddings = (*self.embeddings).clone();
         embeddings.push(EmbeddingEntry::new(&model_id.into(), generator, n_parallel));
         self.embeddings = Arc::new(embeddings);
+        self.dashboard = Arc::new(ActivityDashboard::new(&self.models, &self.embeddings));
         self
     }
 
@@ -1318,13 +2097,16 @@ impl AppState {
         n_parallel: usize,
         cfg: Arc<Config>,
     ) -> Self {
+        let models = Arc::new(Vec::new());
+        let embeddings = Arc::new(vec![EmbeddingEntry::new(
+            &model_id.into(),
+            generator,
+            n_parallel,
+        )]);
         Self {
-            models: Arc::new(Vec::new()),
-            embeddings: Arc::new(vec![EmbeddingEntry::new(
-                &model_id.into(),
-                generator,
-                n_parallel,
-            )]),
+            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
+            models,
+            embeddings,
             cfg,
             stats: Arc::default(),
         }
@@ -1439,6 +2221,7 @@ async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
         .await;
     if let Some(h) = reporter {
         h.abort();
+        set_terminal_dashboard(None);
     }
     served?;
     Ok(())
@@ -1548,6 +2331,8 @@ async fn embeddings_handler(
         return json_error(StatusCode::NOT_FOUND, "no embedding model is loaded".into());
     };
     let model_id = entry.id.to_string();
+    let req_id = next_req_id();
+    let input_count = inputs.len();
     let queued = QueuedGuard::new(state.stats.clone());
     let Ok(permit) = entry.slots.clone().acquire_owned().await else {
         state.stats.fold_failure();
@@ -1558,10 +2343,14 @@ async fn embeddings_handler(
     };
     drop(queued);
     let active = ActiveGuard::new(state.stats.clone());
+    let display = state
+        .dashboard
+        .claim_embedding(&model_id, req_id, input_count);
     let engine = entry.engine.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _active = active;
+        let _display = display;
         engine.embed(&inputs)
     })
     .await
@@ -1661,8 +2450,10 @@ async fn chat_completions_handler(
         // Resolved HERE, once, so both paths see the same policy and neither reaches for the config
         // from inside a blocking task. `None` (the default) = no deadline, exactly as before.
         deadline: request_timeout(&state.cfg),
+        progress_interval: stats_interval(&state.cfg),
         stream: req.stream,
         stats: state.stats.clone(),
+        dashboard: state.dashboard.clone(),
     };
     log_request_start(
         ctx.id,
@@ -1696,8 +2487,12 @@ struct ReqCtx {
     model_id: String,
     created: i64,
     deadline: Option<Duration>,
+    /// Presentation throttle for exact request progress. `None` disables periodic updates while
+    /// retaining the phase-boundary and completion lines.
+    progress_interval: Option<Duration>,
     stream: bool,
     stats: Arc<ServeStats>,
+    dashboard: Arc<ActivityDashboard>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1718,8 +2513,10 @@ async fn non_streaming(
         model_id,
         created,
         deadline,
+        progress_interval,
         stream,
         stats,
+        dashboard,
     } = ctx;
     // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
     // this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as
@@ -1739,6 +2536,14 @@ async fn non_streaming(
     let engine_arc = entry.engine.clone();
     let cid_blk = cid.clone();
     let stats_blk = stats.clone();
+    let progress = Arc::new(RequestProgress::new(
+        req_id,
+        model_id.clone(),
+        progress_interval,
+        stats.clone(),
+    ));
+    let display = dashboard.claim_chat(&model_id, req_id, progress.clone());
+    let progress_blk = progress.clone();
 
     // Per-request abort latch. It lives OUT here, not inside the closure, so the deadline below can
     // reach it: the generator polls it in its decode loop, and that poll is the only way to stop a
@@ -1754,6 +2559,7 @@ async fn non_streaming(
         // `active` gauge rides along with it, so the two can never disagree.
         let _permit = permit;
         let _active = active;
+        let _display = display;
         let Some(engine) = engine_arc else {
             anyhow::bail!("no engine loaded");
         };
@@ -1763,6 +2569,7 @@ async fn non_streaming(
         let mut tool_calls: Vec<OAIToolCall> = Vec::new();
         // Per-request tally: plain locals, folded into the shared counters once at the end.
         let mut tally = ReqTally::new();
+        let progress_cb = progress_blk.callback();
 
         let outcome = engine.chat(
             &messages,
@@ -1770,13 +2577,14 @@ async fn non_streaming(
             tool_choice.as_deref(),
             &params,
             &cancel_blk,
+            Some(progress_cb),
             &mut |delta| match delta {
                 Delta::Reasoning(t) => {
-                    tally.on_text_delta(&stats_blk);
+                    tally.on_text_delta_progress(&stats_blk, &progress_blk);
                     reasoning.push_str(&t);
                 }
                 Delta::Content(t) => {
-                    tally.on_text_delta(&stats_blk);
+                    tally.on_text_delta_progress(&stats_blk, &progress_blk);
                     content.push_str(&t);
                 }
                 Delta::ToolCall { name, arguments } => {
@@ -1791,7 +2599,15 @@ async fn non_streaming(
             },
         )?;
 
-        Ok((reasoning, content, tool_calls, outcome, tally))
+        let finished_progress = progress_blk.finish(outcome);
+        Ok((
+            reasoning,
+            content,
+            tool_calls,
+            outcome,
+            tally,
+            finished_progress,
+        ))
     });
 
     // The deadline, and the ONE thing about it that is easy to get wrong.
@@ -1837,7 +2653,7 @@ async fn non_streaming(
                 json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             }
         }
-        Ok((reasoning, content, tool_calls, outcome, tally)) => {
+        Ok((reasoning, content, tool_calls, outcome, tally, finished_progress)) => {
             // A deadline hit is a TRUNCATION, not a failure: the client keeps the partial reply
             // (a 500 would throw away work it can use) and `finish_reason` says "length", which is
             // OpenAI's reason for a completion that ran out of budget.
@@ -1857,7 +2673,7 @@ async fn non_streaming(
                 outcome.finish
             };
             // Fold the request's tallies in ONCE, here, and log its completion line.
-            let rec = tally.finish(outcome, finish);
+            let rec = tally.finish_with_progress(outcome, finish, finished_progress);
             stats.fold_completion(&rec);
             log_request_done(req_id, &model_id, stream, &rec);
             Json(ChatCompletionResponse {
@@ -1888,6 +2704,7 @@ async fn non_streaming(
                     finish_reason: finish.as_str().into(),
                 }],
                 usage: UsageInfo::from_outcome(outcome),
+                timings: TimingInfo::from_record(&rec),
             })
             .into_response()
         }
@@ -1912,8 +2729,10 @@ async fn streaming(
         model_id,
         created,
         deadline,
+        progress_interval,
         stream,
         stats,
+        dashboard,
     } = ctx;
     // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
     // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
@@ -1944,10 +2763,19 @@ async fn streaming(
     let cid_cb = cid.clone();
     let model_cb = model_id.clone();
     let stats_cb = stats.clone();
+    let progress = Arc::new(RequestProgress::new(
+        req_id,
+        model_id.clone(),
+        progress_interval,
+        stats.clone(),
+    ));
+    let display = dashboard.claim_chat(&model_id, req_id, progress.clone());
+    let progress_cb = progress.clone();
 
-    // Per-request abort latch: set when the client disconnects (an SSE `send` starts failing) and
-    // polled by the generator's decode loop so it stops promptly and frees the GPU slot instead of
-    // running to `max_tokens` into a dead socket (audit finding 2).
+    // Per-request abort latch: set as soon as the client-owned SSE response is dropped, with failed
+    // sends retained as a belt-and-suspenders fallback. The generator polls it at natural work
+    // boundaries so a disconnected client does not keep a GPU slot through the rest of a long
+    // prefill or decode (audit finding 2).
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_cb = cancel.clone();
 
@@ -1968,6 +2796,7 @@ async fn streaming(
         // `active` gauge is released by the same return (or unwind).
         let _permit = permit;
         let _active = active;
+        let _display = display;
         // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
         // deadline was configured, in which case there is no watchdog to disarm.
         let _done_tx = done_tx;
@@ -2004,6 +2833,7 @@ async fn streaming(
         let mut saw_tool_call = false;
         // Per-request tally: plain locals inside the generation, folded in once below.
         let mut tally = ReqTally::new();
+        let model_progress = progress_cb.callback();
 
         let res = engine.chat(
             &messages,
@@ -2011,17 +2841,18 @@ async fn streaming(
             tool_choice.as_deref(),
             &params,
             &cancel_cb,
+            Some(model_progress),
             &mut |delta| {
                 let payload = match delta {
                     Delta::Reasoning(t) => {
-                        tally.on_text_delta(&stats_cb);
+                        tally.on_text_delta_progress(&stats_cb, &progress_cb);
                         DeltaPayload {
                             reasoning_content: Some(t),
                             ..Default::default()
                         }
                     }
                     Delta::Content(t) => {
-                        tally.on_text_delta(&stats_cb);
+                        tally.on_text_delta_progress(&stats_cb, &progress_cb);
                         DeltaPayload {
                             content: Some(t),
                             ..Default::default()
@@ -2065,18 +2896,22 @@ async fn streaming(
                 } else {
                     outcome.finish
                 };
-                // Finish chunk: empty delta + finish_reason.
-                let _ = tx.send(Ok(sse_chunk(
+                let finished_progress = progress_cb.finish(outcome);
+                let rec = tally.finish_with_progress(outcome, finish, finished_progress);
+                // The terminal frame carries authoritative token counts and timings. This is sent
+                // even when the client omitted stream_options.include_usage: local harnesses need
+                // the counts to display context depth and thinking-token throughput truthfully.
+                let _ = tx.send(Ok(sse_final_chunk(
                     &cid,
                     &model_id,
                     created,
-                    DeltaPayload::default(),
-                    Some(finish.as_str().into()),
+                    finish,
+                    UsageInfo::from_outcome(outcome),
+                    TimingInfo::from_record(&rec),
                 )));
                 // Fold the request's tallies in ONCE, here, and log its completion line. The finish
                 // chunk above IS this stream's terminal frame, so the guard must not also report a
                 // failure when it drops.
-                let rec = tally.finish(outcome, finish);
                 stats.fold_completion(&rec);
                 log_request_done(req_id, &model_id, stream, &rec);
                 done.settled();
@@ -2096,10 +2931,9 @@ async fn streaming(
         // above settled the stream it first reports the request as failed (B23).
     });
 
-    // Bridge the mpsc receiver to an async Stream for axum's Sse.
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    });
+    // The response body owns this stream. Axum drops it immediately when the client disconnects,
+    // including during a long prefill where no token has been sent yet.
+    let stream = CancelOnDropStream { rx, cancel };
 
     Sse::new(stream).into_response()
 }
@@ -2107,6 +2941,29 @@ async fn streaming(
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Turns the HTTP response body's lifetime into the generation's cancellation signal.
+///
+/// Relying only on a failed channel send is too late during prefill: no text delta exists yet, so a
+/// disconnected client can otherwise leave the backend running until the first decoded token.
+struct CancelOnDropStream {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Result<Event, Infallible>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl futures_util::Stream for CancelOnDropStream {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_recv(cx)
+    }
+}
+
+impl Drop for CancelOnDropStream {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Closes the SSE stream exactly once when it drops, from the normal end of the generation OR from
 /// an unwinding panic inside the decode closure.
@@ -2221,6 +3078,37 @@ fn sse_chunk(
     Event::default()
         .json_data(chunk)
         .expect("ChatCompletionChunk always serializes")
+}
+
+/// Serialize the one successful terminal frame. Unlike ordinary deltas, it includes authoritative
+/// model-token usage and phase timings so an OpenAI-compatible streaming client does not have to
+/// infer tokens from UTF-8 pieces (which is especially wrong for buffered reasoning output).
+fn sse_final_chunk(
+    cid: &str,
+    model: &str,
+    created: i64,
+    finish: Finish,
+    usage: UsageInfo,
+    timings: TimingInfo,
+) -> Event {
+    let chunk = ChatCompletionChunk {
+        id: cid.to_owned(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_owned(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: DeltaPayload::default(),
+            finish_reason: Some(finish.as_str().into()),
+        }],
+    };
+    Event::default()
+        .json_data(ChatCompletionFinalChunk {
+            chunk,
+            usage,
+            timings,
+        })
+        .expect("ChatCompletionFinalChunk always serializes")
 }
 
 fn json_error(status: StatusCode, msg: String) -> Response {
@@ -2430,19 +3318,18 @@ fn unix_ts() -> i64 {
 
 /// Flatten a DTO `content` field (string OR content-part array) to a plain `String`.
 ///
-/// Mirrors the Python shim's `normalize_messages`: only `"text"` parts are kept.
+/// Text stays in place and each `image_url` becomes one sentinel, preserving interleaving through
+/// chat-template rendering. Image bytes are collected separately by [`collect_images`].
 pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
     match v {
         None | Some(serde_json::Value::Null) => String::new(),
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(parts)) => parts
             .iter()
-            .filter_map(|p| {
-                if p.get("type")?.as_str()? == "text" {
-                    p.get("text")?.as_str().map(str::to_owned)
-                } else {
-                    None
-                }
+            .filter_map(|part| match part.get("type")?.as_str()? {
+                "text" => part.get("text")?.as_str().map(str::to_owned),
+                "image_url" => Some(IMAGE_PART_PLACEHOLDER.to_string()),
+                _ => None,
             })
             .collect::<Vec<_>>()
             .join(""),
@@ -2450,10 +3337,30 @@ pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
     }
 }
 
+fn collect_images(v: &Option<serde_json::Value>) -> Vec<String> {
+    let Some(serde_json::Value::Array(parts)) = v else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| {
+            if part.get("type")?.as_str()? != "image_url" {
+                return None;
+            }
+            let image = part.get("image_url")?;
+            image
+                .as_str()
+                .or_else(|| image.get("url").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 fn dto_to_engine(dto: &ChatMessageDto) -> ChatMessage {
     ChatMessage {
         role: dto.role.clone(),
         content: flatten_content(&dto.content),
+        images: collect_images(&dto.content),
         reasoning_content: dto
             .reasoning_content
             .clone()
@@ -2510,6 +3417,83 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn live_table_reports_each_resource_and_releases_finished_slots() {
+        let dashboard = Arc::new(ActivityDashboard {
+            slots: Mutex::new(vec![
+                DashboardSlot {
+                    kind: DashboardSlotKind::Chat,
+                    ordinal: 1,
+                    capacity: 2,
+                    model: Arc::from("Qwen3.8-Flash-Next"),
+                    activity: None,
+                },
+                DashboardSlot {
+                    kind: DashboardSlotKind::Chat,
+                    ordinal: 2,
+                    capacity: 2,
+                    model: Arc::from("Qwen3.8-Flash-Next"),
+                    activity: None,
+                },
+                DashboardSlot {
+                    kind: DashboardSlotKind::Embedding,
+                    ordinal: 1,
+                    capacity: 1,
+                    model: Arc::from("nomic-embed-text"),
+                    activity: None,
+                },
+            ]),
+        });
+        let progress = Arc::new(RequestProgress {
+            req_id: 17,
+            model: "Qwen3.8-Flash-Next".into(),
+            started: Instant::now() - Duration::from_secs(2),
+            log_period: None,
+            stats: Arc::default(),
+            seen: AtomicBool::new(true),
+            state: Mutex::new(RequestProgressState {
+                latest: Some(infr_core::GenerationProgress {
+                    phase: infr_core::GenerationPhase::Decode,
+                    prompt_tokens: 50_000,
+                    cached_prompt_tokens: 49_000,
+                    prefill_tokens: 1_000,
+                    completion_tokens: 57,
+                    context_tokens: 50_057,
+                    context_limit: 160_000,
+                }),
+                prefill_elapsed: Some(Duration::from_secs(1)),
+                last_log_elapsed: Duration::ZERO,
+                accounted_prefill: 1_000,
+                accounted_decode: 57,
+            }),
+        });
+
+        let chat = dashboard.claim_chat("Qwen3.8-Flash-Next", 17, progress);
+        let embedding = dashboard.claim_embedding("nomic-embed-text", 18, 3);
+        let frame = dashboard.render(&StatsWindow {
+            elapsed: Duration::from_secs(5),
+            gen_tokens: 120,
+            active: 2,
+            ..StatsWindow::default()
+        });
+        assert!(frame.contains("KV 1/2"));
+        assert!(frame.contains("KV 2/2"));
+        assert!(frame.contains("Embedding"));
+        assert!(frame.contains("#17 Qwen3.8-Flash-Next"));
+        assert!(frame.contains("Decode"));
+        assert!(frame.contains("57.0 tok/s"));
+        assert!(frame.contains("50,057 / 160,000"));
+        assert!(frame.contains("#18 3 input(s)"));
+        assert!(frame.contains("decode 24.0 tok/s"));
+
+        drop(chat);
+        drop(embedding);
+        let idle = dashboard.render(&StatsWindow::default());
+        assert_eq!(idle.matches("Idle").count(), 3);
+        assert!(!idle.contains("#17"));
+        assert!(!idle.contains("#18"));
+    }
+
     // --- HTTP endpoint tests (no Engine required) ---------------------------
 
     #[tokio::test]
@@ -2559,7 +3543,8 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            _cancel: &AtomicBool,
+            _cancel: &Arc<AtomicBool>,
+            _progress: Option<infr_core::GenerationProgressCallback>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
             on_delta(Delta::Content(format!("from:{}", self.0)));
@@ -2567,6 +3552,47 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 3,
                 cached_prompt_tokens: 0,
+                completion_tokens: 2,
+            })
+        }
+    }
+
+    /// Emits exact model progress around one reasoning token and one answer token. The deliberately
+    /// different cached/evaluated prompt counts make double accounting visible in the stats test.
+    struct ProgressGen;
+    impl ChatGenerator for ProgressGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            progress: Option<infr_core::GenerationProgressCallback>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            let progress = progress.expect("server requests install a progress observer");
+            let snapshot = |phase, prefill_tokens, completion_tokens, context_tokens| {
+                progress(infr_core::GenerationProgress {
+                    phase,
+                    prompt_tokens: 100,
+                    cached_prompt_tokens: 32,
+                    prefill_tokens,
+                    completion_tokens,
+                    context_tokens,
+                    context_limit: 131_072,
+                });
+            };
+            snapshot(infr_core::GenerationPhase::Prefill, 0, 0, 32);
+            snapshot(infr_core::GenerationPhase::Prefill, 68, 0, 100);
+            snapshot(infr_core::GenerationPhase::Decode, 68, 1, 101);
+            on_delta(Delta::Reasoning("thought".into()));
+            snapshot(infr_core::GenerationPhase::Decode, 68, 2, 102);
+            on_delta(Delta::Content("answer".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 100,
+                cached_prompt_tokens: 32,
                 completion_tokens: 2,
             })
         }
@@ -2788,6 +3814,59 @@ mod tests {
         assert_eq!(content, "from:alpha");
     }
 
+    #[tokio::test]
+    async fn streaming_finish_reports_exact_usage_timings_and_thinking_progress() {
+        let generator: Arc<dyn ChatGenerator> = Arc::new(ProgressGen);
+        let state = AppState::new(generator, "m", 1, Arc::new(Config::default()));
+        let stats = state.stats.clone();
+        let resp = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let wire = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            wire.contains("\"reasoning_content\":\"thought\""),
+            "reasoning delta missing: {wire}"
+        );
+
+        let final_chunk = wire
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|data| *data != "[DONE]")
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .find(|chunk| chunk["choices"][0]["finish_reason"] == "stop")
+            .expect("terminal completion chunk");
+        assert_eq!(final_chunk["usage"]["prompt_tokens"], 100);
+        assert_eq!(final_chunk["usage"]["completion_tokens"], 2);
+        assert_eq!(
+            final_chunk["usage"]["prompt_tokens_details"]["cached_tokens"],
+            32
+        );
+        assert_eq!(final_chunk["timings"]["prompt_n"], 68);
+        assert_eq!(final_chunk["timings"]["predicted_n"], 2);
+        assert_eq!(final_chunk["timings"]["context_n"], 102);
+        assert_eq!(final_chunk["timings"]["context_limit"], 131_072);
+
+        let window = stats.drain(Duration::from_secs(1));
+        assert_eq!(
+            (window.prompt_tokens, window.gen_tokens, window.completed),
+            (68, 2, 1),
+            "exact progress must not be counted again from text deltas: {window:?}"
+        );
+    }
+
     // --- ChatRequest serde round-trip tests --------------------------------
 
     #[test]
@@ -2815,8 +3894,11 @@ mod tests {
             }]
         }"#;
         let req: ChatRequest = serde_json::from_str(raw).unwrap();
-        // Only text parts are concatenated; image_url is discarded.
-        assert_eq!(flatten_content(&req.messages[0].content), "hello world");
+        assert_eq!(
+            flatten_content(&req.messages[0].content),
+            format!("hello{} world", IMAGE_PART_PLACEHOLDER)
+        );
+        assert_eq!(collect_images(&req.messages[0].content), ["data:..."]);
     }
 
     #[test]
@@ -2871,6 +3953,7 @@ mod tests {
                 total_tokens: 15,
                 prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
+            timings: TimingInfo::default(),
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["object"], "chat.completion");
@@ -2905,6 +3988,7 @@ mod tests {
                 total_tokens: 0,
                 prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
+            timings: TimingInfo::default(),
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert_eq!(
@@ -2945,6 +4029,7 @@ mod tests {
                 total_tokens: 0,
                 prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
+            timings: TimingInfo::default(),
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
@@ -3348,13 +4433,17 @@ mod tests {
     }
 
     #[test]
-    fn flatten_content_array_skips_non_text_parts() {
+    fn flatten_content_array_preserves_image_position() {
         let v = Some(serde_json::json!([
             {"type": "text",      "text": "hello"},
             {"type": "image_url", "image_url": {"url": "http://x"}},
             {"type": "text",      "text": " world"}
         ]));
-        assert_eq!(flatten_content(&v), "hello world");
+        assert_eq!(
+            flatten_content(&v),
+            format!("hello{} world", IMAGE_PART_PLACEHOLDER)
+        );
+        assert_eq!(collect_images(&v), ["http://x"]);
     }
 
     #[test]
@@ -3796,7 +4885,8 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            cancel: &AtomicBool,
+            cancel: &Arc<AtomicBool>,
+            _progress: Option<infr_core::GenerationProgressCallback>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
             on_delta(Delta::Content("partial".into()));
@@ -3808,6 +4898,36 @@ mod tests {
                 prompt_tokens: 3,
                 cached_prompt_tokens: 0,
                 completion_tokens: 1,
+            })
+        }
+    }
+
+    /// A prefill-shaped generator: it produces no delta before cancellation, so a failed `send`
+    /// can never be the mechanism that notices the disconnected client.
+    struct SilentLoopGen {
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl ChatGenerator for SilentLoopGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            cancel: &Arc<AtomicBool>,
+            _progress: Option<infr_core::GenerationProgressCallback>,
+            _on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            self.stopped.store(true, Ordering::Relaxed);
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 0,
+                cached_prompt_tokens: 0,
+                completion_tokens: 0,
             })
         }
     }
@@ -3829,8 +4949,12 @@ mod tests {
             model_id: "m".into(),
             created: 0,
             deadline,
+            progress_interval: None,
             stream,
             stats: Arc::default(),
+            dashboard: Arc::new(ActivityDashboard {
+                slots: Mutex::new(Vec::new()),
+            }),
         }
     }
 
@@ -3838,6 +4962,7 @@ mod tests {
         vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            images: Vec::new(),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -3953,6 +5078,39 @@ mod tests {
         assert!(text.contains("[DONE]"), "sentinel missing: {text}");
     }
 
+    /// Dropping the HTTP response must cancel generation even before the first content delta. This
+    /// is the long-prefill case behind a frontend Stop button appearing to do nothing.
+    #[tokio::test]
+    async fn dropping_streaming_response_cancels_before_first_delta() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let entry = deadline_entry(Arc::new(SilentLoopGen {
+            stopped: stopped.clone(),
+        }));
+        let resp = streaming(
+            entry.clone(),
+            user_msg(),
+            None,
+            None,
+            GenParams::default(),
+            test_ctx(None, true),
+        )
+        .await;
+
+        drop(resp);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !stopped.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("dropping the SSE body did not cancel the generator");
+        assert_eq!(
+            entry.slots.available_permits(),
+            1,
+            "the cancelled generation must release its GPU slot"
+        );
+    }
+
     /// The watchdog must not outlive its request. Dropping the "generation finished" sender — which
     /// is what the blocking task does when it returns, or unwinds — has to end the timer task, or a
     /// long-lived server accumulates one sleeping task per request. Asserted by waiting PAST the
@@ -3990,7 +5148,8 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            _cancel: &AtomicBool,
+            _cancel: &Arc<AtomicBool>,
+            _progress: Option<infr_core::GenerationProgressCallback>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
             on_delta(Delta::Content("partial".into()));
@@ -4043,7 +5202,8 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            _cancel: &AtomicBool,
+            _cancel: &Arc<AtomicBool>,
+            _progress: Option<infr_core::GenerationProgressCallback>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
             on_delta(Delta::Content("partial".into()));
@@ -4147,6 +5307,8 @@ mod tests {
             decode: Duration::from_millis(400),
             total: Duration::from_millis(500),
             finish: Finish::Stop,
+            progress_accounted: false,
+            context_limit: None,
         }
     }
 

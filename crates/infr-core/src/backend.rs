@@ -172,6 +172,9 @@ pub struct Capabilities {
     /// sampling; only the 4-byte token id reads back). False = the runner downloads the logits
     /// and samples on the host.
     pub gpu_sample: bool,
+    /// The backend executes [`crate::Op::Sample`] with `rows > 1`, producing one sampled token id
+    /// per logits row. Backends with a single-row sampler leave this false.
+    pub sample_rows: bool,
     /// The backend executes [`crate::Op::Argmax`] with `rows > 1` (per-row greedy argmax over
     /// `[rows, n]` logits — the MTP speculative-verify accept reads back m 4-byte ids instead of
     /// the m×vocab logits, issue #31). Every backend handles `rows == 1` (the decode loop);
@@ -468,11 +471,16 @@ impl Plan for GraphPlan {
 /// not a `HashMap` — `bind`/`get` are then hash-free O(1), which matters because decode rebinds
 /// every step. `bind`/`get` semantics are identical to the old map: `get` on an unbound (or
 /// never-grown-to) id returns `None`, and re-binding an id overwrites.
+enum BoundBuffer<'a> {
+    Single(&'a dyn Buffer),
+    Rows(Vec<&'a dyn Buffer>),
+}
+
 #[derive(Default)]
 pub struct Bindings<'a> {
     /// `slots[id.0] = Some(buf)` for a bound handle, `None` for unbound. Grows on demand to the
     /// highest id bound (bounded by the graph's tensor count).
-    slots: Vec<Option<&'a dyn Buffer>>,
+    slots: Vec<Option<BoundBuffer<'a>>>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -485,15 +493,37 @@ impl<'a> Bindings<'a> {
     pub fn bind(&mut self, id: TensorId, buf: &'a dyn Buffer) -> &mut Self {
         let i = id.0 as usize;
         if i >= self.slots.len() {
-            self.slots.resize(i + 1, None);
+            self.slots.resize_with(i + 1, || None);
         }
-        self.slots[i] = Some(buf);
+        self.slots[i] = Some(BoundBuffer::Single(buf));
+        self
+    }
+
+    /// Bind one persistent buffer per independent graph row. Ordinary graphs never use this;
+    /// layer-synchronous batching uses it while keeping stateless activations row-major.
+    pub fn bind_rows(&mut self, id: TensorId, bufs: Vec<&'a dyn Buffer>) -> &mut Self {
+        let i = id.0 as usize;
+        if i >= self.slots.len() {
+            self.slots.resize_with(i + 1, || None);
+        }
+        self.slots[i] = Some(BoundBuffer::Rows(bufs));
         self
     }
 
     /// Look up a bound buffer (backend uses this while executing).
     pub fn get(&self, id: TensorId) -> Option<&'a dyn Buffer> {
-        self.slots.get(id.0 as usize).copied().flatten()
+        match self.slots.get(id.0 as usize)?.as_ref()? {
+            BoundBuffer::Single(buf) => Some(*buf),
+            BoundBuffer::Rows(_) => None,
+        }
+    }
+
+    /// Look up the per-row binding of a stateful tensor in an independent-row graph.
+    pub fn get_rows(&self, id: TensorId) -> Option<&[&'a dyn Buffer]> {
+        match self.slots.get(id.0 as usize)?.as_ref()? {
+            BoundBuffer::Rows(bufs) => Some(bufs),
+            BoundBuffer::Single(_) => None,
+        }
     }
 }
 
@@ -553,6 +583,59 @@ pub trait Backend: Send + Sync {
     fn clear_segmented_kv(&self, _buffer: &dyn Buffer) -> Result<()> {
         Err(crate::error::Error::backend(
             "segmented KV is not supported by this backend",
+        ))
+    }
+    /// Physical bytes currently backing `buffer`. Ordinary buffers are fully committed, while a
+    /// segmented KV buffer may expose a much larger logical [`Buffer::len_bytes`] than it owns.
+    /// Session spill code uses this value so it never reads uncommitted virtual rows.
+    fn buffer_committed_bytes(&self, buffer: &dyn Buffer) -> Result<usize> {
+        Ok(buffer.len_bytes())
+    }
+    /// Read one byte range without materializing the whole buffer on the host. The default keeps
+    /// every established backend correct; backends with segmented or directly addressable storage
+    /// override it to avoid the prefix-sized temporary.
+    fn download_range(&self, src: &dyn Buffer, offset: usize, dst: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(|| crate::error::Error::backend("download_range offset overflow"))?;
+        if end > self.buffer_committed_bytes(src)? {
+            return Err(crate::error::Error::backend(format!(
+                "download_range: byte range {offset}..{end} exceeds committed buffer size"
+            )));
+        }
+        if offset == 0 {
+            return self.download(src, dst);
+        }
+        let mut prefix = vec![0u8; end];
+        self.download(src, &mut prefix)?;
+        dst.copy_from_slice(&prefix[offset..end]);
+        Ok(())
+    }
+    /// Write one byte range without replacing bytes outside it. See [`Self::download_range`].
+    /// The fallback preserves the existing prefix, patches it, then uploads that prefix; Vulkan
+    /// overrides this with an offset copy and segmented-buffer traversal.
+    fn upload_range(&self, dst: &dyn Buffer, offset: usize, src: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(|| crate::error::Error::backend("upload_range offset overflow"))?;
+        if end > self.buffer_committed_bytes(dst)? {
+            return Err(crate::error::Error::backend(format!(
+                "upload_range: byte range {offset}..{end} exceeds committed buffer size"
+            )));
+        }
+        if offset == 0 {
+            return self.upload(dst, src);
+        }
+        let mut prefix = vec![0u8; end];
+        self.download(dst, &mut prefix)?;
+        prefix[offset..end].copy_from_slice(src);
+        self.upload(dst, &prefix)
+    }
+    /// Return all physical segments owned by one lazily committed KV buffer while retaining its
+    /// logical object/address table for a later restore. Non-segmented backends reject the call.
+    fn release_segmented_kv(&self, _buffer: &dyn Buffer) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV release is not supported by this backend",
         ))
     }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
@@ -667,10 +750,10 @@ pub trait Backend: Send + Sync {
         false
     }
 
-    /// Notify the backend that a cold session has finished allocating resident weights and is
-    /// about to size/allocate KV and recurrent state. Backends may use this boundary to release a
-    /// runtime reservation that protected those bytes from weight-arena packing tails. Default
-    /// no-op.
+    /// Notify the backend that a cold session has finished its resident/fixed allocation phase.
+    /// Backends may use this boundary to release load-only reservations or preload lower tiers.
+    /// A backend whose elastic arena is finalized from measured room may receive it after fixed
+    /// recurrent state; other paths retain the traditional post-weight boundary. Default no-op.
     fn finish_weight_load(&self) -> Result<()> {
         Ok(())
     }
@@ -930,6 +1013,25 @@ mod tests {
         // Re-binding an id overwrites (identical to the old HashMap::insert semantics).
         binds.bind(TensorId(5), &c);
         assert_eq!(binds.get(TensorId(5)).unwrap().len_bytes(), 16);
+    }
+
+    #[test]
+    fn bindings_keep_single_and_independent_row_buffers_distinct() {
+        let a = MockBuffer(std::sync::Mutex::new(vec![0u8; 4]));
+        let b = MockBuffer(std::sync::Mutex::new(vec![0u8; 8]));
+        let c = MockBuffer(std::sync::Mutex::new(vec![0u8; 16]));
+        let mut binds = Bindings::new();
+
+        binds.bind_rows(TensorId(3), vec![&a, &b]);
+        assert!(binds.get(TensorId(3)).is_none());
+        let rows = binds.get_rows(TensorId(3)).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len_bytes(), 4);
+        assert_eq!(rows[1].len_bytes(), 8);
+
+        binds.bind(TensorId(3), &c);
+        assert_eq!(binds.get(TensorId(3)).unwrap().len_bytes(), 16);
+        assert!(binds.get_rows(TensorId(3)).is_none());
     }
 
     #[test]

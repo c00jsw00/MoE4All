@@ -146,6 +146,7 @@ mod tests {
                     u: uniform,
                     dst: token,
                     n: 128,
+                    rows: 1,
                     top_k: 40,
                     temp: 0.8,
                     top_p: 0.95,
@@ -597,6 +598,7 @@ mod tests {
             u: uniform,
             dst: sampled,
             n: 128,
+            rows: 1,
             top_k: 4,
             temp: 1.0,
             top_p: 1.0,
@@ -786,6 +788,7 @@ mod tests {
             u: bad_uniform,
             dst: bad_sampled,
             n: 128,
+            rows: 1,
             top_k: 4,
             temp: 1.0,
             top_p: 1.0,
@@ -1201,7 +1204,7 @@ fn counter_linear_label(enabled: bool, kern: &'static str) -> Option<&'static st
 fn replay_gpu_decode_op_supported(op: &Op, g: &infr_core::graph::Graph) -> Option<bool> {
     match op {
         Op::Argmax { rows, .. } => Some(*rows == 1),
-        Op::Sample { .. } => Some(true),
+        Op::Sample { rows, .. } => Some(*rows == 1),
         Op::EmbedGather { table, rows, .. } => {
             Some(*rows == 1 && metal_embed_gather_kern(g.desc(*table).dtype).is_some())
         }
@@ -3567,10 +3570,16 @@ impl MetalBackend {
                 u,
                 dst,
                 n,
+                rows,
                 top_k,
                 temp,
                 top_p,
             } => {
+                if rows != 1 {
+                    return Err(Error::Unsupported(
+                        "Metal Op::Sample currently supports one logits row".into(),
+                    ));
+                }
                 // Device-side stochastic sampling: only the 4-byte token id reads back, not the
                 // `[vocab]` logits. See `sample_f32` in elementwise_norms.metal for the algorithm
                 // (mirrors the host `sample_logits` order of operations exactly).

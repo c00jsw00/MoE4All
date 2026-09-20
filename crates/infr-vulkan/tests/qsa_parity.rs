@@ -11,6 +11,38 @@ fn h(v: &[u8], i: usize) -> f32 {
     half::f16::from_bits(u16::from_le_bytes([v[2 * i], v[2 * i + 1]])).to_f32()
 }
 
+fn mrope_plane(pair: usize, sections: [usize; 4]) -> usize {
+    let sector = pair % sections.iter().sum::<usize>();
+    if sector % 3 == 1 && sector < 3 * sections[1] {
+        1
+    } else if sector % 3 == 2 && sector < 3 * sections[2] {
+        2
+    } else if sector % 3 == 0 && sector < 3 * sections[0] {
+        0
+    } else {
+        3
+    }
+}
+
+fn rotate_half_in_place(
+    row: &mut [f32],
+    rope_dim: usize,
+    theta: f32,
+    positions: [i32; 4],
+    sections: [usize; 4],
+) {
+    let half = rope_dim / 2;
+    for pair in 0..half {
+        let mate = pair + half;
+        let angle = positions[mrope_plane(pair, sections)] as f32
+            * theta.powf(-((2 * pair) as f32) / rope_dim as f32);
+        let (sin, cos) = angle.sin_cos();
+        let (a, b) = (row[pair], row[mate]);
+        row[pair] = a * cos - b * sin;
+        row[mate] = a * sin + b * cos;
+    }
+}
+
 #[test]
 fn qsa_index_and_gather_match_reference() {
     let Ok(be) = VulkanBackend::new() else {
@@ -49,14 +81,13 @@ fn qsa_index_and_gather_match_reference() {
         for (value, &weight) in key.iter_mut().zip(&norm) {
             *value *= inv * weight;
         }
-        for pair in 0..rope_dim / 2 {
-            let d = 2 * pair;
-            let angle = (block * ratio) as f32 * theta.powf(-((2 * pair) as f32) / rope_dim as f32);
-            let (sin, cos) = angle.sin_cos();
-            let (a, b) = (key[d], key[d + 1]);
-            key[d] = a * cos - b * sin;
-            key[d + 1] = a * sin + b * cos;
-        }
+        rotate_half_in_place(
+            &mut key,
+            rope_dim,
+            theta,
+            [(block * ratio) as i32; 4],
+            [11, 11, 10, 0],
+        );
         for head in 0..nh {
             let dot = (0..hd).map(|d| h(&qb, head * hd + d) * key[d]).sum::<f32>();
             *score += dot.max(0.0) * scale;
@@ -122,6 +153,7 @@ fn qsa_index_and_gather_match_reference() {
         eps,
         scale,
         None,
+        None,
     );
     rec.qsa_gather(
         k.as_ref(),
@@ -153,6 +185,57 @@ fn qsa_index_and_gather_match_reference() {
         assert!(
             (got - want).abs() < 2e-3,
             "score {i}: got {got}, want {want}"
+        );
+    }
+
+    // The multimodal compressor must collapse to the established text path when all four
+    // position planes carry the same linear coordinate.
+    let positions4 = (0..kv_len)
+        .flat_map(|position| [position as i32; 4])
+        .collect::<Vec<_>>();
+    let positions4_buf = be
+        .alloc(positions4.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    be.upload(positions4_buf.as_ref(), bytemuck::cast_slice(&positions4))
+        .unwrap();
+    let rec = be.recorder().unwrap();
+    rec.qsa_indexer(
+        q.as_ref(),
+        raw.as_ref(),
+        block_keys.as_ref(),
+        nw.as_ref(),
+        scores.as_ref(),
+        Some(topk_work.as_ref()),
+        ids.as_ref(),
+        1,
+        kv_len as u32,
+        0,
+        nh as u32,
+        hd as u32,
+        top as u32,
+        ratio as u32,
+        rope_dim as u32,
+        theta,
+        eps,
+        scale,
+        None,
+        Some((positions4_buf.as_ref(), [11, 11, 10, 0])),
+    );
+    rec.finish().unwrap();
+    be.download(scores.as_ref(), &mut sb).unwrap();
+    be.download(ids.as_ref(), &mut ib).unwrap();
+    assert_eq!(
+        bytemuck::cast_slice::<u8, u32>(&ib),
+        rank.iter().map(|&i| i as u32).collect::<Vec<_>>()
+    );
+    for (i, (&got, &want)) in bytemuck::cast_slice::<u8, f32>(&sb)
+        .iter()
+        .zip(&scores_ref)
+        .enumerate()
+    {
+        assert!(
+            (got - want).abs() < 2e-3,
+            "multimodal score {i}: got {got}, want {want}"
         );
     }
 
@@ -233,6 +316,7 @@ fn qsa_index_and_gather_match_reference() {
         eps,
         scale,
         None,
+        None,
     );
     rec.finish().unwrap();
     be.download(ids.as_ref(), &mut ib).unwrap();
@@ -240,6 +324,186 @@ fn qsa_index_and_gather_match_reference() {
         bytemuck::cast_slice::<u8, u32>(&ib),
         &(0..top as u32).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn multimodal_rope_and_qsa_use_distinct_position_planes() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (rows, nh, hd, rope_dim) = (2usize, 2usize, 128usize, 64usize);
+    let sections = [11usize, 11, 10, 0];
+    let theta = 10_000.0f32;
+    let eps = 1e-6f32;
+    let xv = (0..rows * nh * hd)
+        .map(|i| ((i * 29 + 5) % 113) as f32 / 41.0 - 1.2)
+        .collect::<Vec<_>>();
+    let norm = (0..hd)
+        .map(|i| 0.7 + (i % 19) as f32 * 0.015)
+        .collect::<Vec<_>>();
+    let positions = [[3i32, 17, 41, 0], [8, 29, 53, 0]];
+    let positions_flat = positions.into_iter().flatten().collect::<Vec<_>>();
+    let x = be.alloc(xv.len() * 4, BufferUsage::Activations).unwrap();
+    let nw = be.alloc(norm.len() * 4, BufferUsage::Weights).unwrap();
+    let pos = be
+        .alloc(positions_flat.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    let out = be
+        .alloc(rows * nh * hd * 2, BufferUsage::Activations)
+        .unwrap();
+    be.upload(x.as_ref(), bytemuck::cast_slice(&xv)).unwrap();
+    be.upload(nw.as_ref(), bytemuck::cast_slice(&norm)).unwrap();
+    be.upload(pos.as_ref(), bytemuck::cast_slice(&positions_flat))
+        .unwrap();
+    let rec = be.recorder().unwrap();
+    rec.qk_norm_rope_mrope(
+        x.as_ref(),
+        nw.as_ref(),
+        pos.as_ref(),
+        out.as_ref(),
+        rows,
+        nh,
+        hd,
+        rope_dim,
+        theta,
+        eps,
+        sections.map(|v| v as u32),
+        0,
+    );
+    rec.finish().unwrap();
+    let mut got = vec![0u8; rows * nh * hd * 2];
+    be.download(out.as_ref(), &mut got).unwrap();
+    for row in 0..rows {
+        for head in 0..nh {
+            let base = (row * nh + head) * hd;
+            let mut want = xv[base..base + hd].to_vec();
+            let inv = (want.iter().map(|v| v * v).sum::<f32>() / hd as f32 + eps)
+                .sqrt()
+                .recip();
+            for (value, &weight) in want.iter_mut().zip(&norm) {
+                *value *= inv * weight;
+            }
+            rotate_half_in_place(&mut want, rope_dim, theta, positions[row], sections);
+            for (d, &expected) in want.iter().enumerate() {
+                let expected = half::f16::from_f32(expected).to_f32();
+                let actual = h(&got, base + d);
+                assert!(
+                    (actual - expected).abs() < 2e-3,
+                    "M-RoPE row {row} head {head} dim {d}: got {actual}, want {expected}"
+                );
+            }
+        }
+    }
+
+    let (blocks, ratio, top) = (7usize, 4usize, 3usize);
+    let kv_len = blocks * ratio;
+    let rawv = (0..kv_len * hd)
+        .map(|i| ((i * 47 + 13) % 137) as f32 / 57.0 - 1.1)
+        .collect::<Vec<_>>();
+    let qv = (0..nh * hd)
+        .map(|i| ((i * 31 + 7) % 103) as f32 / 43.0 - 1.0)
+        .collect::<Vec<_>>();
+    let rawb = f16_bytes(&rawv);
+    let qb = f16_bytes(&qv);
+    let positions = (0..kv_len)
+        .flat_map(|i| [i as i32 + 2, (i / 4) as i32 + 19, (i % 7) as i32 + 43, 0])
+        .collect::<Vec<_>>();
+    let mut scores_ref = vec![0.0f32; blocks];
+    let mut key = vec![0.0f32; hd];
+    for (block, score) in scores_ref.iter_mut().enumerate() {
+        for (d, value) in key.iter_mut().enumerate() {
+            *value = (0..ratio)
+                .map(|r| h(&rawb, (block * ratio + r) * hd + d))
+                .sum::<f32>()
+                / ratio as f32;
+            *value = half::f16::from_f32(*value).to_f32();
+        }
+        let inv = (key.iter().map(|v| v * v).sum::<f32>() / hd as f32 + eps)
+            .sqrt()
+            .recip();
+        for (value, &weight) in key.iter_mut().zip(&norm) {
+            *value *= inv * weight;
+        }
+        let at = block * ratio * 4;
+        rotate_half_in_place(
+            &mut key,
+            rope_dim,
+            theta,
+            positions[at..at + 4].try_into().unwrap(),
+            sections,
+        );
+        for head in 0..nh {
+            let dot = (0..hd).map(|d| h(&qb, head * hd + d) * key[d]).sum::<f32>();
+            *score += dot.max(0.0) / (hd as f32).sqrt();
+        }
+    }
+    let mut rank = (0..blocks).collect::<Vec<_>>();
+    rank.sort_unstable_by(|&a, &b| {
+        scores_ref[b]
+            .total_cmp(&scores_ref[a])
+            .then_with(|| a.cmp(&b))
+    });
+    rank.truncate(top);
+    rank.sort_unstable();
+
+    let q = be.alloc(qb.len(), BufferUsage::Activations).unwrap();
+    let raw = be.alloc(rawb.len(), BufferUsage::KvCache).unwrap();
+    let block_keys = be.alloc(blocks * hd * 4, BufferUsage::KvCache).unwrap();
+    let pos = be
+        .alloc(positions.len() * 4, BufferUsage::Activations)
+        .unwrap();
+    let scores = be.alloc(blocks * 4, BufferUsage::Activations).unwrap();
+    let topk_work = be
+        .alloc((64 * 256 + 2) * 4, BufferUsage::Activations)
+        .unwrap();
+    let ids = be.alloc(top * 4, BufferUsage::Activations).unwrap();
+    be.upload(q.as_ref(), &qb).unwrap();
+    be.upload(raw.as_ref(), &rawb).unwrap();
+    be.upload(pos.as_ref(), bytemuck::cast_slice(&positions))
+        .unwrap();
+    let rec = be.recorder().unwrap();
+    rec.qsa_indexer(
+        q.as_ref(),
+        raw.as_ref(),
+        block_keys.as_ref(),
+        nw.as_ref(),
+        scores.as_ref(),
+        Some(topk_work.as_ref()),
+        ids.as_ref(),
+        1,
+        kv_len as u32,
+        0,
+        nh as u32,
+        hd as u32,
+        top as u32,
+        ratio as u32,
+        rope_dim as u32,
+        theta,
+        eps,
+        1.0 / (hd as f32).sqrt(),
+        None,
+        Some((pos.as_ref(), sections.map(|v| v as u32))),
+    );
+    rec.finish().unwrap();
+    let mut score_bytes = vec![0u8; blocks * 4];
+    let mut id_bytes = vec![0u8; top * 4];
+    be.download(scores.as_ref(), &mut score_bytes).unwrap();
+    be.download(ids.as_ref(), &mut id_bytes).unwrap();
+    assert_eq!(
+        bytemuck::cast_slice::<u8, u32>(&id_bytes),
+        rank.iter().map(|&i| i as u32).collect::<Vec<_>>()
+    );
+    for (block, (&actual, &expected)) in bytemuck::cast_slice::<u8, f32>(&score_bytes)
+        .iter()
+        .zip(&scores_ref)
+        .enumerate()
+    {
+        assert!(
+            (actual - expected).abs() < 2e-3,
+            "QSA M-RoPE block {block}: got {actual}, want {expected}"
+        );
+    }
 }
 
 #[test]
@@ -290,15 +554,13 @@ fn qsa_batched_rows_match_causal_reference() {
             for (value, &weight) in key.iter_mut().zip(&norm) {
                 *value *= inv * weight;
             }
-            for pair in 0..rope_dim / 2 {
-                let d = 2 * pair;
-                let angle =
-                    (block * ratio) as f32 * theta.powf(-((2 * pair) as f32) / rope_dim as f32);
-                let (sin, cos) = angle.sin_cos();
-                let (a, b) = (key[d], key[d + 1]);
-                key[d] = a * cos - b * sin;
-                key[d + 1] = a * sin + b * cos;
-            }
+            rotate_half_in_place(
+                &mut key,
+                rope_dim,
+                theta,
+                [(block * ratio) as i32; 4],
+                [11, 11, 10, 0],
+            );
             let qbase = row * index_heads * index_hd;
             for head in 0..index_heads {
                 let dot = (0..index_hd)
@@ -405,6 +667,7 @@ fn qsa_batched_rows_match_causal_reference() {
         theta,
         eps,
         index_scale,
+        None,
         None,
     );
     rec.qsa_attention_batch(

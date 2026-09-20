@@ -294,16 +294,17 @@ impl VulkanBackend {
     ) -> Result<vk::CommandBuffer> {
         let device = &self.shared.device;
         let qf = self.shared.queue_family_index;
-        let pool = *self.shared.cmd_pool.lock().unwrap();
+        let pool = self.shared.cmd_pool.lock().unwrap();
         let cmd = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
+                    .command_pool(*pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )
         }
         .map_err(|e| be(format!("tp_record_copies allocate: {e}")))?[0];
+        drop(pool);
         // Any record error past this point must free `cmd` before returning (else it leaks the pool).
         let record = || -> Result<()> {
             unsafe {
@@ -401,7 +402,7 @@ impl VulkanBackend {
         if cmds.is_empty() {
             return;
         }
-        let pool = *self.shared.cmd_pool.lock().unwrap();
-        unsafe { self.shared.device.free_command_buffers(pool, cmds) };
+        let pool = self.shared.cmd_pool.lock().unwrap();
+        unsafe { self.shared.device.free_command_buffers(*pool, cmds) };
     }
 }

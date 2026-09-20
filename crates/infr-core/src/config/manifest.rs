@@ -148,6 +148,10 @@ knobs! {
     "INFR_KV_TYPE_V"            => "kv.type_v",              Dtype,       Ignored, "q8_0", migrated;
     "INFR_KV_Q8"                => "kv.force_q8",            Presence,    Ignored, "1",    migrated;
     "INFR_KV_SLOTS"             => "kv.slots",               Int,         Ignored, "8",    migrated;
+    "INFR_KV_SESSION_CACHE_DIR"  => "kv.session_cache_dir",   Path,        Ignored, "D:\\infr-kv", migrated;
+    "INFR_KV_SESSION_IDLE_SECS"  => "kv.session_idle_secs",   Int,         Ignored, "120",  migrated;
+    "INFR_KV_SESSION_CACHE_MAX"  => "kv.session_cache_max",   Size,        Ignored, "5GiB",  migrated;
+    "INFR_KV_SESSION_CACHE_TTL_HOURS" => "kv.session_cache_ttl_hours", Int,  Ignored, "24",   migrated;
     "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    migrated;
     "INFR_NO_DYNAMIC_KV"        => "kv.dynamic",             PresenceInv, Ignored, "1",    migrated;
     "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    migrated;
@@ -162,6 +166,7 @@ knobs! {
     "INFR_PAGER_RING_SLOTS"     => "paging.ring_slots",                Int,      Ignored, "2",   migrated;
     "INFR_NO_MOE_LAYER_STREAM"  => "paging.moe_layer_stream",          PresenceInv, Ignored, "1", migrated;
     "INFR_SYNC_PREFILL_UPLOAD"  => "paging.prefill_upload_async",      PresenceInv, Ignored, "1", migrated;
+    "INFR_EXPERT_PREFETCH"      => "paging.expert_prefetch",           Presence, Ignored, "1", migrated;
     "INFR_MOE_SIZE_CACHE_BIAS"  => "paging.moe_size_cache_bias",       Float,    Ignored, "2",   migrated;
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   migrated;
     "INFR_PAGER_TRACE"          => "paging.trace",                     Path,     Ignored, "pager-trace.csv", migrated;

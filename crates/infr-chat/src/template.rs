@@ -12,7 +12,7 @@ use infr_gguf::Gguf;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use crate::{ChatMessage, ChatTemplateOptions};
+use crate::{ChatMessage, ChatTemplateOptions, IMAGE_PART_PLACEHOLDER, VISION_MARKER};
 
 /// Compiled-environment cache keyed by the raw template source. A GGUF's chat template never
 /// changes across a process, but `serve` re-renders it on every request/turn — building the
@@ -176,6 +176,8 @@ pub enum TemplateError {
     NoTemplate,
     /// The embedded template failed to parse or render (the minijinja error says why).
     Render(minijinja::Error),
+    /// The flattened OpenAI content parts lost or gained an image marker.
+    Vision(String),
 }
 
 impl std::fmt::Display for TemplateError {
@@ -185,6 +187,7 @@ impl std::fmt::Display for TemplateError {
                 write!(f, "model GGUF has no `tokenizer.chat_template`")
             }
             TemplateError::Render(e) => write!(f, "chat template failed to render: {e:#}"),
+            TemplateError::Vision(e) => write!(f, "invalid multimodal chat content: {e}"),
         }
     }
 }
@@ -196,7 +199,7 @@ impl TemplateError {
     /// and unrelated template runtime errors remain server errors, even if also InvalidOperation.
     pub fn is_invalid_input(&self) -> bool {
         let Self::Render(error) = self else {
-            return false;
+            return matches!(self, Self::Vision(_));
         };
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
         while let Some(error) = source {
@@ -290,9 +293,18 @@ pub fn render_chat_oai_with_options(
     cfg: &Config,
     options: &ChatTemplateOptions,
 ) -> Result<String, TemplateError> {
+    for (index, message) in messages.iter().enumerate() {
+        let markers = message.content.matches(IMAGE_PART_PLACEHOLDER).count();
+        if markers != message.images.len() {
+            return Err(TemplateError::Vision(format!(
+                "message #{index} has {markers} image marker(s) but {} payload(s)",
+                message.images.len()
+            )));
+        }
+    }
     let msgs: Vec<Value> = messages.iter().map(message_to_json).collect();
     let tools = tools.cloned().unwrap_or(Value::Null);
-    render_core(
+    let rendered = render_core(
         gguf,
         tokenizer,
         eos,
@@ -301,7 +313,8 @@ pub fn render_chat_oai_with_options(
         add_generation_prompt,
         cfg,
         options,
-    )
+    )?;
+    Ok(rendered.replace(IMAGE_PART_PLACEHOLDER, VISION_MARKER))
 }
 
 /// Build the template's per-message dict, preserving the tool round-trip fields the HF chat templates
@@ -498,6 +511,7 @@ mod template_tests {
         ))
         .is_invalid_input());
         assert!(!TemplateError::NoTemplate.is_invalid_input());
+        assert!(TemplateError::Vision("marker mismatch".into()).is_invalid_input());
     }
 
     #[test]
