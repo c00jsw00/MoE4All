@@ -2411,6 +2411,7 @@ fn tool_parsing_allowed(tools: Option<&serde_json::Value>, tool_choice: Option<&
 /// concurrent calls therefore share nothing: that is what makes request A's `temperature` unable to
 /// leak into request B (the old thread-local could not offer that guarantee once one thread stepped
 /// several sequences).
+#[allow(clippy::too_many_arguments)]
 fn run_chat(
     be: &dyn GenBackend,
     messages: &[infr_engine::ChatMessage],
@@ -4506,6 +4507,7 @@ fn apply_model_sampling_defaults(
     Arc::new(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     model: &str,
     mmproj: Option<&Path>,
