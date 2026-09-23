@@ -19,7 +19,8 @@ MoE 模型的专家权重按需在显存、内存和 SSD 之间流动，因此�
 “自动配置：激进性能”。
 
 > 当前主要开发和实测平台是原生 Windows 11、AMD Radeon RX 7900 XTX 和
-> Vulkan。其他 Vulkan GPU 可能可用，但不是 MoE4All 当前的重点验证平台。
+> Vulkan。Linux 可走相同的 Vulkan 路径构建运行（见[快速开始](GETTING_STARTED.md)
+> 的 Linux 小节与 [docs/linux.md](docs/linux.md)），其他 GPU/平台未单独基准化。
 
 ## 0.7.0：视觉、并发服务与 SSD 会话缓存
 
